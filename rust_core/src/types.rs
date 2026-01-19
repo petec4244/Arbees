@@ -1,0 +1,382 @@
+//! Native Rust types with PyO3 bindings for zero-copy Python interop.
+
+use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
+
+/// Supported sports
+#[pyclass]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Sport {
+    NFL,
+    NBA,
+    NHL,
+    MLB,
+    NCAAF,
+    NCAAB,
+    MLS,
+    Soccer,
+    Tennis,
+    MMA,
+}
+
+#[pymethods]
+impl Sport {
+    /// Get total regulation time in seconds
+    #[getter]
+    pub fn total_seconds(&self) -> u32 {
+        match self {
+            Sport::NFL | Sport::NCAAF => 3600,      // 60 min
+            Sport::NBA | Sport::NCAAB => 2880,      // 48 min (NBA) / 40 min (NCAAB)
+            Sport::NHL => 3600,                      // 60 min
+            Sport::MLB => 10800,                     // ~3 hours avg
+            Sport::MLS | Sport::Soccer => 5400,     // 90 min
+            Sport::Tennis => 7200,                   // ~2 hours avg
+            Sport::MMA => 1500,                      // 25 min (5 rounds)
+        }
+    }
+
+    /// Get number of periods
+    #[getter]
+    pub fn periods(&self) -> u8 {
+        match self {
+            Sport::NFL | Sport::NCAAF | Sport::NBA | Sport::NCAAB => 4,
+            Sport::NHL => 3,
+            Sport::MLB => 9,
+            Sport::MLS | Sport::Soccer => 2,
+            Sport::Tennis => 3,  // Best of 3 or 5
+            Sport::MMA => 5,     // Max rounds
+        }
+    }
+}
+
+/// Platform identifier
+#[pyclass]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Platform {
+    Kalshi,
+    Polymarket,
+    Sportsbook,
+    Paper,
+}
+
+/// Current game state
+#[pyclass]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GameState {
+    #[pyo3(get, set)]
+    pub game_id: String,
+    #[pyo3(get, set)]
+    pub sport: Sport,
+    #[pyo3(get, set)]
+    pub home_team: String,
+    #[pyo3(get, set)]
+    pub away_team: String,
+    #[pyo3(get, set)]
+    pub home_score: u16,
+    #[pyo3(get, set)]
+    pub away_score: u16,
+    #[pyo3(get, set)]
+    pub period: u8,
+    #[pyo3(get, set)]
+    pub time_remaining_seconds: u32,
+    #[pyo3(get, set)]
+    pub possession: Option<String>,
+    // NFL/NCAAF specific
+    #[pyo3(get, set)]
+    pub down: Option<u8>,
+    #[pyo3(get, set)]
+    pub yards_to_go: Option<u8>,
+    #[pyo3(get, set)]
+    pub yard_line: Option<u8>,
+    #[pyo3(get, set)]
+    pub is_redzone: bool,
+}
+
+#[pymethods]
+impl GameState {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        game_id: String,
+        sport: Sport,
+        home_team: String,
+        away_team: String,
+        home_score: u16,
+        away_score: u16,
+        period: u8,
+        time_remaining_seconds: u32,
+    ) -> Self {
+        Self {
+            game_id,
+            sport,
+            home_team,
+            away_team,
+            home_score,
+            away_score,
+            period,
+            time_remaining_seconds,
+            possession: None,
+            down: None,
+            yards_to_go: None,
+            yard_line: None,
+            is_redzone: false,
+        }
+    }
+
+    /// Get total seconds remaining in regulation
+    pub fn total_time_remaining(&self) -> u32 {
+        let periods_remaining = match self.sport {
+            Sport::NFL | Sport::NCAAF | Sport::NBA | Sport::NCAAB => {
+                4u32.saturating_sub(self.period as u32)
+            }
+            Sport::NHL => 3u32.saturating_sub(self.period as u32),
+            Sport::MLB => 9u32.saturating_sub(self.period as u32),
+            Sport::MLS | Sport::Soccer => 2u32.saturating_sub(self.period as u32),
+            Sport::Tennis | Sport::MMA => 0,
+        };
+
+        let period_length = self.sport.total_seconds() / self.sport.periods() as u32;
+        self.time_remaining_seconds + (periods_remaining * period_length)
+    }
+
+    /// Fraction of game remaining (0.0 = game over, 1.0 = full game)
+    pub fn game_progress(&self) -> f64 {
+        let total = self.sport.total_seconds() as f64;
+        let remaining = self.total_time_remaining() as f64;
+        (remaining / total).clamp(0.0, 1.0)
+    }
+
+    /// Score differential (positive = home winning)
+    pub fn score_diff(&self) -> i16 {
+        self.home_score as i16 - self.away_score as i16
+    }
+}
+
+/// Market price snapshot
+#[pyclass]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarketPrice {
+    #[pyo3(get, set)]
+    pub platform: Platform,
+    #[pyo3(get, set)]
+    pub market_id: String,
+    #[pyo3(get, set)]
+    pub yes_bid: f64,
+    #[pyo3(get, set)]
+    pub yes_ask: f64,
+    #[pyo3(get, set)]
+    pub volume: f64,
+    #[pyo3(get, set)]
+    pub liquidity: f64,
+    #[pyo3(get, set)]
+    pub timestamp_ms: i64,
+}
+
+#[pymethods]
+impl MarketPrice {
+    #[new]
+    pub fn new(
+        platform: Platform,
+        market_id: String,
+        yes_bid: f64,
+        yes_ask: f64,
+        volume: f64,
+        liquidity: f64,
+        timestamp_ms: i64,
+    ) -> Self {
+        Self {
+            platform,
+            market_id,
+            yes_bid,
+            yes_ask,
+            volume,
+            liquidity,
+            timestamp_ms,
+        }
+    }
+
+    /// Mid price
+    pub fn mid_price(&self) -> f64 {
+        (self.yes_bid + self.yes_ask) / 2.0
+    }
+
+    /// Spread in percentage points
+    pub fn spread(&self) -> f64 {
+        (self.yes_ask - self.yes_bid) * 100.0
+    }
+
+    /// No bid (1 - yes_ask)
+    pub fn no_bid(&self) -> f64 {
+        1.0 - self.yes_ask
+    }
+
+    /// No ask (1 - yes_bid)
+    pub fn no_ask(&self) -> f64 {
+        1.0 - self.yes_bid
+    }
+}
+
+/// Arbitrage opportunity
+#[pyclass]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArbitrageOpportunity {
+    #[pyo3(get, set)]
+    pub opportunity_type: String,
+    #[pyo3(get, set)]
+    pub platform_buy: Platform,
+    #[pyo3(get, set)]
+    pub platform_sell: Platform,
+    #[pyo3(get, set)]
+    pub event_id: String,
+    #[pyo3(get, set)]
+    pub sport: Sport,
+    #[pyo3(get, set)]
+    pub market_title: String,
+    #[pyo3(get, set)]
+    pub edge_pct: f64,
+    #[pyo3(get, set)]
+    pub buy_price: f64,
+    #[pyo3(get, set)]
+    pub sell_price: f64,
+    #[pyo3(get, set)]
+    pub implied_profit: f64,
+    #[pyo3(get, set)]
+    pub liquidity_buy: f64,
+    #[pyo3(get, set)]
+    pub liquidity_sell: f64,
+    #[pyo3(get, set)]
+    pub is_risk_free: bool,
+    #[pyo3(get, set)]
+    pub description: String,
+    #[pyo3(get, set)]
+    pub model_probability: Option<f64>,
+}
+
+#[pymethods]
+impl ArbitrageOpportunity {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        opportunity_type: String,
+        platform_buy: Platform,
+        platform_sell: Platform,
+        event_id: String,
+        sport: Sport,
+        market_title: String,
+        edge_pct: f64,
+        buy_price: f64,
+        sell_price: f64,
+        liquidity_buy: f64,
+        liquidity_sell: f64,
+        is_risk_free: bool,
+    ) -> Self {
+        let implied_profit = (sell_price - buy_price) * 100.0;
+        let description = format!(
+            "Buy {:?} @ {:.3}, Sell {:?} @ {:.3}",
+            platform_buy, buy_price, platform_sell, sell_price
+        );
+        Self {
+            opportunity_type,
+            platform_buy,
+            platform_sell,
+            event_id,
+            sport,
+            market_title,
+            edge_pct,
+            buy_price,
+            sell_price,
+            implied_profit,
+            liquidity_buy,
+            liquidity_sell,
+            is_risk_free,
+            description,
+            model_probability: None,
+        }
+    }
+
+    /// Max tradeable size based on liquidity
+    fn max_size(&self) -> f64 {
+        self.liquidity_buy.min(self.liquidity_sell)
+    }
+
+    /// Expected profit for given size
+    fn expected_profit(&self, size: f64) -> f64 {
+        size * (self.sell_price - self.buy_price)
+    }
+}
+
+/// Trading signal generated from analysis
+#[pyclass]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TradingSignal {
+    #[pyo3(get, set)]
+    pub signal_type: String,
+    #[pyo3(get, set)]
+    pub game_id: String,
+    #[pyo3(get, set)]
+    pub sport: Sport,
+    #[pyo3(get, set)]
+    pub team: String,
+    #[pyo3(get, set)]
+    pub direction: String,  // "BUY" or "SELL"
+    #[pyo3(get, set)]
+    pub model_prob: f64,
+    #[pyo3(get, set)]
+    pub market_prob: f64,
+    #[pyo3(get, set)]
+    pub edge_pct: f64,
+    #[pyo3(get, set)]
+    pub confidence: f64,
+    #[pyo3(get, set)]
+    pub reason: String,
+    #[pyo3(get, set)]
+    pub timestamp_ms: i64,
+}
+
+#[pymethods]
+impl TradingSignal {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        signal_type: String,
+        game_id: String,
+        sport: Sport,
+        team: String,
+        direction: String,
+        model_prob: f64,
+        market_prob: f64,
+        confidence: f64,
+        reason: String,
+        timestamp_ms: i64,
+    ) -> Self {
+        let edge_pct = (model_prob - market_prob).abs() * 100.0;
+        Self {
+            signal_type,
+            game_id,
+            sport,
+            team,
+            direction,
+            model_prob,
+            market_prob,
+            edge_pct,
+            confidence,
+            reason,
+            timestamp_ms,
+        }
+    }
+
+    /// Kelly criterion optimal bet fraction
+    fn kelly_fraction(&self) -> f64 {
+        if self.edge_pct <= 0.0 {
+            return 0.0;
+        }
+        // Kelly = (p * b - q) / b where p=prob, q=1-p, b=odds-1
+        let p = self.model_prob;
+        let q = 1.0 - p;
+        let b = (1.0 / self.market_prob) - 1.0;
+        if b <= 0.0 {
+            return 0.0;
+        }
+        ((p * b - q) / b).max(0.0)
+    }
+}

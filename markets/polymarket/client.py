@@ -1,0 +1,490 @@
+"""
+Polymarket CLOB API client.
+
+Improvements over original:
+- Fully async with aiohttp
+- Designed as standalone microservice for EU deployment
+- Robust token ID resolution with caching
+- No VPN hacks - proper cloud deployment
+"""
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime
+from typing import Any, AsyncIterator, Optional
+
+import aiohttp
+
+from arbees_shared.models.market import (
+    MarketPrice,
+    MarketStatus,
+    OrderBook,
+    OrderBookLevel,
+    Platform,
+)
+from markets.base import BaseMarketClient
+
+logger = logging.getLogger(__name__)
+
+
+class PolymarketClient(BaseMarketClient):
+    """Async Polymarket CLOB API client."""
+
+    CLOB_URL = "https://clob.polymarket.com"
+    GAMMA_URL = "https://gamma-api.polymarket.com"
+
+    # Sports-related tags
+    SPORTS_TAGS = [
+        "sports", "nfl", "nba", "nhl", "mlb",
+        "soccer", "football", "basketball", "hockey", "baseball",
+        "mma", "ufc", "tennis", "golf",
+    ]
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        proxy_url: Optional[str] = None,
+        use_eu_proxy: bool = False,
+        rate_limit: float = 10.0,
+    ):
+        """
+        Initialize Polymarket client.
+
+        Args:
+            api_key: Optional API key for authenticated endpoints
+            proxy_url: Optional proxy URL for routing
+            use_eu_proxy: If True, use EU proxy service (for regulatory compliance)
+            rate_limit: Max requests per second
+        """
+        super().__init__(
+            base_url=self.CLOB_URL,
+            platform=Platform.POLYMARKET,
+            rate_limit=rate_limit,
+        )
+
+        self.api_key = api_key or os.environ.get("POLYMARKET_API_KEY")
+        self.proxy_url = proxy_url
+        self._token_id_cache: dict[str, Optional[str]] = {}
+
+        # EU proxy configuration for regulatory compliance
+        if use_eu_proxy:
+            self.proxy_url = os.environ.get(
+                "EU_POLYMARKET_PROXY_URL",
+                "http://polymarket-proxy.eu-central-1.internal:8080"
+            )
+
+    async def connect(self) -> None:
+        """Create the aiohttp session with optional proxy."""
+        if self._session is None:
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=30,
+            )
+
+            # Note: For actual proxy routing, you'd configure this differently
+            # The proxy_url is for a proxy service, not HTTP proxy
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=self.timeout,
+            )
+
+    def _get_headers(self) -> dict[str, str]:
+        """Get headers for requests."""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def _gamma_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[dict] = None,
+    ) -> Any:
+        """Make request to Gamma API."""
+        session = self._ensure_connected()
+        url = f"{self.GAMMA_URL}{endpoint}"
+
+        await self._rate_limiter.acquire()
+
+        async with session.request(
+            method,
+            url,
+            params=params,
+            headers=self._get_headers(),
+        ) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _clob_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[dict] = None,
+    ) -> Any:
+        """Make request to CLOB API."""
+        session = self._ensure_connected()
+        url = f"{self.CLOB_URL}{endpoint}"
+
+        await self._rate_limiter.acquire()
+
+        async with session.request(
+            method,
+            url,
+            params=params,
+            headers=self._get_headers(),
+        ) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    # ==========================================================================
+    # Token ID Resolution
+    # ==========================================================================
+
+    def _is_valid_token_id(self, token_id: Optional[str]) -> bool:
+        """Validate that a token_id looks legitimate."""
+        if not token_id or not isinstance(token_id, str):
+            return False
+        if len(token_id) < 10:
+            return False
+        if token_id in ["[", "]", "{", "}", "null", "undefined", "None"]:
+            return False
+        if not token_id[0].isalnum():
+            return False
+        return True
+
+    def _extract_yes_token_id(self, market: dict) -> Optional[str]:
+        """Extract YES token_id from market data."""
+        # Try tokens array
+        tokens = market.get("tokens") or []
+        for token in tokens:
+            outcome = str(token.get("outcome", "")).lower()
+            token_id = token.get("token_id") or token.get("id")
+            if outcome == "yes" and self._is_valid_token_id(token_id):
+                return str(token_id)
+
+        # Try outcomes + token_ids arrays
+        outcomes = market.get("outcomes")
+        token_ids = market.get("token_ids")
+        if isinstance(outcomes, list) and isinstance(token_ids, list):
+            for idx, outcome in enumerate(outcomes):
+                if str(outcome).lower() == "yes" and idx < len(token_ids):
+                    tid = str(token_ids[idx])
+                    if self._is_valid_token_id(tid):
+                        return tid
+
+        # Try direct fields
+        direct = market.get("token_id") or market.get("yes_token_id")
+        if self._is_valid_token_id(direct):
+            return str(direct)
+
+        # Try clobTokenIds (new field from CLOB API)
+        clob_token_ids = market.get("clobTokenIds")
+        if clob_token_ids:
+            if isinstance(clob_token_ids, str):
+                try:
+                    clob_token_ids = json.loads(clob_token_ids)
+                except json.JSONDecodeError:
+                    pass
+
+            if isinstance(clob_token_ids, list) and len(clob_token_ids) > 0:
+                token_id = str(clob_token_ids[0])
+                if self._is_valid_token_id(token_id):
+                    return token_id
+
+        return None
+
+    async def resolve_yes_token_id(self, market: dict) -> Optional[str]:
+        """Resolve YES token_id with caching and fallback strategies."""
+        condition_id = market.get("condition_id") or market.get("id")
+        if not condition_id:
+            return None
+
+        condition_id = str(condition_id)
+
+        # Check cache
+        if condition_id in self._token_id_cache:
+            return self._token_id_cache[condition_id]
+
+        # Try extracting from provided market data
+        token_id = self._extract_yes_token_id(market)
+
+        # Fallback: refresh from Gamma API
+        if not token_id:
+            try:
+                refreshed = await self._gamma_request("GET", f"/markets/{condition_id}")
+                if refreshed:
+                    token_id = self._extract_yes_token_id(refreshed)
+            except Exception as e:
+                logger.debug(f"Gamma refresh failed for {condition_id}: {e}")
+
+        # Fallback: try CLOB API
+        if not token_id:
+            try:
+                clob_market = await self._clob_request("GET", f"/markets/{condition_id}")
+                if clob_market:
+                    token_id = self._extract_yes_token_id(clob_market)
+            except Exception as e:
+                logger.debug(f"CLOB lookup failed for {condition_id}: {e}")
+
+        # Cache result (even if None)
+        self._token_id_cache[condition_id] = token_id
+        return token_id
+
+    # ==========================================================================
+    # Market Data Methods
+    # ==========================================================================
+
+    async def get_markets(
+        self,
+        sport: Optional[str] = None,
+        status: str = "open",
+        limit: int = 100,
+    ) -> list[dict]:
+        """Get markets from Polymarket."""
+        params: dict[str, Any] = {"limit": limit}
+
+        if status == "open":
+            params["active"] = "true"
+
+        # Map sport to tag
+        if sport:
+            sport_lower = sport.lower()
+            if sport_lower in self.SPORTS_TAGS:
+                params["tag"] = sport_lower
+            else:
+                # Try "sports" tag as fallback
+                params["tag"] = "sports"
+
+        try:
+            data = await self._gamma_request("GET", "/markets", params=params)
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error(f"Error getting Polymarket markets: {e}")
+            return []
+
+    async def get_market(self, market_id: str) -> Optional[dict]:
+        """Get detailed information about a specific market."""
+        try:
+            return await self._gamma_request("GET", f"/markets/{market_id}")
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                return None
+            raise
+
+    async def get_orderbook(self, market_id: str) -> Optional[OrderBook]:
+        """Get order book for a market (by condition_id or token_id)."""
+        # First, resolve to token_id if given condition_id
+        token_id = market_id
+        if len(market_id) < 30:
+            # Likely a condition_id, need to resolve
+            market = await self.get_market(market_id)
+            if market:
+                resolved = await self.resolve_yes_token_id(market)
+                if resolved:
+                    token_id = resolved
+                else:
+                    return None
+            else:
+                return None
+
+        try:
+            data = await self._clob_request("GET", "/book", params={"token_id": token_id})
+
+            # Parse bids
+            yes_bids = []
+            for level in data.get("bids", []):
+                price = float(level.get("price", 0))
+                size = float(level.get("size", 0))
+                if size > 0:
+                    yes_bids.append(OrderBookLevel(price=price, quantity=size))
+
+            # Parse asks
+            yes_asks = []
+            for level in data.get("asks", []):
+                price = float(level.get("price", 0))
+                size = float(level.get("size", 0))
+                if size > 0:
+                    yes_asks.append(OrderBookLevel(price=price, quantity=size))
+
+            return OrderBook(
+                market_id=market_id,
+                platform=Platform.POLYMARKET,
+                yes_bids=sorted(yes_bids, key=lambda x: x.price, reverse=True),
+                yes_asks=sorted(yes_asks, key=lambda x: x.price),
+            )
+
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                # AMM markets don't have CLOB orderbooks
+                logger.debug(f"No CLOB orderbook for {market_id} (AMM market)")
+                return None
+            raise
+
+    async def get_market_price(self, market_id: str) -> Optional[MarketPrice]:
+        """Get current market price snapshot."""
+        market = await self.get_market(market_id)
+        if not market:
+            return None
+
+        # Try to get orderbook for better prices
+        orderbook = await self.get_orderbook(market_id)
+
+        yes_bid = 0.0
+        yes_ask = 1.0
+        liquidity = 0.0
+
+        if orderbook:
+            if orderbook.best_yes_bid:
+                yes_bid = orderbook.best_yes_bid
+            if orderbook.best_yes_ask:
+                yes_ask = orderbook.best_yes_ask
+            liquidity = orderbook.total_bid_liquidity
+        else:
+            # Fall back to last traded price from market data
+            # Polymarket uses different price formats
+            outcomes = market.get("outcomePrices") or market.get("outcomes_prices") or []
+            if outcomes and len(outcomes) > 0:
+                try:
+                    yes_price = float(outcomes[0]) if isinstance(outcomes[0], (int, float, str)) else 0.5
+                    yes_bid = max(0.0, yes_price - 0.02)
+                    yes_ask = min(1.0, yes_price + 0.02)
+                except (ValueError, TypeError):
+                    pass
+
+        # Determine status
+        status = MarketStatus.OPEN
+        if market.get("closed"):
+            status = MarketStatus.CLOSED
+        elif market.get("resolved"):
+            status = MarketStatus.SETTLED
+
+        return MarketPrice(
+            market_id=market_id,
+            platform=Platform.POLYMARKET,
+            game_id=market.get("game_id"),
+            market_title=market.get("question", market.get("title", "")),
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            volume=float(market.get("volume", 0) or 0),
+            liquidity=liquidity,
+            status=status,
+        )
+
+    async def stream_prices(
+        self,
+        market_ids: list[str],
+        interval_seconds: float = 5.0,
+    ) -> AsyncIterator[MarketPrice]:
+        """Stream price updates for markets via polling."""
+        if not market_ids:
+            return
+
+        logger.info(f"Streaming {len(market_ids)} Polymarket markets")
+
+        while True:
+            for market_id in market_ids:
+                try:
+                    price = await self.get_market_price(market_id)
+                    if price:
+                        yield price
+                except Exception as e:
+                    logger.warning(f"Error fetching price for {market_id}: {e}")
+
+            await asyncio.sleep(interval_seconds)
+
+    # ==========================================================================
+    # Sports-Specific Methods
+    # ==========================================================================
+
+    async def get_sports_markets(self, limit: int = 100) -> list[dict]:
+        """Get all sports-related markets."""
+        all_markets = []
+        seen_ids = set()
+
+        # Fetch from multiple sports tags
+        for tag in ["sports", "nfl", "nba", "soccer", "mma"]:
+            try:
+                markets = await self.get_markets(sport=tag, limit=limit)
+                for market in markets:
+                    market_id = market.get("condition_id") or market.get("id")
+                    if market_id and market_id not in seen_ids:
+                        seen_ids.add(market_id)
+                        all_markets.append(market)
+            except Exception as e:
+                logger.warning(f"Error fetching {tag} markets: {e}")
+
+        return all_markets
+
+    async def search_markets(self, query: str, limit: int = 50) -> list[dict]:
+        """Search for markets by keyword."""
+        try:
+            # Gamma API doesn't have search, filter in memory
+            markets = await self.get_markets(limit=1000)
+            query_lower = query.lower()
+            return [
+                m for m in markets
+                if query_lower in (m.get("question", "") + m.get("title", "")).lower()
+            ][:limit]
+        except Exception as e:
+            logger.error(f"Error searching markets: {e}")
+            return []
+
+    async def get_trades(self, market_id: str, limit: int = 100) -> list[dict]:
+        """Get recent trades for a market."""
+        try:
+            # Resolve token_id
+            market = await self.get_market(market_id)
+            if not market:
+                return []
+
+            token_id = await self.resolve_yes_token_id(market)
+            if not token_id:
+                return []
+
+            data = await self._clob_request(
+                "GET",
+                "/trades",
+                params={"market": token_id, "limit": limit}
+            )
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error(f"Error fetching trades for {market_id}: {e}")
+            return []
+
+    async def health_check(self) -> bool:
+        """Check if APIs are accessible."""
+        try:
+            await self._gamma_request("GET", "/markets", params={"limit": 1})
+            return True
+        except Exception:
+            return False
+
+
+class EUPolymarketProxy:
+    """
+    EU deployment proxy for Polymarket access.
+
+    Designed to run in eu-central-1 as a standalone microservice
+    that forwards requests to Polymarket APIs.
+    """
+
+    def __init__(self, upstream_client: PolymarketClient):
+        self.client = upstream_client
+
+    async def get_markets(self, **kwargs) -> list[dict]:
+        """Forward get_markets request."""
+        return await self.client.get_markets(**kwargs)
+
+    async def get_market_price(self, market_id: str) -> Optional[MarketPrice]:
+        """Forward get_market_price request."""
+        return await self.client.get_market_price(market_id)
+
+    async def get_orderbook(self, market_id: str) -> Optional[OrderBook]:
+        """Forward get_orderbook request."""
+        return await self.client.get_orderbook(market_id)

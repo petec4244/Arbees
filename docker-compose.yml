@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: arbees-timescaledb
+    environment:
+      POSTGRES_USER: arbees
+      POSTGRES_PASSWORD: arbees_dev
+      POSTGRES_DB: arbees
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./shared/arbees_shared/db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arbees"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: arbees-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    container_name: arbees-orchestrator
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://arbees:arbees_dev@timescaledb:5432/arbees
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
+  game_shard:
+    build:
+      context: .
+      dockerfile: services/game_shard/Dockerfile
+    container_name: arbees-game-shard-1
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://arbees:arbees_dev@timescaledb:5432/arbees
+      REDIS_URL: redis://redis:6379
+      SHARD_ID: shard-1
+      LOG_LEVEL: INFO
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: arbees-api
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://arbees:arbees_dev@timescaledb:5432/arbees
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
+volumes:
+  timescaledb_data:
+  redis_data:
+
+networks:
+  default:
+    name: arbees-network

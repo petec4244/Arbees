@@ -1,5 +1,13 @@
 # Environment variables (contains secrets)
 .env
+.env.local
+.env.*.local
+
+# Rust
+target/
+Cargo.lock
+*.rlib
+*.rmeta
 
 # Python
 __pycache__/
@@ -58,6 +66,19 @@ Thumbs.db
 grafana/grafana.db
 *.pem
 
-#claude
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.local
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!*.tfvars.example
+
+# Claude
 .claude/
 CLAUDE.md
