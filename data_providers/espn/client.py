@@ -257,11 +257,20 @@ class ESPNClient(DataProvider):
                 status = status_name
 
             # Build state - sport-specific parsing
+            # Extract names with fallbacks
+            home_team_name = home.get("team", {}).get("displayName", home.get("team", {}).get("name", "Home"))
+            away_team_name = away.get("team", {}).get("displayName", away.get("team", {}).get("name", "Away"))
+            
+            home_abbr = home.get("team", {}).get("abbreviation", "")
+            away_abbr = away.get("team", {}).get("abbreviation", "")
+
             state_kwargs = {
                 "game_id": game_id,
                 "sport": self._sport,
-                "home_team": home.get("team", {}).get("displayName", ""),
-                "away_team": away.get("team", {}).get("displayName", ""),
+                "home_team": home_team_name,
+                "away_team": away_team_name,
+                "home_team_abbrev": home_abbr,
+                "away_team_abbrev": away_abbr,
                 "home_score": int(home.get("score", 0) or 0),
                 "away_score": int(away.get("score", 0) or 0),
                 "period": period,

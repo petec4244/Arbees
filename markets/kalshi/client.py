@@ -284,7 +284,11 @@ class KalshiClient(BaseMarketClient):
         """Get order book for a market."""
         try:
             data = await self.get(f"/markets/{market_id}/orderbook")
-            orderbook_data = data.get("orderbook", {})
+            orderbook_data = data.get("orderbook", {}) or {}
+
+            # Get yes/no levels, handling null values from API
+            yes_levels = orderbook_data.get("yes") or []
+            no_levels = orderbook_data.get("no") or []
 
             # Parse bids (yes side)
             yes_bids = [
@@ -292,8 +296,8 @@ class KalshiClient(BaseMarketClient):
                     price=level[0] / 100.0,  # Kalshi uses cents
                     quantity=level[1],
                 )
-                for level in orderbook_data.get("yes", [])
-                if len(level) >= 2 and level[1] > 0
+                for level in yes_levels
+                if isinstance(level, (list, tuple)) and len(level) >= 2 and level[1] > 0
             ]
 
             # Parse asks (no side inverted)
@@ -302,8 +306,8 @@ class KalshiClient(BaseMarketClient):
                     price=1.0 - (level[0] / 100.0),
                     quantity=level[1],
                 )
-                for level in orderbook_data.get("no", [])
-                if len(level) >= 2 and level[1] > 0
+                for level in no_levels
+                if isinstance(level, (list, tuple)) and len(level) >= 2 and level[1] > 0
             ]
 
             return OrderBook(

@@ -1,3 +1,5 @@
 """Position manager service for risk management and execution."""
 
-__all__ = []
+from .position_manager import PositionManager
+
+__all__ = ["PositionManager"]

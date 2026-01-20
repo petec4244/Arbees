@@ -62,17 +62,42 @@ export default function Dashboard() {
 
       {/* Recent Activity */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="bg-gray-800 rounded-lg p-6">
-          <h2 className="text-xl font-semibold mb-4">Live Games</h2>
-          <div className="space-y-3">
-            {games?.slice(0, 5).map((game: any) => (
-              <div key={game.game_id} className="flex justify-between items-center p-3 bg-gray-700 rounded">
-                <span>{game.away_team_abbrev} @ {game.home_team_abbrev}</span>
-                <span className="font-mono">{game.away_score} - {game.home_score}</span>
+        <div className="bg-gray-800 rounded-lg p-6 flex flex-col max-h-[500px]">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-xl font-semibold">Live Games</h2>
+            <span className="text-xs text-gray-400 bg-gray-900 px-2 py-1 rounded-full">{games?.length || 0} active</span>
+          </div>
+
+          <div className="space-y-3 overflow-y-auto pr-2 custom-scrollbar flex-1">
+            {games?.map((game: any) => (
+              <div key={game.game_id} className="flex flex-col p-3 bg-gray-700/50 rounded hover:bg-gray-700 transition-colors">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">{game.sport}</span>
+                  <span className="text-xs text-green-400 font-mono animate-pulse">● LIVE</span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <div className="flex-1">
+                    <div className="flex justify-between">
+                      <span className="text-gray-300">{game.away_team}</span>
+                      <span className="font-mono font-bold">{game.away_score}</span>
+                    </div>
+                    <div className="flex justify-between mt-1">
+                      <span className="text-white font-medium">{game.home_team}</span>
+                      <span className="font-mono font-bold">{game.home_score}</span>
+                    </div>
+                  </div>
+                </div>
+                {game.status && (
+                  <div className="mt-2 text-xs text-gray-500 text-right">
+                    {game.status.replace('_', ' ')}
+                  </div>
+                )}
               </div>
             ))}
             {(!games || games.length === 0) && (
-              <p className="text-gray-400">No live games at the moment</p>
+              <div className="flex flex-col items-center justify-center h-48 text-gray-500">
+                <p>No live games at the moment</p>
+              </div>
             )}
           </div>
         </div>

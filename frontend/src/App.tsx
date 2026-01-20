@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard'
 import Opportunities from './pages/Opportunities'
 import LiveGames from './pages/LiveGames'
 import PaperTrading from './pages/PaperTrading'
+import SystemStatus from './components/SystemStatus'
 
 function App() {
   const { isConnected, lastMessage } = useWebSocket()
@@ -31,11 +32,14 @@ function App() {
                 </Link>
               </div>
             </div>
-            <div className="flex items-center">
-              <span className={`w-2 h-2 rounded-full mr-2 ${isConnected ? 'bg-green-400' : 'bg-red-400'}`} />
-              <span className="text-sm text-gray-400">
-                {isConnected ? 'Live' : 'Disconnected'}
-              </span>
+            <div className="flex items-center space-x-4">
+              <SystemStatus />
+              <div className="flex items-center">
+                <span className={`w-2 h-2 rounded-full mr-2 ${isConnected ? 'bg-green-400' : 'bg-red-400'}`} />
+                <span className="text-sm text-gray-400">
+                  {isConnected ? 'WS' : 'No WS'}
+                </span>
+              </div>
             </div>
           </div>
         </div>

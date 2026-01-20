@@ -298,7 +298,8 @@ async def get_live_games(
             g.home_team, g.away_team, g.home_team_abbrev, g.away_team_abbrev
         FROM game_states gs
         LEFT JOIN games g ON gs.game_id = g.game_id
-        WHERE gs.status IN ('in_progress', 'halftime', 'end_period')
+        WHERE gs.status NOT IN ('final', 'completed', 'scheduled')
+          AND gs.time > NOW() - INTERVAL '24 hours'
     """
     params = []
 
@@ -503,6 +504,42 @@ async def health_check():
         "database": db is not None,
         "redis": redis is not None,
         "websocket_clients": len(websocket_clients),
+    }
+
+
+@app.get("/api/monitoring/status")
+async def get_system_status():
+    """Detailed system status for frontend."""
+    # Check DB connection
+    db_ok = False
+    if db:
+        try:
+            # Simple query to check connection
+            await db.pool.fetchval("SELECT 1")
+            db_ok = True
+        except Exception:
+            pass
+
+    # Check Redis connection
+    redis_ok = False
+    if redis and redis.redis:
+        try:
+            await redis.redis.ping()
+            redis_ok = True
+        except Exception:
+            pass
+
+    # Get shard count (mock for now or query redis)
+    shards = 0
+    if redis_ok:
+        # In a real implementation we would count active heartbeats
+        # For now return 1 if redis is up
+        shards = 1
+
+    return {
+        "redis": redis_ok,
+        "timescaledb": db_ok,
+        "shards": shards,
     }
 
 

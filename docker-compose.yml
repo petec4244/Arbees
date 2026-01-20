@@ -98,6 +98,31 @@ services:
     profiles:
       - full
 
+  position_manager:
+    build:
+      context: .
+      dockerfile: services/position_manager/Dockerfile
+    container_name: arbees-position-manager
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://arbees:arbees_dev@timescaledb:5432/arbees
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      INITIAL_BANKROLL: "1000"
+      MIN_EDGE_PCT: "2.0"
+      KELLY_FRACTION: "0.25"
+      MAX_POSITION_PCT: "10.0"
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
   frontend:
     build:
       context: ./frontend

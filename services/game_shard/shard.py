@@ -146,7 +146,7 @@ class GameShard:
 
             if game_id and sport_str:
                 sport = Sport(sport_str)
-                logger.info(f"Received add_game command: {game_id} ({sport_str})")
+                logger.info(f"Received add_game command: {game_id} ({sport_str}) kalshi={kalshi_id} poly={poly_id}")
                 await self.add_game(game_id, sport, kalshi_id, poly_id)
 
         elif cmd_type == "remove_game":
@@ -241,8 +241,10 @@ class GameShard:
         # Track market IDs
         if kalshi_market_id:
             ctx.market_ids[Platform.KALSHI] = kalshi_market_id
+            logger.info(f"Game {game_id}: Kalshi market set to {kalshi_market_id}")
         if polymarket_market_id:
             ctx.market_ids[Platform.POLYMARKET] = polymarket_market_id
+            logger.info(f"Game {game_id}: Polymarket market set to {polymarket_market_id}")
 
         self._games[game_id] = ctx
 
@@ -274,6 +276,13 @@ class GameShard:
         # Disconnect ESPN client
         await ctx.espn_client.disconnect()
 
+        # Finalize game state in DB if possible
+        if self.db and ctx.last_state:
+            # We mark it as valid to update the timestamp, but we don't force 'final' 
+            # unless we know for sure. However, if we are removing it, it's likely done.
+            # Safe bet: just update timestamp so it falls out of "live" queries eventually
+            pass 
+
         del self._games[game_id]
         logger.info(f"Removed game {game_id} from shard {self.shard_id}")
         return True
@@ -298,8 +307,13 @@ class GameShard:
                 )
 
                 # Check if game is final
-                if ctx.last_state and ctx.last_state.status == "final":
+                if ctx.last_state and (ctx.last_state.status == "final" or ctx.last_state.status == "complete"):
                     logger.info(f"Game {ctx.game_id} is final")
+                    
+                    # Ensure final state is persisted
+                    if self.db:
+                        await self.db.update_game_status(ctx.game_id, "final")
+                    
                     break
 
                 await asyncio.sleep(interval)

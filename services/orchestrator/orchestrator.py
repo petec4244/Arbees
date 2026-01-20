@@ -105,6 +105,11 @@ class Orchestrator:
         self._assignments: dict[str, GameAssignment] = {}  # game_id -> assignment
         self._running = False
 
+        # Market cache: game_id -> {"kalshi": {team: ticker}, "polymarket": {team: id}}
+        self._market_cache: dict[str, dict] = {}
+        self._kalshi_markets: list[dict] = []  # All open Kalshi markets
+        self._kalshi_refresh_time: Optional[datetime] = None
+
         # Tasks
         self._discovery_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
@@ -329,27 +334,242 @@ class Orchestrator:
         for game_id in finished_ids:
             await self._unassign_game(game_id)
 
+    async def _refresh_kalshi_markets(self) -> None:
+        """Refresh the Kalshi markets cache (every 5 minutes)."""
+        if not self.kalshi:
+            return
+
+        # Check if cache is still fresh (5 minute TTL)
+        now = datetime.utcnow()
+        if self._kalshi_refresh_time and (now - self._kalshi_refresh_time).seconds < 300:
+            return
+
+        try:
+            # Fetch all open markets across sports
+            all_markets = []
+            for sport in ["nfl", "nba", "nhl", "mlb", "ncaaf", "ncaab"]:
+                markets = await self.kalshi.get_markets(sport=sport, limit=200)
+                all_markets.extend(markets)
+
+            # Also fetch without sport filter (catches multi-sport events)
+            general_markets = await self.kalshi.get_markets(limit=200)
+            all_markets.extend(general_markets)
+
+            # Deduplicate by ticker
+            seen = set()
+            unique_markets = []
+            for m in all_markets:
+                ticker = m.get("ticker", "")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    unique_markets.append(m)
+
+            self._kalshi_markets = unique_markets
+            self._kalshi_refresh_time = now
+            logger.info(f"Refreshed Kalshi market cache: {len(unique_markets)} markets")
+
+        except Exception as e:
+            logger.error(f"Error refreshing Kalshi markets: {e}")
+
+    def _get_team_aliases(self, team_name: str, sport: Sport) -> list[str]:
+        """Get all possible names/aliases for a team."""
+        # Normalize input
+        name_lower = team_name.lower().strip()
+
+        # Start with the original name
+        aliases = [name_lower]
+
+        # Team alias mappings (full name -> [aliases])
+        NFL_ALIASES = {
+            "kansas city chiefs": ["kansas city", "chiefs", "kc"],
+            "buffalo bills": ["buffalo", "bills", "buf"],
+            "philadelphia eagles": ["philadelphia", "eagles", "philly", "phi"],
+            "san francisco 49ers": ["san francisco", "49ers", "niners", "sf"],
+            "dallas cowboys": ["dallas", "cowboys", "dal"],
+            "detroit lions": ["detroit", "lions", "det"],
+            "baltimore ravens": ["baltimore", "ravens", "bal"],
+            "green bay packers": ["green bay", "packers", "gb"],
+            "miami dolphins": ["miami", "dolphins", "mia"],
+            "new york jets": ["ny jets", "jets", "nyj"],
+            "new york giants": ["ny giants", "giants", "nyg"],
+            "los angeles rams": ["la rams", "rams", "lar"],
+            "los angeles chargers": ["la chargers", "chargers", "lac"],
+            "las vegas raiders": ["las vegas", "raiders", "lvr"],
+            "denver broncos": ["denver", "broncos", "den"],
+            "pittsburgh steelers": ["pittsburgh", "steelers", "pit"],
+            "cincinnati bengals": ["cincinnati", "bengals", "cin"],
+            "cleveland browns": ["cleveland", "browns", "cle"],
+            "tennessee titans": ["tennessee", "titans", "ten"],
+            "indianapolis colts": ["indianapolis", "colts", "ind"],
+            "houston texans": ["houston", "texans", "hou"],
+            "jacksonville jaguars": ["jacksonville", "jaguars", "jax"],
+            "new england patriots": ["new england", "patriots", "ne"],
+            "seattle seahawks": ["seattle", "seahawks", "sea"],
+            "arizona cardinals": ["arizona", "cardinals", "ari"],
+            "atlanta falcons": ["atlanta", "falcons", "atl"],
+            "carolina panthers": ["carolina", "panthers", "car"],
+            "new orleans saints": ["new orleans", "saints", "no"],
+            "tampa bay buccaneers": ["tampa bay", "buccaneers", "bucs", "tb"],
+            "minnesota vikings": ["minnesota", "vikings", "min"],
+            "chicago bears": ["chicago", "bears", "chi"],
+            "washington commanders": ["washington", "commanders", "wsh"],
+        }
+
+        NBA_ALIASES = {
+            "boston celtics": ["boston", "celtics", "bos"],
+            "los angeles lakers": ["la lakers", "lakers", "lal"],
+            "golden state warriors": ["golden state", "warriors", "gsw"],
+            "phoenix suns": ["phoenix", "suns", "phx"],
+            "milwaukee bucks": ["milwaukee", "bucks", "mil"],
+            "miami heat": ["miami", "heat", "mia"],
+            "philadelphia 76ers": ["philadelphia", "76ers", "sixers", "phi"],
+            "denver nuggets": ["denver", "nuggets", "den"],
+            "cleveland cavaliers": ["cleveland", "cavaliers", "cavs", "cle"],
+            "dallas mavericks": ["dallas", "mavericks", "mavs", "dal"],
+            "brooklyn nets": ["brooklyn", "nets", "bkn"],
+            "new york knicks": ["new york", "knicks", "nyk"],
+            "los angeles clippers": ["la clippers", "clippers", "lac"],
+            "memphis grizzlies": ["memphis", "grizzlies", "mem"],
+            "sacramento kings": ["sacramento", "kings", "sac"],
+            "indiana pacers": ["indiana", "pacers", "ind"],
+            "orlando magic": ["orlando", "magic", "orl"],
+            "chicago bulls": ["chicago", "bulls", "chi"],
+            "toronto raptors": ["toronto", "raptors", "tor"],
+            "atlanta hawks": ["atlanta", "hawks", "atl"],
+            "houston rockets": ["houston", "rockets", "hou"],
+            "san antonio spurs": ["san antonio", "spurs", "sas"],
+            "minnesota timberwolves": ["minnesota", "timberwolves", "wolves", "min"],
+            "oklahoma city thunder": ["oklahoma city", "thunder", "okc"],
+            "portland trail blazers": ["portland", "blazers", "por"],
+            "new orleans pelicans": ["new orleans", "pelicans", "nop"],
+            "utah jazz": ["utah", "jazz", "uta"],
+            "detroit pistons": ["detroit", "pistons", "det"],
+            "charlotte hornets": ["charlotte", "hornets", "cha"],
+            "washington wizards": ["washington", "wizards", "wsh"],
+        }
+
+        NHL_ALIASES = {
+            "toronto maple leafs": ["toronto", "maple leafs", "leafs", "tor"],
+            "montreal canadiens": ["montreal", "canadiens", "habs", "mtl"],
+            "boston bruins": ["boston", "bruins", "bos"],
+            "new york rangers": ["ny rangers", "rangers", "nyr"],
+            "vegas golden knights": ["vegas", "golden knights", "vgk"],
+            "colorado avalanche": ["colorado", "avalanche", "avs", "col"],
+            "edmonton oilers": ["edmonton", "oilers", "edm"],
+            "florida panthers": ["florida", "panthers", "fla"],
+            "dallas stars": ["dallas", "stars", "dal"],
+            "carolina hurricanes": ["carolina", "hurricanes", "canes", "car"],
+            "new jersey devils": ["new jersey", "devils", "njd"],
+            "tampa bay lightning": ["tampa bay", "lightning", "tbl"],
+            "winnipeg jets": ["winnipeg", "jets", "wpg"],
+            "los angeles kings": ["la kings", "kings", "lak"],
+            "pittsburgh penguins": ["pittsburgh", "penguins", "pens", "pit"],
+            "detroit red wings": ["detroit", "red wings", "det"],
+            "chicago blackhawks": ["chicago", "blackhawks", "hawks", "chi"],
+            "minnesota wild": ["minnesota", "wild", "min"],
+            "seattle kraken": ["seattle", "kraken", "sea"],
+            "new york islanders": ["ny islanders", "islanders", "nyi"],
+            "ottawa senators": ["ottawa", "senators", "sens", "ott"],
+            "philadelphia flyers": ["philadelphia", "flyers", "phi"],
+            "washington capitals": ["washington", "capitals", "caps", "wsh"],
+            "buffalo sabres": ["buffalo", "sabres", "buf"],
+            "anaheim ducks": ["anaheim", "ducks", "ana"],
+            "calgary flames": ["calgary", "flames", "cgy"],
+            "vancouver canucks": ["vancouver", "canucks", "van"],
+            "arizona coyotes": ["arizona", "coyotes", "ari"],
+            "san jose sharks": ["san jose", "sharks", "sjs"],
+            "nashville predators": ["nashville", "predators", "preds", "nsh"],
+            "st. louis blues": ["st louis", "blues", "stl"],
+            "columbus blue jackets": ["columbus", "blue jackets", "cbj"],
+        }
+
+        # Select alias map based on sport
+        if sport in (Sport.NFL, Sport.NCAAF):
+            alias_map = NFL_ALIASES
+        elif sport in (Sport.NBA, Sport.NCAAB):
+            alias_map = NBA_ALIASES
+        elif sport == Sport.NHL:
+            alias_map = NHL_ALIASES
+        else:
+            alias_map = {}
+
+        # Find matching aliases
+        for full_name, team_aliases in alias_map.items():
+            if name_lower in full_name or any(a in name_lower for a in team_aliases):
+                aliases.extend(team_aliases)
+                break
+
+        return list(set(aliases))
+
+    def _match_team_in_text(self, text: str, team_name: str, sport: Sport) -> bool:
+        """Check if market text contains team (with win context)."""
+        text_lower = text.lower()
+        aliases = self._get_team_aliases(team_name, sport)
+
+        for alias in aliases:
+            # Check for "team win" patterns
+            if f"will {alias} win" in text_lower:
+                return True
+            if f"{alias} win" in text_lower:
+                return True
+            if f"{alias} to win" in text_lower:
+                return True
+            # Check if alias appears in a game-winner market
+            if alias in text_lower and ("win" in text_lower or "winner" in text_lower):
+                return True
+
+        return False
+
     async def _find_kalshi_market(self, game: GameInfo) -> Optional[str]:
-        """Find Kalshi market for a game."""
+        """Find Kalshi market for a game using cached markets and team matching."""
         if not self.kalshi:
             return None
 
-        try:
-            # Search for market matching the game
-            query = f"{game.away_team_abbrev} {game.home_team_abbrev}"
-            markets = await self.kalshi.search_markets(query, limit=10)
+        # Refresh market cache if needed
+        await self._refresh_kalshi_markets()
 
-            for market in markets:
-                # Match by team names or game keywords
-                title = market.get("title", "").lower()
-                if (
-                    game.home_team_abbrev.lower() in title or
-                    game.away_team_abbrev.lower() in title
-                ):
-                    return market.get("ticker")
+        # Check if we already have a cached mapping
+        if game.game_id in self._market_cache:
+            cached = self._market_cache[game.game_id].get("kalshi", {})
+            # Return home team market (standard for win probability)
+            return cached.get(game.home_team) or cached.get(game.home_team_abbrev)
+
+        try:
+            # Scan all markets for matches
+            home_market = None
+            away_market = None
+
+            for market in self._kalshi_markets:
+                title = market.get("title", "")
+                ticker = market.get("ticker", "")
+                combined = f"{title} {ticker}"
+
+                # Check for home team match
+                if self._match_team_in_text(combined, game.home_team, game.sport):
+                    home_market = ticker
+                    logger.info(f"Kalshi match: {game.home_team} -> {ticker}")
+
+                # Check for away team match
+                if self._match_team_in_text(combined, game.away_team, game.sport):
+                    away_market = ticker
+
+                # If we found both, we can stop
+                if home_market and away_market:
+                    break
+
+            # Cache the mapping
+            self._market_cache[game.game_id] = {
+                "kalshi": {
+                    game.home_team: home_market,
+                    game.away_team: away_market,
+                }
+            }
+
+            # Return home team market for win probability tracking
+            return home_market
 
         except Exception as e:
-            logger.debug(f"Error finding Kalshi market: {e}")
+            logger.error(f"Error finding Kalshi market for {game.game_id}: {e}")
 
         return None
 

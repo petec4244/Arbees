@@ -243,7 +243,7 @@ class PaperTradingEngine(BaseMarketClient):
                 model_prob=trade.model_prob,
                 edge_at_entry=trade.edge_at_entry,
                 kelly_fraction=trade.kelly_fraction,
-                entry_time=trade.entry_time.isoformat(),
+                entry_time=trade.entry_time,  # Pass datetime object, not string
             )
 
         # Publish event
@@ -331,7 +331,7 @@ class PaperTradingEngine(BaseMarketClient):
             await self.db.close_paper_trade(
                 trade_id=closed_trade.trade_id,
                 exit_price=exec_price,
-                exit_time=closed_trade.exit_time.isoformat() if closed_trade.exit_time else datetime.utcnow().isoformat(),
+                exit_time=closed_trade.exit_time if closed_trade.exit_time else datetime.utcnow(),
                 outcome=outcome.value,
             )
 
