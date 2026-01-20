@@ -1,0 +1,59 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+.eggs
+dist
+build
+*.egg
+venv
+env
+.venv
+
+# Rust build artifacts
+target
+rust_core/target
+
+# Node
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Docker volumes
+volumes
+
+# Data files
+data/training
+data/production
+data/models
+*.parquet
+*.pkl
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Terraform
+.terraform
+*.tfstate
+*.tfstate.*
+
+# Claude
+.claude
+
+# Docs
+docs

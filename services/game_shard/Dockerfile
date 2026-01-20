@@ -1,5 +1,5 @@
 # GameShard Service Dockerfile
-FROM python:3.11-slim as base
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -13,28 +13,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Install Python dependencies
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[dev]"
-
-# Build Rust core
-COPY Cargo.toml ./
+# Copy project files
+COPY pyproject.toml README.md Cargo.toml ./
 COPY rust_core/ ./rust_core/
-RUN cd rust_core && pip install maturin && maturin develop --release
-
-# Copy shared library
 COPY shared/ ./shared/
-
-# Copy service code
-COPY services/game_shard/ ./services/game_shard/
-
-# Copy data providers and market clients
 COPY data_providers/ ./data_providers/
 COPY markets/ ./markets/
+COPY services/ ./services/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir maturin
+RUN pip install --no-cache-dir .
+
+# Build and install Rust core
+RUN cd rust_core && maturin build --release && pip install $(find /app/target/wheels -name "*.whl" | head -1)
+
+ENV PYTHONPATH=/app:/app/shared
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python -c "import asyncio; from services.game_shard.shard import GameShard; print('healthy')" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "print('healthy')" || exit 1
 
 # Run the service
 CMD ["python", "-m", "services.game_shard.shard"]

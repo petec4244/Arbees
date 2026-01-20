@@ -124,10 +124,36 @@ class GameShard:
 
         self._running = True
 
+        # Subscribe to commands from orchestrator
+        command_channel = f"shard:{self.shard_id}:command"
+        await self.redis.subscribe(command_channel, self._handle_command)
+        asyncio.create_task(self.redis.start_listening())
+
         # Start heartbeat
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         logger.info(f"GameShard {self.shard_id} started")
+
+    async def _handle_command(self, data: dict) -> None:
+        """Handle command from orchestrator."""
+        cmd_type = data.get("type")
+
+        if cmd_type == "add_game":
+            game_id = data.get("game_id")
+            sport_str = data.get("sport")
+            kalshi_id = data.get("kalshi_market_id")
+            poly_id = data.get("polymarket_market_id")
+
+            if game_id and sport_str:
+                sport = Sport(sport_str)
+                logger.info(f"Received add_game command: {game_id} ({sport_str})")
+                await self.add_game(game_id, sport, kalshi_id, poly_id)
+
+        elif cmd_type == "remove_game":
+            game_id = data.get("game_id")
+            if game_id:
+                logger.info(f"Received remove_game command: {game_id}")
+                await self.remove_game(game_id)
 
     async def stop(self) -> None:
         """Stop the shard gracefully."""

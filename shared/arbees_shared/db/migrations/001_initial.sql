@@ -215,7 +215,7 @@ CREATE TABLE trading_signals (
 SELECT create_hypertable('trading_signals', 'time');
 CREATE INDEX idx_trading_signals_game_id ON trading_signals(game_id, time DESC) WHERE game_id IS NOT NULL;
 CREATE INDEX idx_trading_signals_type ON trading_signals(signal_type, time DESC);
-CREATE INDEX idx_trading_signals_active ON trading_signals(time DESC) WHERE NOT executed AND (expires_at IS NULL OR expires_at > NOW());
+CREATE INDEX idx_trading_signals_active ON trading_signals(time DESC) WHERE NOT executed;
 
 -- Arbitrage opportunities (time-series - detected opportunities)
 CREATE TABLE arbitrage_opportunities (

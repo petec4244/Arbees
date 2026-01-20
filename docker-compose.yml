@@ -92,6 +92,18 @@ services:
     profiles:
       - full
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: arbees-frontend
+    depends_on:
+      - api
+    ports:
+      - "3000:80"
+    profiles:
+      - full
+
 volumes:
   timescaledb_data:
   redis_data:
