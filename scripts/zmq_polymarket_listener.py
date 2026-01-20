@@ -19,6 +19,10 @@ import sys
 from datetime import datetime
 from typing import Optional
 
+# Fix Windows asyncio compatibility with ZMQ
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Optional imports
 try:
     import zmq

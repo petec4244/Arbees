@@ -3,9 +3,14 @@
 
 FROM python:3.11-slim-bookworm
 
-# Install minimal dependencies
+# Install build dependencies for pyzmq on ARM + runtime deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    build-essential \
+    cmake \
+    libzmq3-dev \
+    libatomic1 \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
