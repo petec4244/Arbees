@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
-import { TrendingUp, TrendingDown, Activity, Target, AlertTriangle, ChevronDown, ChevronUp, Eye, EyeOff } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { TrendingUp, TrendingDown, Activity, Target, AlertTriangle, ChevronDown, ChevronUp, Eye, EyeOff, Clock, Calendar, ArrowRight } from 'lucide-react'
 import EquityCurveSparkline from '../components/EquityCurveSparkline'
 import RiskStatusBar from '../components/RiskStatusBar'
 import RecentTradesList from '../components/RecentTradesList'
@@ -25,6 +26,11 @@ async function fetchRiskMetrics() {
   return res.json()
 }
 
+async function fetchUpcomingGames() {
+  const res = await fetch('/api/upcoming-games?hours_ahead=6&limit=5')
+  return res.json()
+}
+
 export default function Dashboard() {
   const {
     showLiveGames,
@@ -32,6 +38,7 @@ export default function Dashboard() {
     showOpportunities,
     showEquityCurve,
     showRiskBar,
+    showUpcomingGames,
     toggleSection,
     isSectionCollapsed,
   } = useUIPreferences()
@@ -58,6 +65,12 @@ export default function Dashboard() {
     queryKey: ['riskMetrics'],
     queryFn: fetchRiskMetrics,
     refetchInterval: 5000,
+  })
+
+  const { data: upcomingGames } = useQuery({
+    queryKey: ['upcomingGamesDashboard'],
+    queryFn: fetchUpcomingGames,
+    refetchInterval: 60000, // Refresh every minute
   })
 
   // Calculate daily P&L (from risk metrics)
@@ -199,6 +212,17 @@ export default function Dashboard() {
         )}
       </div>
 
+      {/* Upcoming Games */}
+      {showUpcomingGames && (
+        <CollapsibleSection
+          title="Upcoming Games"
+          badge={`${upcomingGames?.length || 0} in next 6h`}
+          sectionId="dashboard-upcoming-games"
+        >
+          <UpcomingGamesList games={upcomingGames} />
+        </CollapsibleSection>
+      )}
+
       {/* Top Opportunities */}
       {showOpportunities && (
         <CollapsibleSection
@@ -296,12 +320,15 @@ function ViewToggle() {
     setShowEquityCurve,
     showRiskBar,
     setShowRiskBar,
+    showUpcomingGames,
+    setShowUpcomingGames,
   } = useUIPreferences()
 
   const toggles = [
     { label: 'Equity', value: showEquityCurve, set: setShowEquityCurve },
     { label: 'Risk', value: showRiskBar, set: setShowRiskBar },
     { label: 'Games', value: showLiveGames, set: setShowLiveGames },
+    { label: 'Upcoming', value: showUpcomingGames, set: setShowUpcomingGames },
     { label: 'Trades', value: showRecentTrades, set: setShowRecentTrades },
     { label: 'Opps', value: showOpportunities, set: setShowOpportunities },
   ]
@@ -369,6 +396,76 @@ function OpportunityList({ limit }: { limit: number }) {
       {(!opportunities || opportunities.length === 0) && (
         <p className="text-gray-400 text-center py-8">No active opportunities</p>
       )}
+    </div>
+  )
+}
+
+const TIME_CATEGORY_COLORS: Record<string, { text: string; bg: string }> = {
+  imminent: { text: 'text-red-400', bg: 'bg-red-500/10' },
+  soon: { text: 'text-yellow-400', bg: 'bg-yellow-500/10' },
+  upcoming: { text: 'text-blue-400', bg: 'bg-blue-500/10' },
+  future: { text: 'text-gray-400', bg: 'bg-gray-500/10' },
+}
+
+function UpcomingGamesList({ games }: { games?: any[] }) {
+  if (!games || games.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-48 text-gray-500">
+        <Calendar className="w-8 h-8 mb-2 opacity-50" />
+        <p>No upcoming games in the next 6 hours</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3">
+      {games.map((game: any) => {
+        const colors = TIME_CATEGORY_COLORS[game.time_category] || TIME_CATEGORY_COLORS.upcoming
+        const scheduledDate = new Date(game.scheduled_time)
+
+        return (
+          <div
+            key={game.game_id}
+            className="flex flex-col p-3 bg-gray-700/50 rounded hover:bg-gray-700 transition-colors"
+          >
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">
+                {game.sport}
+              </span>
+              <span className={`text-xs font-bold px-2 py-0.5 rounded ${colors.bg} ${colors.text}`}>
+                {game.time_until_start}
+              </span>
+            </div>
+            <div className="flex justify-between items-center">
+              <div className="flex-1">
+                <div className="flex justify-between">
+                  <span className="text-gray-300">{game.away_team_abbrev || game.away_team}</span>
+                  <span className="text-xs text-gray-500">AWAY</span>
+                </div>
+                <div className="flex justify-between mt-1">
+                  <span className="text-white font-medium">{game.home_team_abbrev || game.home_team}</span>
+                  <span className="text-xs text-gray-500">HOME</span>
+                </div>
+              </div>
+            </div>
+            <div className="mt-2 flex items-center gap-2 text-xs text-gray-500">
+              <Clock className="w-3 h-3" />
+              <span>{scheduledDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+              <span className="text-gray-600">|</span>
+              <span>{scheduledDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+            </div>
+          </div>
+        )
+      })}
+
+      {/* Link to full upcoming games page */}
+      <Link
+        to="/upcoming-games"
+        className="flex items-center justify-center gap-2 p-3 text-sm text-blue-400 hover:text-blue-300 hover:bg-gray-700/50 rounded transition-colors"
+      >
+        View all upcoming games
+        <ArrowRight className="w-4 h-4" />
+      </Link>
     </div>
   )
 }

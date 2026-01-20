@@ -2,7 +2,8 @@
 
 import os
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional
+from datetime import datetime
+from typing import AsyncGenerator, Optional, Union
 
 import asyncpg
 from asyncpg import Pool, Connection
@@ -86,26 +87,48 @@ class DatabaseClient:
         sport: str,
         home_team: str,
         away_team: str,
-        scheduled_time: str,
+        scheduled_time: Union[datetime, str],
         home_team_abbrev: Optional[str] = None,
         away_team_abbrev: Optional[str] = None,
         venue: Optional[str] = None,
         broadcast: Optional[str] = None,
+        status: str = "scheduled",
     ) -> None:
-        """Insert or update a game."""
+        """Insert or update a game.
+
+        Note: The ON CONFLICT clause intentionally does NOT update status
+        to avoid overwriting live game status with 'scheduled'.
+        """
+        # Convert string to datetime if necessary
+        if isinstance(scheduled_time, str):
+            scheduled_time = datetime.fromisoformat(scheduled_time.replace("Z", "+00:00"))
         pool = await self._get_pool()
         await pool.execute(
             """
             INSERT INTO games (
                 game_id, sport, home_team, away_team, scheduled_time,
-                home_team_abbrev, away_team_abbrev, venue, broadcast
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                home_team_abbrev, away_team_abbrev, venue, broadcast, status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (game_id) DO UPDATE SET
-                status = EXCLUDED.status,
+                venue = COALESCE(EXCLUDED.venue, games.venue),
+                broadcast = COALESCE(EXCLUDED.broadcast, games.broadcast),
+                scheduled_time = EXCLUDED.scheduled_time,
                 updated_at = NOW()
             """,
             game_id, sport, home_team, away_team, scheduled_time,
-            home_team_abbrev, away_team_abbrev, venue, broadcast
+            home_team_abbrev, away_team_abbrev, venue, broadcast, status
+        )
+
+    async def update_game_status(self, game_id: str, status: str) -> None:
+        """Update a game's status."""
+        pool = await self._get_pool()
+        await pool.execute(
+            """
+            UPDATE games
+            SET status = $2, updated_at = NOW()
+            WHERE game_id = $1
+            """,
+            game_id, status
         )
 
     async def get_live_games(self, sport: Optional[str] = None) -> list[dict]:
@@ -441,6 +464,41 @@ class DatabaseClient:
                 """,
                 trade_id, exit_price, exit_time, outcome, exit_fees, pnl, pnl_pct
             )
+
+    async def get_open_positions_for_game(self, game_id: str) -> list[dict]:
+        """Get all open paper trades for a specific game."""
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            """
+            SELECT trade_id, market_id, market_title, side, entry_price, size,
+                   entry_time, entry_fees
+            FROM paper_trades
+            WHERE game_id = $1 AND status = 'open'
+            ORDER BY time DESC
+            """,
+            game_id
+        )
+        return [dict(row) for row in rows]
+
+    async def update_bankroll(
+        self,
+        pnl_change: float,
+        account_name: str = "default"
+    ) -> None:
+        """Update bankroll balance after a trade settlement."""
+        pool = await self._get_pool()
+        await pool.execute(
+            """
+            UPDATE bankroll
+            SET
+                current_balance = current_balance + $1,
+                peak_balance = GREATEST(peak_balance, current_balance + $1),
+                trough_balance = LEAST(trough_balance, current_balance + $1),
+                updated_at = NOW()
+            WHERE account_name = $2
+            """,
+            pnl_change, account_name
+        )
 
     async def get_performance_stats(
         self,

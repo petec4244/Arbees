@@ -6,7 +6,7 @@ Supports: NFL, NBA, NHL, MLB, NCAAF, NCAAB, MLS, Soccer
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import AsyncIterator, Callable, Coroutine, Optional
 
 import aiohttp
@@ -142,6 +142,39 @@ class ESPNClient(DataProvider):
         except Exception as e:
             logger.error(f"Error fetching games for {self._sport}: {e}")
             return []
+
+    async def get_games_for_date(self, date: datetime) -> list[GameInfo]:
+        """Get all games for a specific date."""
+        try:
+            date_str = date.strftime("%Y%m%d")
+            data = await self._fetch(f"scoreboard?dates={date_str}")
+            events = data.get("events", [])
+
+            games = []
+            for event in events:
+                game_info = self._parse_game_info(event)
+                if game_info:
+                    games.append(game_info)
+
+            return games
+        except Exception as e:
+            logger.error(f"Error fetching games for {self._sport} on {date}: {e}")
+            return []
+
+    async def get_scheduled_games(self, days_ahead: int = 7) -> list[GameInfo]:
+        """Get all scheduled games for the next N days."""
+        games = []
+        today = datetime.utcnow().date()
+
+        for day_offset in range(days_ahead + 1):
+            target_date = datetime.combine(
+                today + timedelta(days=day_offset),
+                datetime.min.time()
+            )
+            day_games = await self.get_games_for_date(target_date)
+            games.extend(day_games)
+
+        return games
 
     def _parse_game_info(self, event: dict) -> Optional[GameInfo]:
         """Parse ESPN event into GameInfo."""

@@ -173,6 +173,22 @@ class GameStateResponse(BaseModel):
     home_win_prob: Optional[float]
 
 
+class UpcomingGameResponse(BaseModel):
+    """Response model for upcoming games."""
+    game_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    home_team_abbrev: Optional[str] = None
+    away_team_abbrev: Optional[str] = None
+    scheduled_time: datetime
+    venue: Optional[str] = None
+    broadcast: Optional[str] = None
+    time_category: str  # "imminent" | "soon" | "upcoming" | "future"
+    time_until_start: str  # "15 min" | "2h 15m" | "Today at 7:00 PM" | "Tomorrow at 1:00 PM"
+    minutes_until_start: int
+
+
 class SignalResponse(BaseModel):
     signal_id: str
     signal_type: str
@@ -427,6 +443,189 @@ async def get_game_signals(
     """, game_id, limit)
 
     return [SignalResponse(**dict(row)) for row in rows]
+
+
+# =============================================================================
+# Upcoming Games Endpoints
+# =============================================================================
+
+def _categorize_time(minutes_until_start: int) -> str:
+    """Categorize time until game start.
+
+    Categories:
+    - imminent: < 30 minutes
+    - soon: 30 min - 2 hours
+    - upcoming: 2 - 24 hours
+    - future: > 24 hours
+    """
+    if minutes_until_start < 30:
+        return "imminent"
+    elif minutes_until_start < 120:  # 2 hours
+        return "soon"
+    elif minutes_until_start < 1440:  # 24 hours
+        return "upcoming"
+    else:
+        return "future"
+
+
+def _format_time_until(scheduled_time: datetime, minutes_until: int) -> str:
+    """Format time until game start as human-readable string."""
+    if minutes_until < 0:
+        return "Started"
+
+    if minutes_until < 60:
+        return f"{minutes_until} min"
+    elif minutes_until < 120:
+        hours = minutes_until // 60
+        mins = minutes_until % 60
+        return f"{hours}h {mins}m" if mins > 0 else f"{hours} hour"
+    elif minutes_until < 1440:  # Same day
+        hours = minutes_until // 60
+        mins = minutes_until % 60
+        if mins > 0:
+            return f"{hours}h {mins}m"
+        return f"{hours} hours"
+    elif minutes_until < 2880:  # Tomorrow
+        # Format as "Tomorrow at HH:MM AM/PM"
+        return f"Tomorrow at {scheduled_time.strftime('%I:%M %p')}"
+    else:
+        # Format as "Day, Mon DD at HH:MM AM/PM"
+        return scheduled_time.strftime("%a, %b %d at %I:%M %p")
+
+
+@app.get("/api/upcoming-games", response_model=list[UpcomingGameResponse])
+async def get_upcoming_games(
+    sport: Optional[str] = Query(None, description="Filter by sport (nfl, nba, nhl, etc.)"),
+    hours_ahead: int = Query(24, ge=1, le=168, description="Hours ahead to look (1-168)"),
+    limit: int = Query(50, le=200, description="Maximum number of games to return"),
+):
+    """Get upcoming scheduled games with time categorization.
+
+    Returns games that are scheduled but haven't started yet, sorted by start time.
+    Each game includes:
+    - time_category: "imminent" (<30min), "soon" (30min-2h), "upcoming" (2-24h), "future" (>24h)
+    - time_until_start: Human-readable time until game starts
+    - minutes_until_start: Minutes until game starts (for sorting/filtering)
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    # Query scheduled games from the games table
+    # Include games where status is 'scheduled' or NULL and scheduled_time is in the future
+    query = """
+        SELECT
+            g.game_id,
+            g.sport,
+            COALESCE(g.home_team, 'TBD') as home_team,
+            COALESCE(g.away_team, 'TBD') as away_team,
+            g.home_team_abbrev,
+            g.away_team_abbrev,
+            g.scheduled_time,
+            g.venue,
+            g.broadcast,
+            EXTRACT(EPOCH FROM (g.scheduled_time - NOW())) / 60 AS minutes_until_start
+        FROM games g
+        WHERE (g.status IS NULL OR g.status IN ('scheduled', 'status_scheduled', 'pregame'))
+          AND g.scheduled_time > NOW()
+          AND g.scheduled_time < NOW() + INTERVAL '%s hours'
+    """ % hours_ahead
+
+    params = []
+
+    if sport:
+        query += f" AND LOWER(g.sport) = ${len(params) + 1}"
+        params.append(sport.lower())
+
+    query += f"""
+        ORDER BY g.scheduled_time ASC
+        LIMIT ${len(params) + 1}
+    """
+    params.append(limit)
+
+    rows = await pool.fetch(query, *params)
+
+    results = []
+    for row in rows:
+        minutes_until = int(row["minutes_until_start"] or 0)
+        scheduled_time = row["scheduled_time"]
+
+        # Skip if game already started (shouldn't happen but safety check)
+        if minutes_until < -5:
+            continue
+
+        time_category = _categorize_time(minutes_until)
+        time_until_start = _format_time_until(scheduled_time, minutes_until)
+
+        results.append(UpcomingGameResponse(
+            game_id=row["game_id"],
+            sport=row["sport"],
+            home_team=row["home_team"],
+            away_team=row["away_team"],
+            home_team_abbrev=row["home_team_abbrev"],
+            away_team_abbrev=row["away_team_abbrev"],
+            scheduled_time=scheduled_time,
+            venue=row["venue"],
+            broadcast=row["broadcast"],
+            time_category=time_category,
+            time_until_start=time_until_start,
+            minutes_until_start=max(0, minutes_until),
+        ))
+
+    return results
+
+
+@app.get("/api/upcoming-games/stats")
+async def get_upcoming_games_stats(
+    hours_ahead: int = Query(24, ge=1, le=168),
+):
+    """Get statistics about upcoming games."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    row = await pool.fetchrow("""
+        SELECT
+            COUNT(*) as total_games,
+            COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM (scheduled_time - NOW())) / 60 < 30) as imminent,
+            COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM (scheduled_time - NOW())) / 60 >= 30
+                                AND EXTRACT(EPOCH FROM (scheduled_time - NOW())) / 60 < 120) as soon,
+            COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM (scheduled_time - NOW())) / 60 >= 120
+                                AND EXTRACT(EPOCH FROM (scheduled_time - NOW())) / 60 < 1440) as upcoming,
+            COUNT(*) FILTER (WHERE EXTRACT(EPOCH FROM (scheduled_time - NOW())) / 60 >= 1440) as future
+        FROM games
+        WHERE (status IS NULL OR status IN ('scheduled', 'status_scheduled', 'pregame'))
+          AND scheduled_time > NOW()
+          AND scheduled_time < NOW() + INTERVAL '%s hours'
+    """ % hours_ahead)
+
+    # Count by sport
+    sport_rows = await pool.fetch("""
+        SELECT
+            sport,
+            COUNT(*) as count
+        FROM games
+        WHERE (status IS NULL OR status IN ('scheduled', 'status_scheduled', 'pregame'))
+          AND scheduled_time > NOW()
+          AND scheduled_time < NOW() + INTERVAL '%s hours'
+        GROUP BY sport
+        ORDER BY count DESC
+    """ % hours_ahead)
+
+    by_sport = {r["sport"]: r["count"] for r in sport_rows}
+
+    return {
+        "total_games": row["total_games"] if row else 0,
+        "by_category": {
+            "imminent": row["imminent"] if row else 0,
+            "soon": row["soon"] if row else 0,
+            "upcoming": row["upcoming"] if row else 0,
+            "future": row["future"] if row else 0,
+        },
+        "by_sport": by_sport,
+    }
 
 
 # =============================================================================

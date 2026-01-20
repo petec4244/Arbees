@@ -78,6 +78,7 @@ class Orchestrator:
         discovery_interval: float = 30.0,
         health_check_interval: float = 15.0,
         shard_timeout: float = 60.0,
+        scheduled_sync_interval: float = 3600.0,
     ):
         """
         Initialize Orchestrator.
@@ -86,10 +87,12 @@ class Orchestrator:
             discovery_interval: Seconds between game discovery scans
             health_check_interval: Seconds between health checks
             shard_timeout: Seconds before considering shard unhealthy
+            scheduled_sync_interval: Seconds between scheduled game syncs (default 1 hour)
         """
         self.discovery_interval = discovery_interval
         self.health_check_interval = health_check_interval
         self.shard_timeout = timedelta(seconds=shard_timeout)
+        self.scheduled_sync_interval = scheduled_sync_interval
 
         # Connections
         self.db: Optional[DatabaseClient] = None
@@ -114,6 +117,7 @@ class Orchestrator:
         self._discovery_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._scheduled_sync_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         """Start the orchestrator."""
@@ -152,6 +156,7 @@ class Orchestrator:
         # Start background tasks
         self._discovery_task = asyncio.create_task(self._discovery_loop())
         self._health_task = asyncio.create_task(self._health_check_loop())
+        self._scheduled_sync_task = asyncio.create_task(self._scheduled_games_sync_loop())
 
         logger.info("Orchestrator started")
 
@@ -161,7 +166,7 @@ class Orchestrator:
         self._running = False
 
         # Cancel tasks
-        for task in [self._discovery_task, self._health_task, self._heartbeat_task]:
+        for task in [self._discovery_task, self._health_task, self._heartbeat_task, self._scheduled_sync_task]:
             if task:
                 task.cancel()
                 try:
@@ -333,6 +338,55 @@ class Orchestrator:
 
         for game_id in finished_ids:
             await self._unassign_game(game_id)
+
+    # ==========================================================================
+    # Scheduled Games Sync
+    # ==========================================================================
+
+    async def _scheduled_games_sync_loop(self) -> None:
+        """Periodically sync scheduled games to database."""
+        # Run immediately on startup, then hourly
+        while self._running:
+            try:
+                await self._sync_scheduled_games()
+            except Exception as e:
+                logger.error(f"Error syncing scheduled games: {e}")
+
+            await asyncio.sleep(self.scheduled_sync_interval)
+
+    async def _sync_scheduled_games(self) -> None:
+        """Fetch scheduled games from ESPN and upsert to database."""
+        all_games: list[GameInfo] = []
+
+        for sport, client in self._espn_clients.items():
+            try:
+                games = await client.get_scheduled_games(days_ahead=7)
+                all_games.extend(games)
+                logger.info(f"Fetched {len(games)} scheduled {sport.value} games")
+            except Exception as e:
+                logger.warning(f"Error fetching scheduled {sport.value} games: {e}")
+
+        # Upsert to database
+        synced_count = 0
+        for game in all_games:
+            try:
+                await self.db.upsert_game(
+                    game_id=game.game_id,
+                    sport=game.sport.value,
+                    home_team=game.home_team,
+                    away_team=game.away_team,
+                    scheduled_time=game.scheduled_time,
+                    home_team_abbrev=game.home_team_abbrev,
+                    away_team_abbrev=game.away_team_abbrev,
+                    venue=game.venue,
+                    broadcast=game.broadcast,
+                    status=game.status or "scheduled",
+                )
+                synced_count += 1
+            except Exception as e:
+                logger.warning(f"Error upserting game {game.game_id}: {e}")
+
+        logger.info(f"Synced {synced_count} scheduled games to database")
 
     async def _refresh_kalshi_markets(self) -> None:
         """Refresh the Kalshi markets cache (every 5 minutes)."""

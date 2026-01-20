@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard'
 import Analytics from './pages/Analytics'
 import Opportunities from './pages/Opportunities'
 import LiveGames from './pages/LiveGames'
+import UpcomingGames from './pages/UpcomingGames'
 import PaperTrading from './pages/PaperTrading'
 import SystemStatus from './components/SystemStatus'
 
@@ -82,6 +83,7 @@ function App() {
                 <NavLink to="/analytics">Analytics</NavLink>
                 <NavLink to="/opportunities">Opportunities</NavLink>
                 <NavLink to="/live-games">Live Games</NavLink>
+                <NavLink to="/upcoming-games">Upcoming</NavLink>
                 <NavLink to="/paper-trading">Paper Trading</NavLink>
               </div>
             </div>
@@ -108,6 +110,7 @@ function App() {
               <MobileNavLink to="/analytics" onClick={closeMobileMenu}>Analytics</MobileNavLink>
               <MobileNavLink to="/opportunities" onClick={closeMobileMenu}>Opportunities</MobileNavLink>
               <MobileNavLink to="/live-games" onClick={closeMobileMenu}>Live Games</MobileNavLink>
+              <MobileNavLink to="/upcoming-games" onClick={closeMobileMenu}>Upcoming Games</MobileNavLink>
               <MobileNavLink to="/paper-trading" onClick={closeMobileMenu}>Paper Trading</MobileNavLink>
             </div>
             <div className="px-4 py-3 border-t border-gray-700">
@@ -124,6 +127,7 @@ function App() {
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/opportunities" element={<Opportunities />} />
           <Route path="/live-games" element={<LiveGames />} />
+          <Route path="/upcoming-games" element={<UpcomingGames />} />
           <Route path="/paper-trading" element={<PaperTrading />} />
         </Routes>
       </main>

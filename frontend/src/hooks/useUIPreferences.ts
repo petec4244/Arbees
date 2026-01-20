@@ -8,6 +8,7 @@ interface UIPreferencesState {
   showOpportunities: boolean
   showEquityCurve: boolean
   showRiskBar: boolean
+  showUpcomingGames: boolean
 
   // Analytics preferences
   analyticsTimePeriod: '7d' | '30d' | '90d' | 'all'
@@ -25,6 +26,7 @@ interface UIPreferencesState {
   setShowOpportunities: (show: boolean) => void
   setShowEquityCurve: (show: boolean) => void
   setShowRiskBar: (show: boolean) => void
+  setShowUpcomingGames: (show: boolean) => void
   setAnalyticsTimePeriod: (period: '7d' | '30d' | '90d' | 'all') => void
   setRiskDisplayMode: (mode: 'compact' | 'detailed') => void
   setShowLatencyChart: (show: boolean) => void
@@ -41,6 +43,7 @@ export const useUIPreferences = create<UIPreferencesState>()(
       showOpportunities: true,
       showEquityCurve: true,
       showRiskBar: true,
+      showUpcomingGames: true,
 
       // Default analytics period
       analyticsTimePeriod: '30d',
@@ -58,6 +61,7 @@ export const useUIPreferences = create<UIPreferencesState>()(
       setShowOpportunities: (show) => set({ showOpportunities: show }),
       setShowEquityCurve: (show) => set({ showEquityCurve: show }),
       setShowRiskBar: (show) => set({ showRiskBar: show }),
+      setShowUpcomingGames: (show) => set({ showUpcomingGames: show }),
       setAnalyticsTimePeriod: (period) => set({ analyticsTimePeriod: period }),
       setRiskDisplayMode: (mode) => set({ riskDisplayMode: mode }),
       setShowLatencyChart: (show) => set({ showLatencyChart: show }),

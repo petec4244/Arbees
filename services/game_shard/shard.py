@@ -25,6 +25,8 @@ from arbees_shared.models.signal import TradingSignal, SignalType, SignalDirecti
 from data_providers.espn.client import ESPNClient
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
+from markets.kalshi.hybrid_client import HybridKalshiClient
+from markets.polymarket.hybrid_client import HybridPolymarketClient
 import arbees_core
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ class GameShard:
         default_poll_interval: float = 3.0,
         crunch_time_interval: float = 1.0,
         halftime_interval: float = 30.0,
+        use_websocket_streaming: bool = True,
     ):
         """
         Initialize GameShard.
@@ -75,12 +78,14 @@ class GameShard:
             default_poll_interval: Normal poll interval in seconds
             crunch_time_interval: Poll interval for close games
             halftime_interval: Poll interval during halftime
+            use_websocket_streaming: If True, use WebSocket for real-time prices (10-50ms latency)
         """
         self.shard_id = shard_id or os.environ.get("SHARD_ID", str(uuid.uuid4())[:8])
         self.max_games = max_games
         self.default_poll_interval = default_poll_interval
         self.crunch_time_interval = crunch_time_interval
         self.halftime_interval = halftime_interval
+        self.use_websocket_streaming = use_websocket_streaming
 
         # Connections (shared across all games)
         self.db: Optional[DatabaseClient] = None
@@ -88,11 +93,19 @@ class GameShard:
         self.kalshi: Optional[KalshiClient] = None
         self.polymarket: Optional[PolymarketClient] = None
 
+        # Hybrid clients for WebSocket streaming (10-50ms latency vs 500-3000ms polling)
+        self.kalshi_hybrid: Optional[HybridKalshiClient] = None
+        self.polymarket_hybrid: Optional[HybridPolymarketClient] = None
+
         # Game tracking
         self._games: dict[str, GameContext] = {}
         self._game_tasks: dict[str, asyncio.Task] = {}
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
+
+        # WebSocket streaming tasks
+        self._ws_stream_tasks: dict[Platform, asyncio.Task] = {}
+        self._market_to_game: dict[str, str] = {}  # market_id -> game_id mapping
 
     @property
     def game_count(self) -> int:
@@ -106,7 +119,7 @@ class GameShard:
 
     async def start(self) -> None:
         """Start the shard and connect to services."""
-        logger.info(f"Starting GameShard {self.shard_id}")
+        logger.info(f"Starting GameShard {self.shard_id} (websocket_streaming={self.use_websocket_streaming})")
 
         # Connect to database
         pool = await get_pool()
@@ -117,11 +130,27 @@ class GameShard:
         await self.redis.connect()
 
         # Connect to market clients
-        self.kalshi = KalshiClient()
-        await self.kalshi.connect()
+        if self.use_websocket_streaming:
+            # Use hybrid clients for WebSocket streaming
+            self.kalshi_hybrid = HybridKalshiClient()
+            await self.kalshi_hybrid.connect()
+            # Also keep REST client as fallback
+            self.kalshi = self.kalshi_hybrid._rest
 
-        self.polymarket = PolymarketClient()
-        await self.polymarket.connect()
+            self.polymarket_hybrid = HybridPolymarketClient()
+            await self.polymarket_hybrid.connect()
+            self.polymarket = self.polymarket_hybrid._rest
+
+            logger.info("Using WebSocket streaming for market prices (10-50ms latency)")
+        else:
+            # REST-only clients
+            self.kalshi = KalshiClient()
+            await self.kalshi.connect()
+
+            self.polymarket = PolymarketClient()
+            await self.polymarket.connect()
+
+            logger.info("Using REST polling for market prices")
 
         self._running = True
 
@@ -165,14 +194,27 @@ class GameShard:
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
 
+        # Cancel WebSocket stream tasks
+        for platform, task in self._ws_stream_tasks.items():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._ws_stream_tasks.clear()
+
         # Stop all game monitoring
         for game_id in list(self._games.keys()):
             await self.remove_game(game_id)
 
         # Disconnect from services
-        if self.kalshi:
+        if self.kalshi_hybrid:
+            await self.kalshi_hybrid.disconnect()
+        elif self.kalshi:
             await self.kalshi.disconnect()
-        if self.polymarket:
+        if self.polymarket_hybrid:
+            await self.polymarket_hybrid.disconnect()
+        elif self.polymarket:
             await self.polymarket.disconnect()
         if self.redis:
             await self.redis.disconnect()
@@ -242,12 +284,18 @@ class GameShard:
         # Track market IDs
         if kalshi_market_id:
             ctx.market_ids[Platform.KALSHI] = kalshi_market_id
+            self._market_to_game[kalshi_market_id] = game_id
             logger.info(f"Game {game_id}: Kalshi market set to {kalshi_market_id}")
         if polymarket_market_id:
             ctx.market_ids[Platform.POLYMARKET] = polymarket_market_id
+            self._market_to_game[polymarket_market_id] = game_id
             logger.info(f"Game {game_id}: Polymarket market set to {polymarket_market_id}")
 
         self._games[game_id] = ctx
+
+        # Subscribe to WebSocket streaming if enabled
+        if self.use_websocket_streaming:
+            await self._subscribe_to_ws_streams(ctx)
 
         # Start monitoring task
         task = asyncio.create_task(self._monitor_game(ctx))
@@ -274,15 +322,23 @@ class GameShard:
                 pass
             del self._game_tasks[game_id]
 
+        # Unsubscribe from WebSocket streams
+        if self.use_websocket_streaming:
+            await self._unsubscribe_from_ws_streams(ctx)
+
+        # Clean up market_to_game mappings
+        for platform, market_id in ctx.market_ids.items():
+            self._market_to_game.pop(market_id, None)
+
         # Disconnect ESPN client
         await ctx.espn_client.disconnect()
 
         # Finalize game state in DB if possible
         if self.db and ctx.last_state:
-            # We mark it as valid to update the timestamp, but we don't force 'final' 
+            # We mark it as valid to update the timestamp, but we don't force 'final'
             # unless we know for sure. However, if we are removing it, it's likely done.
             # Safe bet: just update timestamp so it falls out of "live" queries eventually
-            pass 
+            pass
 
         del self._games[game_id]
         logger.info(f"Removed game {game_id} from shard {self.shard_id}")
@@ -309,12 +365,15 @@ class GameShard:
 
                 # Check if game is final
                 if ctx.last_state and (ctx.last_state.status == "final" or ctx.last_state.status == "complete"):
-                    logger.info(f"Game {ctx.game_id} is final")
-                    
+                    logger.info(f"Game {ctx.game_id} is final: {ctx.last_state.home_team} {ctx.last_state.home_score} - {ctx.last_state.away_score} {ctx.last_state.away_team}")
+
                     # Ensure final state is persisted
                     if self.db:
                         await self.db.update_game_status(ctx.game_id, "final")
-                    
+
+                    # Settle all open positions for this game
+                    await self._settle_game_positions(ctx)
+
                     break
 
                 await asyncio.sleep(interval)
@@ -326,6 +385,113 @@ class GameShard:
         finally:
             # Clean up
             ctx.is_active = False
+
+    async def _settle_game_positions(self, ctx: GameContext) -> None:
+        """
+        Settle all open paper trading positions for a completed game.
+
+        Settlement uses the final calculated win probability as exit price:
+        - Winning team's probability → ~1.0 (they won)
+        - Losing team's probability → ~0.0 (they lost)
+
+        For each position:
+        - BUY on winning team: profit (exit at high price)
+        - BUY on losing team: loss (exit at low price)
+        - SELL on winning team: loss (have to pay out high)
+        - SELL on losing team: profit (keep premium, pay nothing)
+        """
+        if not self.db or not ctx.last_state:
+            return
+
+        # Get all open positions for this game
+        open_positions = await self.db.get_open_positions_for_game(ctx.game_id)
+        if not open_positions:
+            logger.info(f"No open positions to settle for game {ctx.game_id}")
+            return
+
+        logger.info(f"Settling {len(open_positions)} open positions for game {ctx.game_id}")
+
+        # Determine winner from final score
+        home_won = ctx.last_state.home_score > ctx.last_state.away_score
+        home_team = ctx.last_state.home_team
+        away_team = ctx.last_state.away_team
+
+        # Calculate final probabilities (winner ~1.0, loser ~0.0)
+        # In a finished game, the winner's probability is essentially 1.0
+        winning_exit_price = 0.99  # Slightly less than 1.0 to account for model uncertainty
+        losing_exit_price = 0.01  # Slightly more than 0.0
+
+        total_pnl = 0.0
+        exit_time = datetime.utcnow().isoformat()
+
+        for position in open_positions:
+            trade_id = position['trade_id']
+            market_title = position['market_title'] or ""
+            side = position['side']
+            entry_price = float(position['entry_price'])
+            size = float(position['size'])
+
+            # Determine if this position is on the winning or losing team
+            # Market titles are like "Boston Celtics to win" or "Detroit Pistons to win"
+            market_title_lower = market_title.lower()
+            is_home_team_market = (
+                home_team.lower() in market_title_lower or
+                (ctx.last_state.home_team_abbrev and ctx.last_state.home_team_abbrev.lower() in market_title_lower)
+            )
+            is_away_team_market = (
+                away_team.lower() in market_title_lower or
+                (ctx.last_state.away_team_abbrev and ctx.last_state.away_team_abbrev.lower() in market_title_lower)
+            )
+
+            # Determine exit price based on whether this market's team won
+            if is_home_team_market:
+                exit_price = winning_exit_price if home_won else losing_exit_price
+                team_won = home_won
+            elif is_away_team_market:
+                exit_price = losing_exit_price if home_won else winning_exit_price
+                team_won = not home_won
+            else:
+                # Can't determine team from market title, use 0.5 (push)
+                logger.warning(f"Cannot determine team for market '{market_title}', settling as push")
+                exit_price = entry_price
+                team_won = None
+
+            # Determine outcome based on position side and whether team won
+            if team_won is None:
+                outcome = "push"
+            elif side == "buy":
+                outcome = "win" if team_won else "loss"
+            else:  # sell
+                outcome = "loss" if team_won else "win"
+
+            # Calculate P&L
+            if side == "buy":
+                pnl = size * (exit_price - entry_price)
+            else:
+                pnl = size * (entry_price - exit_price)
+
+            total_pnl += pnl
+
+            # Close the position
+            await self.db.close_paper_trade(
+                trade_id=trade_id,
+                exit_price=exit_price,
+                exit_time=exit_time,
+                outcome=outcome,
+            )
+
+            logger.info(
+                f"Settled position {trade_id}: {side.upper()} {market_title} "
+                f"entry=${entry_price:.4f} exit=${exit_price:.4f} "
+                f"P&L=${pnl:.2f} ({outcome.upper()})"
+            )
+
+        # Update bankroll with total P&L
+        if total_pnl != 0:
+            await self.db.update_bankroll(total_pnl)
+            logger.info(f"Updated bankroll: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
+
+        logger.info(f"Finished settling {len(open_positions)} positions for game {ctx.game_id}, total P&L: ${total_pnl:.2f}")
 
     def _get_poll_interval(self, ctx: GameContext) -> float:
         """Get poll interval based on game state."""
@@ -434,11 +600,255 @@ class GameShard:
         except Exception as e:
             logger.error(f"Error polling game state for {ctx.game_id}: {e}")
 
+    # ==========================================================================
+    # WebSocket Streaming
+    # ==========================================================================
+
+    async def _subscribe_to_ws_streams(self, ctx: GameContext) -> None:
+        """Subscribe to WebSocket streams for a game's markets."""
+        # Subscribe to Kalshi
+        if ctx.market_ids.get(Platform.KALSHI) and self.kalshi_hybrid:
+            market_id = ctx.market_ids[Platform.KALSHI]
+            await self.kalshi_hybrid.subscribe_with_metadata([{
+                "market_id": market_id,
+                "title": "",
+                "game_id": ctx.game_id,
+            }])
+            logger.info(f"Subscribed to Kalshi WebSocket for {market_id}")
+
+            # Start stream task if not running
+            if Platform.KALSHI not in self._ws_stream_tasks:
+                task = asyncio.create_task(self._run_ws_price_stream(Platform.KALSHI))
+                self._ws_stream_tasks[Platform.KALSHI] = task
+
+        # Subscribe to Polymarket
+        if ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket_hybrid:
+            market_id = ctx.market_ids[Platform.POLYMARKET]
+
+            # Resolve token_id if needed (Polymarket requires token_ids for WS)
+            market = await self.polymarket_hybrid.get_market(market_id)
+            if market:
+                token_id = await self.polymarket_hybrid.resolve_yes_token_id(market)
+                if token_id:
+                    await self.polymarket_hybrid.subscribe_with_metadata([{
+                        "token_id": token_id,
+                        "condition_id": market_id,
+                        "title": market.get("question", market.get("title", "")),
+                        "game_id": ctx.game_id,
+                    }])
+                    logger.info(f"Subscribed to Polymarket WebSocket for {token_id}")
+
+                    # Start stream task if not running
+                    if Platform.POLYMARKET not in self._ws_stream_tasks:
+                        task = asyncio.create_task(self._run_ws_price_stream(Platform.POLYMARKET))
+                        self._ws_stream_tasks[Platform.POLYMARKET] = task
+
+    async def _unsubscribe_from_ws_streams(self, ctx: GameContext) -> None:
+        """Unsubscribe from WebSocket streams when removing a game."""
+        if ctx.market_ids.get(Platform.KALSHI) and self.kalshi_hybrid:
+            market_id = ctx.market_ids[Platform.KALSHI]
+            await self.kalshi_hybrid.unsubscribe([market_id])
+            logger.debug(f"Unsubscribed from Kalshi WebSocket for {market_id}")
+
+        if ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket_hybrid:
+            # Note: Polymarket doesn't have explicit unsubscribe
+            pass
+
+    async def _run_ws_price_stream(self, platform: Platform) -> None:
+        """Background task to process WebSocket price updates.
+
+        This task runs continuously and routes price updates to the appropriate
+        game context for signal generation.
+        """
+        logger.info(f"Starting WebSocket price stream for {platform.value}")
+
+        try:
+            if platform == Platform.KALSHI and self.kalshi_hybrid:
+                # Get currently subscribed markets
+                market_ids = list(self.kalshi_hybrid.subscribed_markets)
+                if not market_ids:
+                    logger.warning("No Kalshi markets subscribed, waiting...")
+                    await asyncio.sleep(5)
+                    return
+
+                async for price in self.kalshi_hybrid.stream_prices(market_ids):
+                    if not self._running:
+                        break
+                    await self._handle_ws_price_update(platform, price)
+
+            elif platform == Platform.POLYMARKET and self.polymarket_hybrid:
+                # Get currently subscribed token_ids
+                token_ids = list(self.polymarket_hybrid.subscribed_markets)
+                if not token_ids:
+                    logger.warning("No Polymarket markets subscribed, waiting...")
+                    await asyncio.sleep(5)
+                    return
+
+                async for price in self.polymarket_hybrid.stream_prices(token_ids):
+                    if not self._running:
+                        break
+                    await self._handle_ws_price_update(platform, price)
+
+        except asyncio.CancelledError:
+            logger.info(f"WebSocket stream cancelled for {platform.value}")
+        except Exception as e:
+            logger.error(f"WebSocket stream error for {platform.value}: {e}")
+            # Restart the stream after a delay
+            await asyncio.sleep(5)
+            if self._running:
+                task = asyncio.create_task(self._run_ws_price_stream(platform))
+                self._ws_stream_tasks[platform] = task
+
+    async def _handle_ws_price_update(self, platform: Platform, price: MarketPrice) -> None:
+        """Handle incoming WebSocket price update.
+
+        Routes the price update to the appropriate game context and
+        triggers signal generation if conditions are met.
+        """
+        # Find the game associated with this market
+        game_id = self._market_to_game.get(price.market_id)
+        if not game_id:
+            # Try to find by game_id in the price object
+            game_id = price.game_id
+
+        if not game_id or game_id not in self._games:
+            return
+
+        ctx = self._games[game_id]
+
+        # Update context with new price
+        ctx.market_prices[platform] = price
+
+        # Persist to database
+        if self.db:
+            await self.db.insert_market_price(
+                market_id=price.market_id,
+                platform=platform.value,
+                yes_bid=price.yes_bid,
+                yes_ask=price.yes_ask,
+                volume=price.volume,
+                liquidity=price.liquidity,
+                game_id=game_id,
+                market_title=price.market_title,
+            )
+
+        # Publish to Redis
+        if self.redis:
+            await self.redis.publish_market_price(game_id, price)
+
+        # Check for signal generation based on market price change
+        await self._check_market_signals(ctx, platform, price)
+
+    async def _check_market_signals(
+        self,
+        ctx: GameContext,
+        platform: Platform,
+        price: MarketPrice,
+    ) -> None:
+        """Check if market price change warrants signal generation.
+
+        This enables faster signal generation based on market price changes
+        detected via WebSocket, complementing game-state-based signals.
+        """
+        if ctx.last_home_win_prob is None:
+            return
+
+        # Compare model probability vs market price
+        model_prob = ctx.last_home_win_prob
+        market_prob = price.mid_price
+
+        # Calculate edge
+        edge = (model_prob - market_prob) * 100.0
+
+        # Only signal on significant edge (> 3%)
+        if abs(edge) < 3.0:
+            return
+
+        # Additional friction check
+        spread = (price.yes_ask - price.yes_bid) * 100.0
+        required_edge = 2.0 + (spread / 2.0) + 1.0  # fees + half spread + margin
+
+        if abs(edge) < required_edge:
+            return
+
+        # Hysteresis check
+        direction = SignalDirection.BUY if edge > 0 else SignalDirection.SELL
+        if ctx.active_signal and ctx.active_signal.direction != direction:
+            if abs(edge) < (required_edge * 2.0):
+                return
+
+        # Generate signal
+        signal = TradingSignal(
+            signal_id=str(uuid.uuid4()),
+            signal_type=SignalType.MARKET_MISPRICING,
+            game_id=ctx.game_id,
+            sport=ctx.sport,
+            team=ctx.last_state.home_team if edge > 0 else ctx.last_state.away_team if ctx.last_state else None,
+            direction=direction,
+            model_prob=model_prob,
+            market_prob=market_prob,
+            edge_pct=abs(edge),
+            confidence=min(1.0, abs(edge) / 10.0),
+            reason=f"Market mispricing detected via WebSocket (model: {model_prob*100:.1f}%, market: {market_prob*100:.1f}%)",
+        )
+
+        ctx.signals_generated += 1
+        ctx.active_signal = signal
+
+        # Persist signal
+        if self.db:
+            await self.db.insert_trading_signal(
+                signal_id=signal.signal_id,
+                signal_type=signal.signal_type.value,
+                direction=signal.direction.value,
+                edge_pct=signal.edge_pct,
+                game_id=signal.game_id,
+                sport=signal.sport.value if signal.sport else None,
+                team=signal.team,
+                model_prob=signal.model_prob,
+                market_prob=signal.market_prob,
+                confidence=signal.confidence,
+                reason=signal.reason,
+            )
+
+        # Publish signal
+        if self.redis:
+            await self.redis.publish_signal(signal)
+
+        logger.info(
+            f"[WS] Generated signal: {signal.direction.value} {signal.team} "
+            f"(edge: {signal.edge_pct:.1f}%, platform: {platform.value})"
+        )
+
     async def _poll_market_prices(self, ctx: GameContext) -> None:
-        """Poll market prices for the game."""
+        """Poll market prices for the game.
+
+        Note: When WebSocket streaming is enabled, this serves as a fallback
+        for markets not subscribed via WebSocket.
+        """
         # Skip if no market IDs configured
         if not ctx.market_ids:
             return
+
+        # Skip polling if WebSocket streaming is active for these markets
+        if self.use_websocket_streaming:
+            # Only poll markets not in WebSocket subscriptions
+            kalshi_subscribed = (
+                self.kalshi_hybrid and
+                ctx.market_ids.get(Platform.KALSHI) in self.kalshi_hybrid.subscribed_markets
+            )
+            poly_subscribed = (
+                self.polymarket_hybrid and
+                ctx.market_ids.get(Platform.POLYMARKET) in self.polymarket_hybrid.subscribed_markets
+            )
+
+            # If both are subscribed via WS, skip polling entirely
+            if kalshi_subscribed and poly_subscribed:
+                return
+            if kalshi_subscribed and Platform.POLYMARKET not in ctx.market_ids:
+                return
+            if poly_subscribed and Platform.KALSHI not in ctx.market_ids:
+                return
 
         try:
             # Poll Kalshi
