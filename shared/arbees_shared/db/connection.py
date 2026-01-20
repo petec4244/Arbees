@@ -12,11 +12,18 @@ _pool: Optional[Pool] = None
 
 
 def get_database_url() -> str:
-    """Get database URL from environment."""
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgresql://arbees:arbees_dev@localhost:5432/arbees"
-    )
+    """Get database URL from environment.
+
+    Raises:
+        RuntimeError: If DATABASE_URL environment variable is not set.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is required. "
+            "Set it in your .env file or environment."
+        )
+    return url
 
 
 async def get_pool() -> Pool:
@@ -443,21 +450,35 @@ class DatabaseClient:
         """Get aggregate performance statistics."""
         pool = await self._get_pool()
 
-        query = """
-            SELECT
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as winning_trades,
-                SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losing_trades,
-                SUM(pnl) as total_pnl,
-                AVG(pnl) as avg_pnl,
-                AVG(edge_at_entry) as avg_edge
-            FROM paper_trades
-            WHERE status = 'closed'
-              AND time > NOW() - INTERVAL '%s days'
-        """ % days
-
+        # Use parameterized queries to prevent SQL injection
         if signal_type:
-            query += f" AND signal_type = '{signal_type}'"
+            query = """
+                SELECT
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losing_trades,
+                    SUM(pnl) as total_pnl,
+                    AVG(pnl) as avg_pnl,
+                    AVG(edge_at_entry) as avg_edge
+                FROM paper_trades
+                WHERE status = 'closed'
+                  AND time > NOW() - make_interval(days => $1)
+                  AND signal_type = $2
+            """
+            row = await pool.fetchrow(query, days, signal_type)
+        else:
+            query = """
+                SELECT
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as winning_trades,
+                    SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losing_trades,
+                    SUM(pnl) as total_pnl,
+                    AVG(pnl) as avg_pnl,
+                    AVG(edge_at_entry) as avg_edge
+                FROM paper_trades
+                WHERE status = 'closed'
+                  AND time > NOW() - make_interval(days => $1)
+            """
+            row = await pool.fetchrow(query, days)
 
-        row = await pool.fetchrow(query)
         return dict(row) if row else {}

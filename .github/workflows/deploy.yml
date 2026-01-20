@@ -1,0 +1,88 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_API: arbees/api
+  ECR_REPOSITORY_FRONTEND: arbees/frontend
+  ECR_REPOSITORY_SHARD: arbees/game-shard
+  ECS_CLUSTER: arbees-cluster
+  ECS_SERVICE_API: api-service
+  ECS_SERVICE_FRONTEND: frontend-service
+  ECS_SERVICE_SHARD: game-shard-service
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    # Build and Push API
+    - name: Build, tag, and push API image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG -f services/api/Dockerfile .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG
+        echo "image_api=$ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    # Build and Push Frontend
+    - name: Build, tag, and push Frontend image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:$IMAGE_TAG -f frontend/Dockerfile .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:$IMAGE_TAG
+
+    # Build and Push GameShard
+    - name: Build, tag, and push GameShard image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_SHARD:$IMAGE_TAG -f services/game_shard/Dockerfile .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_SHARD:$IMAGE_TAG
+
+    # Force Deployment (Requires Services to exist in ECS first)
+    # This just updates the service to pull the new image with the 'latest' tag or sha if we updated the task def
+    # For simple deployments, we assume the task definition uses the 'latest' tag or we update it here.
+    # Below works if we tag as latest, OR we can use aws ecs update-service. 
+    
+    # Simpler approach: Tag as latest and push, then force new deployment
+    - name: Push Latest Tags
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_API:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_API:latest
+        
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:latest
+        
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY_SHARD:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_SHARD:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_SHARD:latest
+
+    - name: Deploy to ECS
+      run: |
+        aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE_API --force-new-deployment
+        aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE_FRONTEND --force-new-deployment
+        aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE_SHARD --force-new-deployment

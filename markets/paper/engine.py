@@ -178,7 +178,7 @@ class PaperTradingEngine(BaseMarketClient):
         """
         # Validate edge
         if signal.edge_pct < self.min_edge_pct:
-            logger.debug(f"Signal rejected: edge {signal.edge_pct}% < min {self.min_edge_pct}%")
+            logger.info(f"Signal rejected: edge {signal.edge_pct:.1f}% < min {self.min_edge_pct}%")
             return None
 
         # Determine side and price
@@ -192,7 +192,7 @@ class PaperTradingEngine(BaseMarketClient):
         size = self.calculate_position_size(signal, exec_price)
 
         if size < 1.0:
-            logger.debug(f"Signal rejected: position size too small ({size})")
+            logger.info(f"Signal rejected: position size too small (${size:.2f}) - model_prob={signal.model_prob:.3f}, edge={signal.edge_pct:.1f}%")
             return None
 
         # Check available balance

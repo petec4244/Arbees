@@ -1,13 +1,24 @@
-import { useState, useMemo } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { ChevronDown, ChevronUp, Activity, Filter, ArrowUpDown } from 'lucide-react'
+import { useState, useMemo, useEffect } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { ChevronDown, ChevronUp, Activity, Filter, ArrowUpDown, CheckCircle } from 'lucide-react'
 import { useWebSocket } from '../hooks/useWebSocket'
 import WinProbChart from '../components/WinProbChart'
 
 export default function LiveGames() {
-  const { subscribe } = useWebSocket()
+  const { subscribe, lastMessage } = useWebSocket()
+  const queryClient = useQueryClient()
   const [selectedSport, setSelectedSport] = useState<string>('ALL')
   const [sortBy, setSortBy] = useState<'time' | 'score'>('time')
+  const [trackedGames, setTrackedGames] = useState<Set<string>>(new Set())
+
+  // Handle incoming WebSocket messages
+  useEffect(() => {
+    if (lastMessage && lastMessage.type === 'game_update') {
+      const { game_id, data } = lastMessage
+      // Instantly update the cache for this game
+      queryClient.setQueryData(['gameState', game_id], data)
+    }
+  }, [lastMessage, queryClient])
 
   const { data: games, isLoading } = useQuery({
     queryKey: ['liveGames'],
@@ -17,6 +28,11 @@ export default function LiveGames() {
     },
     refetchInterval: 5000,
   })
+
+  const handleSubscribe = (gameId: string) => {
+    subscribe(gameId)
+    setTrackedGames(prev => new Set(prev).add(gameId))
+  }
 
   const sports = useMemo(() => {
     if (!games) return []
@@ -77,7 +93,12 @@ export default function LiveGames() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 pb-4">
           {isLoading && <p className="text-gray-400 animate-pulse">Loading games...</p>}
           {filteredGames.map((game: any) => (
-            <GameCard key={game.game_id} game={game} onSubscribe={() => subscribe(game.game_id)} />
+            <GameCard
+              key={game.game_id}
+              game={game}
+              onSubscribe={() => handleSubscribe(game.game_id)}
+              isTracked={trackedGames.has(game.game_id)}
+            />
           ))}
           {(!isLoading && filteredGames.length === 0) && (
             <div className="col-span-full flex flex-col items-center justify-center p-12 text-gray-500 bg-gray-800/50 rounded-lg border border-gray-700 border-dashed">
@@ -91,7 +112,7 @@ export default function LiveGames() {
   )
 }
 
-function GameCard({ game, onSubscribe }: { game: any; onSubscribe: () => void }) {
+function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: () => void; isTracked: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const [prevHomeScore, setPrevHomeScore] = useState(game.home_score)
   const [prevAwayScore, setPrevAwayScore] = useState(game.away_score)
@@ -111,15 +132,12 @@ function GameCard({ game, onSubscribe }: { game: any; onSubscribe: () => void })
       return res.json()
     },
     enabled: !!game.game_id,
-    refetchInterval: expanded ? 2000 : 10000, // Poll faster when expanded
+    refetchInterval: expanded ? 2000 : 10000,
   })
 
-  // Mock historical data for chart (since we might not have a full history endpoint yet)
-  // In a real implementation, we'd fetch this from /api/games/{id}/history
   const mockHistory = useMemo(() => {
     if (!state || !state.home_win_prob) return []
     const prob = state.home_win_prob * 100
-    // Generate simple fake trend ending in current prob
     return Array.from({ length: 10 }, (_, i) => ({
       time: `${i * 5}m`,
       prob: Math.max(0, Math.min(100, prob + (Math.random() - 0.5) * 10))
@@ -182,10 +200,15 @@ function GameCard({ game, onSubscribe }: { game: any; onSubscribe: () => void })
           </div>
 
           <button
-            onClick={(e) => { e.stopPropagation(); onSubscribe(); }}
-            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium rounded transition-colors"
+            onClick={(e) => { e.stopPropagation(); if (!isTracked) onSubscribe(); }}
+            disabled={isTracked}
+            className={`px-3 py-1.5 text-xs font-medium rounded transition-all flex items-center space-x-1 ${isTracked
+                ? 'bg-green-500/20 text-green-400 cursor-default'
+                : 'bg-blue-600 hover:bg-blue-500 text-white'
+              }`}
           >
-            Track
+            {isTracked && <CheckCircle className="w-3 h-3" />}
+            <span>{isTracked ? 'Tracking' : 'Track'}</span>
           </button>
         </div>
       </div>

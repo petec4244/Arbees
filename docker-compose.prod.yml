@@ -9,7 +9,7 @@ services:
     container_name: arbees-timescaledb
     environment:
       POSTGRES_USER: ${DB_USER:-arbees}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-arbees_prod}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD required}
       POSTGRES_DB: arbees
     ports:
       - "5432:5432"
@@ -50,7 +50,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD:-arbees_prod}@timescaledb:5432/arbees
+      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD}@timescaledb:5432/arbees
       REDIS_URL: redis://redis:6379
       KALSHI_API_KEY: ${KALSHI_API_KEY}
       KALSHI_PRIVATE_KEY: ${KALSHI_PRIVATE_KEY}
@@ -73,7 +73,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD:-arbees_prod}@timescaledb:5432/arbees
+      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD}@timescaledb:5432/arbees
       REDIS_URL: redis://redis:6379
       SHARD_ID: shard-1
       KALSHI_API_KEY: ${KALSHI_API_KEY}
@@ -97,7 +97,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD:-arbees_prod}@timescaledb:5432/arbees
+      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD}@timescaledb:5432/arbees
       REDIS_URL: redis://redis:6379
       SHARD_ID: shard-2
       KALSHI_API_KEY: ${KALSHI_API_KEY}
@@ -121,7 +121,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD:-arbees_prod}@timescaledb:5432/arbees
+      DATABASE_URL: postgresql://${DB_USER:-arbees}:${DB_PASSWORD}@timescaledb:5432/arbees
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: INFO
     ports:

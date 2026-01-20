@@ -44,6 +44,7 @@ class GameContext:
     signals_generated: int = 0
     started_at: datetime = field(default_factory=datetime.utcnow)
     is_active: bool = True
+    active_signal: Optional[TradingSignal] = None  # Track current position for hysteresis
 
 
 class GameShard:
@@ -539,8 +540,15 @@ class GameShard:
         prob_change = new_prob - old_prob
 
         # Only signal on significant changes (> 3% for probability shifts)
-        if abs(prob_change) < 0.03:
+        if abs(prob_change) < 0.02:
             return
+
+        # 1. Clamp probabilities to avoid overconfidence
+        # Capping at 85% prevents "sure thing" bets that lose 100% of the time in our analysis
+        capped_new_prob = max(0.15, min(0.85, new_prob))
+        
+        # 2. Estimate Fees/Friction (2% round trip estimate)
+        estimated_fees = 2.0 
 
         # Get market price for comparison (optional)
         market_price = ctx.market_prices.get(Platform.KALSHI) or ctx.market_prices.get(Platform.POLYMARKET)
@@ -548,19 +556,32 @@ class GameShard:
         if market_price is not None:
             # With market data: calculate edge vs market
             market_prob = market_price.mid_price
-            edge = (new_prob - market_prob) * 100.0
-
-            # Only signal if edge exceeds threshold
-            if abs(edge) < 2.0:
+            edge = (capped_new_prob - market_prob) * 100.0
+            
+            # Fee-adjusted edge
+            spread = (market_price.yes_ask - market_price.yes_bid) * 100.0
+            required_edge = estimated_fees + (spread / 2.0) + 1.0 # 1% extra margin
+            
+            # Only signal if edge exceeds friction
+            if abs(edge) < required_edge:
                 return
         else:
             # Without market data: signal based on probability shift alone
             # Use the probability change as a pseudo-edge
             market_prob = None
             edge = prob_change * 100.0  # Convert to percentage
+            required_edge = 3.0 # Higher threshold for naked prob changes
 
         # Determine direction based on probability change
         direction = SignalDirection.BUY if prob_change > 0 else SignalDirection.SELL
+
+        # 3. Hysteresis (Flip-Flop Protection)
+        # If we have an active signal in the OPPOSITE direction, we need much stronger evidence to flip
+        if ctx.active_signal and ctx.active_signal.direction != direction:
+             # If flipping, require double the normal edge to justify exit cost + entry cost
+             if abs(edge) < (required_edge * 2.0):
+                 logger.debug(f"Ignoring flip signal {direction} for game {ctx.game_id}: edge {edge:.1f}% < required {required_edge*2:.1f}%")
+                 return
 
         # Create signal
         signal = TradingSignal(
@@ -570,7 +591,7 @@ class GameShard:
             sport=ctx.sport,
             team=new_state.home_team if prob_change > 0 else new_state.away_team,
             direction=direction,
-            model_prob=new_prob,
+            model_prob=capped_new_prob,
             market_prob=market_prob,
             edge_pct=abs(edge),
             confidence=min(1.0, abs(prob_change) * 10),
@@ -579,6 +600,7 @@ class GameShard:
         )
 
         ctx.signals_generated += 1
+        ctx.active_signal = signal  # Update state
 
         # Persist signal
         if self.db:
@@ -661,14 +683,17 @@ class GameShard:
                 rust_state.is_redzone = state.is_redzone
 
             # Calculate probability (for home team)
-            return arbees_core.calculate_win_probability(rust_state, True)
+            raw_prob = arbees_core.calculate_win_probability(rust_state, True)
+            
+            # Clamp probability to [0.15, 0.85] to avoid extreme confidence
+            return max(0.15, min(0.85, raw_prob))
 
         except Exception as e:
             logger.error(f"Error calculating win prob with Rust core: {e}")
             # Fallback to simple heuristic
             score_diff = state.home_score - state.away_score
             prob = 0.5 + (score_diff * 0.05)
-            return max(0.01, min(0.99, prob))
+            return max(0.15, min(0.85, prob))
 
     # ==========================================================================
     # Status and Metrics

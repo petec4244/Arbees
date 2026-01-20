@@ -69,11 +69,14 @@ class PolymarketClient(BaseMarketClient):
         self._token_id_cache: dict[str, Optional[str]] = {}
 
         # EU proxy configuration for regulatory compliance
-        if use_eu_proxy:
+        # EU proxy configuration for regulatory compliance
+        if use_eu_proxy or os.environ.get("POLYMARKET_PROXY_URL"):
             self.proxy_url = os.environ.get(
-                "EU_POLYMARKET_PROXY_URL",
-                "http://polymarket-proxy.eu-central-1.internal:8080"
+                "POLYMARKET_PROXY_URL",
+                proxy_url  # Fallback to init arg
             )
+            if self.proxy_url:
+                logger.info(f"Polymarket client using proxy: {self.proxy_url}")
 
     async def connect(self) -> None:
         """Create the aiohttp session with optional proxy."""
@@ -81,10 +84,8 @@ class PolymarketClient(BaseMarketClient):
             connector = aiohttp.TCPConnector(
                 limit=100,
                 limit_per_host=30,
+                ssl=False if self.proxy_url else True
             )
-
-            # Note: For actual proxy routing, you'd configure this differently
-            # The proxy_url is for a proxy service, not HTTP proxy
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=self.timeout,

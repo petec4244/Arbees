@@ -7,6 +7,7 @@ Responsibilities:
 - Monitor for arbitrage opportunities
 - Close positions when games end
 - Track and report performance
+- Enforce risk limits via RiskController
 """
 
 import asyncio
@@ -21,6 +22,7 @@ from arbees_shared.models.game import Sport
 from arbees_shared.models.market import MarketPrice, Platform
 from arbees_shared.models.signal import TradingSignal, SignalType, SignalDirection, ArbitrageOpportunity
 from arbees_shared.models.trade import TradeStatus
+from arbees_shared.risk import RiskController, RiskDecision, RiskRejection
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
 from markets.paper.engine import PaperTradingEngine
@@ -45,6 +47,13 @@ class PositionManager:
         min_edge_pct: float = 2.0,
         kelly_fraction: float = 0.25,
         max_position_pct: float = 10.0,
+        max_buy_prob: float = 0.85,  # Don't buy above 85% - limited upside
+        min_sell_prob: float = 0.15,  # Don't sell below 15% - limited upside
+        # Risk management settings
+        max_daily_loss: float = 100.0,
+        max_game_exposure: float = 50.0,
+        max_sport_exposure: float = 200.0,
+        max_latency_ms: float = 5000.0,
     ):
         """
         Initialize Position Manager.
@@ -54,11 +63,25 @@ class PositionManager:
             min_edge_pct: Minimum edge to take a trade
             kelly_fraction: Fraction of Kelly criterion for sizing
             max_position_pct: Maximum position size as % of bankroll
+            max_buy_prob: Maximum probability to BUY at (avoid limited upside)
+            min_sell_prob: Minimum probability to SELL at (avoid limited upside)
+            max_daily_loss: Maximum loss per day before halting ($)
+            max_game_exposure: Maximum exposure to single game ($)
+            max_sport_exposure: Maximum exposure to single sport ($)
+            max_latency_ms: Maximum signal latency before rejection (ms)
         """
         self.initial_bankroll = initial_bankroll
         self.min_edge_pct = min_edge_pct
         self.kelly_fraction = kelly_fraction
         self.max_position_pct = max_position_pct
+        self.max_buy_prob = max_buy_prob
+        self.min_sell_prob = min_sell_prob
+
+        # Risk management settings
+        self.max_daily_loss = max_daily_loss
+        self.max_game_exposure = max_game_exposure
+        self.max_sport_exposure = max_sport_exposure
+        self.max_latency_ms = max_latency_ms
 
         # Connections
         self.db: Optional[DatabaseClient] = None
@@ -69,11 +92,15 @@ class PositionManager:
         # Paper trading engine
         self.paper_engine: Optional[PaperTradingEngine] = None
 
+        # Risk controller
+        self.risk_controller: Optional[RiskController] = None
+
         # Tracking
         self._running = False
         self._signal_count = 0
         self._trade_count = 0
         self._arb_count = 0
+        self._risk_rejected_count = 0
 
     async def start(self) -> None:
         """Start the position manager and connect to services."""
@@ -82,6 +109,19 @@ class PositionManager:
         # Connect to database
         pool = await get_pool()
         self.db = DatabaseClient(pool)
+
+        # Initialize risk controller
+        self.risk_controller = RiskController(
+            pool=pool,
+            max_daily_loss=self.max_daily_loss,
+            max_game_exposure=self.max_game_exposure,
+            max_sport_exposure=self.max_sport_exposure,
+            max_latency_ms=self.max_latency_ms,
+        )
+        logger.info(
+            f"Risk Controller initialized: max_daily_loss=${self.max_daily_loss}, "
+            f"max_game_exposure=${self.max_game_exposure}, max_sport_exposure=${self.max_sport_exposure}"
+        )
 
         # Connect to Redis
         self.redis = RedisBus()
@@ -123,6 +163,9 @@ class PositionManager:
 
         # Start arbitrage scanner
         asyncio.create_task(self._arbitrage_scan_loop())
+
+        # Start risk monitoring
+        asyncio.create_task(self._risk_monitor_loop())
 
         logger.info("Position Manager started")
 
@@ -189,16 +232,28 @@ class PositionManager:
         """Send periodic status updates."""
         while self._running:
             try:
+                risk_metrics = None
+                if self.risk_controller:
+                    risk_metrics = await self.risk_controller.get_metrics()
+
                 status = {
                     "type": "position_manager",
                     "signals_received": self._signal_count,
                     "trades_executed": self._trade_count,
+                    "risk_rejected": self._risk_rejected_count,
                     "arb_opportunities": self._arb_count,
                     "bankroll": self.paper_engine._bankroll.current_balance if self.paper_engine else 0,
                     "open_positions": len(self.paper_engine.get_open_trades()) if self.paper_engine else 0,
+                    "daily_pnl": risk_metrics.daily_pnl if risk_metrics else 0,
+                    "circuit_breaker": risk_metrics.circuit_breaker_open if risk_metrics else False,
                     "timestamp": datetime.utcnow().isoformat(),
                 }
-                logger.info(f"Position Manager status: {status['trades_executed']} trades, ${status['bankroll']:.2f} bankroll")
+                logger.info(
+                    f"Position Manager status: {status['trades_executed']} trades, "
+                    f"{status['risk_rejected']} risk-rejected, "
+                    f"${status['bankroll']:.2f} bankroll, "
+                    f"daily P&L ${status['daily_pnl']:.2f}"
+                )
 
                 # Also save bankroll periodically
                 await self._save_bankroll()
@@ -206,6 +261,18 @@ class PositionManager:
                 logger.warning(f"Heartbeat failed: {e}")
 
             await asyncio.sleep(30)
+
+    async def _risk_monitor_loop(self) -> None:
+        """Periodically log risk status."""
+        while self._running:
+            try:
+                if self.risk_controller:
+                    report = await self.risk_controller.get_status_report()
+                    logger.info(f"Risk Status:\n{report}")
+            except Exception as e:
+                logger.warning(f"Risk monitor failed: {e}")
+
+            await asyncio.sleep(60)  # Log risk status every minute
 
     async def _handle_signal(self, data: dict) -> None:
         """Handle incoming trading signal."""
@@ -221,6 +288,32 @@ class PositionManager:
                 logger.debug(f"Signal rejected: edge {signal.edge_pct}% < min {self.min_edge_pct}%")
                 return
 
+            # Probability guardrails - avoid extreme probabilities with poor risk/reward
+            if signal.direction == SignalDirection.BUY and signal.model_prob > self.max_buy_prob:
+                logger.info(f"Signal rejected: BUY at {signal.model_prob*100:.1f}% > max {self.max_buy_prob*100:.0f}% (poor risk/reward)")
+                return
+            if signal.direction == SignalDirection.SELL and signal.model_prob < self.min_sell_prob:
+                logger.info(f"Signal rejected: SELL at {signal.model_prob*100:.1f}% < min {self.min_sell_prob*100:.0f}% (poor risk/reward)")
+                return
+
+            # Check for existing position on this game
+            existing_position = await self._get_open_position_for_game(signal.game_id)
+
+            if existing_position:
+                existing_side = existing_position["side"]
+                new_side = "buy" if signal.direction == SignalDirection.BUY else "sell"
+
+                if existing_side == new_side:
+                    # Same direction - skip, don't double down
+                    logger.info(f"Skipping signal: already have {existing_side.upper()} position on game {signal.game_id}")
+                    return
+                else:
+                    # Opposite direction - close existing position instead of opening new one
+                    logger.info(f"Closing existing {existing_side.upper()} position on game {signal.game_id} (opposite signal received)")
+                    await self._close_position(existing_position, signal)
+                    return
+
+            # No existing position - open new one
             # Get market price for execution
             market_price = await self._get_market_price(signal)
             if not market_price:
@@ -228,15 +321,125 @@ class PositionManager:
                 # Create synthetic market price for paper trading
                 market_price = self._create_synthetic_price(signal)
 
+            # Calculate proposed position size for risk check
+            # Use paper engine's sizing logic to estimate
+            proposed_size = self._estimate_position_size(signal, market_price)
+
+            # Risk management check
+            if self.risk_controller:
+                risk_decision = await self.risk_controller.evaluate_trade(
+                    game_id=signal.game_id,
+                    sport=signal.sport.value,
+                    team=signal.team,
+                    side="buy" if signal.direction == SignalDirection.BUY else "sell",
+                    proposed_size=proposed_size,
+                    signal_timestamp=signal.created_at,
+                )
+
+                if not risk_decision.approved:
+                    self._risk_rejected_count += 1
+                    logger.warning(
+                        f"Trade REJECTED by risk controller: {risk_decision.rejection_reason.value} - "
+                        f"{risk_decision.rejection_details}"
+                    )
+                    return
+
+                logger.debug(
+                    f"Risk check passed: daily_pnl=${risk_decision.daily_pnl:.2f}, "
+                    f"game_exp=${risk_decision.game_exposure:.2f}, "
+                    f"sport_exp=${risk_decision.sport_exposure:.2f}"
+                )
+
             # Execute through paper engine
             if self.paper_engine:
+                logger.info(f"Opening new position with price: bid={market_price.yes_bid:.3f}, ask={market_price.yes_ask:.3f}")
                 trade = await self.paper_engine.execute_signal(signal, market_price)
                 if trade:
                     self._trade_count += 1
-                    logger.info(f"Executed trade: {trade.trade_id}")
+                    logger.info(f"Opened trade: {trade.trade_id}")
+                else:
+                    logger.info(f"Trade not executed for signal {signal.signal_id} - rejected by paper engine")
 
         except Exception as e:
             logger.error(f"Error handling signal: {e}")
+
+    def _estimate_position_size(self, signal: TradingSignal, market_price: MarketPrice) -> float:
+        """Estimate position size for risk check (mirrors paper engine logic)."""
+        if not self.paper_engine:
+            return 0.0
+
+        # Get current bankroll
+        bankroll = self.paper_engine._bankroll.available_balance
+
+        # Kelly fraction sizing
+        kelly = signal.kelly_fraction if signal.kelly_fraction > 0 else 0.0
+        fractional_kelly = kelly * self.kelly_fraction
+
+        # Position as % of bankroll
+        position_pct = min(fractional_kelly * 100, self.max_position_pct)
+        position_size = bankroll * (position_pct / 100)
+
+        # Minimum position size
+        min_size = 1.0
+        return max(min_size, position_size)
+
+    async def _get_open_position_for_game(self, game_id: str) -> Optional[dict]:
+        """Get existing open position for a game."""
+        pool = await get_pool()
+        row = await pool.fetchrow("""
+            SELECT trade_id, game_id, side, entry_price, size, time
+            FROM paper_trades
+            WHERE game_id = $1 AND status = 'open'
+            ORDER BY time DESC
+            LIMIT 1
+        """, game_id)
+        return dict(row) if row else None
+
+    async def _close_position(self, position: dict, signal: TradingSignal) -> None:
+        """Close an existing position based on opposite signal."""
+        if not self.paper_engine:
+            return
+
+        # Find the trade in paper engine's list
+        open_trades = self.paper_engine.get_open_trades()
+        trade_to_close = None
+        for trade in open_trades:
+            if trade.trade_id == position["trade_id"]:
+                trade_to_close = trade
+                break
+
+        if not trade_to_close:
+            # Trade not in memory, close directly in database
+            logger.warning(f"Trade {position['trade_id']} not in paper engine memory, closing in DB")
+            pool = await get_pool()
+
+            # Calculate exit price based on current model probability
+            exit_price = signal.model_prob
+
+            # Determine PnL
+            entry_price = float(position["entry_price"])
+            size = float(position["size"])
+            if position["side"] == "buy":
+                pnl = size * (exit_price - entry_price)
+            else:
+                pnl = size * (entry_price - exit_price)
+
+            outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "push")
+
+            await pool.execute("""
+                UPDATE paper_trades
+                SET status = 'closed', outcome = $1, exit_price = $2, exit_time = NOW(),
+                    pnl = $3, pnl_pct = $4
+                WHERE trade_id = $5
+            """, outcome, exit_price, pnl, (pnl / (size * entry_price)) * 100 if entry_price > 0 else 0, position["trade_id"])
+
+            logger.info(f"Closed position {position['trade_id']}: {position['side'].upper()} -> PnL ${pnl:.2f} ({outcome})")
+            return
+
+        # Close using paper engine
+        exit_price = signal.model_prob
+        closed_trade = await self.paper_engine.close_trade(trade_to_close, exit_price)
+        logger.info(f"Closed position {closed_trade.trade_id}: PnL ${closed_trade.pnl:.2f} ({closed_trade.outcome.value})")
 
     async def _get_market_price(self, signal: TradingSignal) -> Optional[MarketPrice]:
         """Get current market price for a signal."""
@@ -470,10 +673,18 @@ async def main():
     )
 
     manager = PositionManager(
+        # Trading parameters
         initial_bankroll=float(os.environ.get("INITIAL_BANKROLL", "1000")),
         min_edge_pct=float(os.environ.get("MIN_EDGE_PCT", "2.0")),
         kelly_fraction=float(os.environ.get("KELLY_FRACTION", "0.25")),
         max_position_pct=float(os.environ.get("MAX_POSITION_PCT", "10.0")),
+        max_buy_prob=float(os.environ.get("MAX_BUY_PROB", "0.85")),  # Don't buy above 85%
+        min_sell_prob=float(os.environ.get("MIN_SELL_PROB", "0.15")),  # Don't sell below 15%
+        # Risk management parameters
+        max_daily_loss=float(os.environ.get("MAX_DAILY_LOSS", "100.0")),  # $100 max daily loss
+        max_game_exposure=float(os.environ.get("MAX_GAME_EXPOSURE", "50.0")),  # $50 max per game
+        max_sport_exposure=float(os.environ.get("MAX_SPORT_EXPOSURE", "200.0")),  # $200 max per sport
+        max_latency_ms=float(os.environ.get("MAX_LATENCY_MS", "5000.0")),  # 5 second max latency
     )
 
     await manager.start()
