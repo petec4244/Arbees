@@ -355,6 +355,25 @@ class GameShard:
             if new_state is None:
                 return
 
+            # Upsert game info (to get team names in the games table)
+            if self.db and new_state.home_team and new_state.away_team:
+                try:
+                    logger.info(f"Upserting game {ctx.game_id}: {new_state.away_team} @ {new_state.home_team}")
+                    await self.db.upsert_game(
+                        game_id=ctx.game_id,
+                        sport=ctx.sport.value,
+                        home_team=new_state.home_team,
+                        away_team=new_state.away_team,
+                        scheduled_time=datetime.utcnow(),  # Pass datetime object, not string
+                        home_team_abbrev=getattr(new_state, 'home_team_abbrev', None),
+                        away_team_abbrev=getattr(new_state, 'away_team_abbrev', None),
+                    )
+                except Exception as e:
+                    logger.error(f"Error upserting game {ctx.game_id}: {e}")
+            else:
+                if self.db:
+                    logger.warning(f"Missing team names for game {ctx.game_id}: home='{new_state.home_team}', away='{new_state.away_team}'")
+
             old_state = ctx.last_state
             old_prob = ctx.last_home_win_prob
 
@@ -402,9 +421,13 @@ class GameShard:
 
     async def _poll_market_prices(self, ctx: GameContext) -> None:
         """Poll market prices for the game."""
+        # Skip if no market IDs configured
+        if not ctx.market_ids:
+            return
+
         try:
             # Poll Kalshi
-            if Platform.KALSHI in ctx.market_ids and self.kalshi:
+            if ctx.market_ids.get(Platform.KALSHI) and self.kalshi:
                 market_id = ctx.market_ids[Platform.KALSHI]
                 price = await self.kalshi.get_market_price(market_id)
                 if price:
@@ -428,7 +451,7 @@ class GameShard:
                         await self.redis.publish_market_price(ctx.game_id, price)
 
             # Poll Polymarket
-            if Platform.POLYMARKET in ctx.market_ids and self.polymarket:
+            if ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket:
                 market_id = ctx.market_ids[Platform.POLYMARKET]
                 price = await self.polymarket.get_market_price(market_id)
                 if price:
@@ -501,24 +524,29 @@ class GameShard:
         """Generate trading signals from game updates."""
         prob_change = new_prob - old_prob
 
-        # Only signal on significant changes (> 2%)
-        if abs(prob_change) < 0.02:
+        # Only signal on significant changes (> 3% for probability shifts)
+        if abs(prob_change) < 0.03:
             return
 
-        # Get market price for comparison
+        # Get market price for comparison (optional)
         market_price = ctx.market_prices.get(Platform.KALSHI) or ctx.market_prices.get(Platform.POLYMARKET)
-        if market_price is None:
-            return
 
-        market_prob = market_price.mid_price
-        edge = (new_prob - market_prob) * 100.0
+        if market_price is not None:
+            # With market data: calculate edge vs market
+            market_prob = market_price.mid_price
+            edge = (new_prob - market_prob) * 100.0
 
-        # Only signal if edge exceeds threshold
-        if abs(edge) < 2.0:
-            return
+            # Only signal if edge exceeds threshold
+            if abs(edge) < 2.0:
+                return
+        else:
+            # Without market data: signal based on probability shift alone
+            # Use the probability change as a pseudo-edge
+            market_prob = None
+            edge = prob_change * 100.0  # Convert to percentage
 
-        # Determine direction
-        direction = SignalDirection.BUY if edge > 0 else SignalDirection.SELL
+        # Determine direction based on probability change
+        direction = SignalDirection.BUY if prob_change > 0 else SignalDirection.SELL
 
         # Create signal
         signal = TradingSignal(
@@ -526,7 +554,7 @@ class GameShard:
             signal_type=SignalType.WIN_PROB_SHIFT,
             game_id=ctx.game_id,
             sport=ctx.sport,
-            team=new_state.home_team if edge > 0 else new_state.away_team,
+            team=new_state.home_team if prob_change > 0 else new_state.away_team,
             direction=direction,
             model_prob=new_prob,
             market_prob=market_prob,

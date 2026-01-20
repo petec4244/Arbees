@@ -42,6 +42,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://arbees:arbees_dev@timescaledb:5432/arbees
       REDIS_URL: redis://redis:6379
@@ -61,6 +63,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://arbees:arbees_dev@timescaledb:5432/arbees
       REDIS_URL: redis://redis:6379
@@ -81,6 +85,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://arbees:arbees_dev@timescaledb:5432/arbees
       REDIS_URL: redis://redis:6379

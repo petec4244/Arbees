@@ -123,7 +123,7 @@ class TradingSignal(BaseModel):
 
     # Probabilities
     model_prob: float = Field(ge=0.0, le=1.0)
-    market_prob: float = Field(ge=0.0, le=1.0)
+    market_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
     # Edge calculation
     edge_pct: float
@@ -164,7 +164,7 @@ class TradingSignal(BaseModel):
     @property
     def kelly_fraction(self) -> float:
         """Kelly criterion optimal bet fraction."""
-        if self.edge_pct <= 0:
+        if self.edge_pct <= 0 or self.market_prob is None:
             return 0.0
         # Kelly = (p * b - q) / b where p=prob, q=1-p, b=odds-1
         p = self.model_prob

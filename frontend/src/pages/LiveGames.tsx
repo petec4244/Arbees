@@ -13,17 +13,22 @@ export default function LiveGames() {
   })
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-3xl font-bold">Live Games</h1>
+    <div className="space-y-6 h-full flex flex-col">
+      <div className="flex justify-between items-center">
+        <h1 className="text-3xl font-bold">Live Games</h1>
+        <span className="text-sm text-gray-400">{games?.length || 0} games</span>
+      </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {isLoading && <p className="text-gray-400">Loading...</p>}
-        {games?.map((game: any) => (
-          <GameCard key={game.game_id} game={game} onSubscribe={() => subscribe(game.game_id)} />
-        ))}
-        {(!isLoading && (!games || games.length === 0)) && (
-          <p className="text-gray-400 col-span-full text-center py-8">No live games at the moment</p>
-        )}
+      <div className="flex-1 overflow-y-auto min-h-0">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 pb-4">
+          {isLoading && <p className="text-gray-400">Loading...</p>}
+          {games?.map((game: any) => (
+            <GameCard key={game.game_id} game={game} onSubscribe={() => subscribe(game.game_id)} />
+          ))}
+          {(!isLoading && (!games || games.length === 0)) && (
+            <p className="text-gray-400 col-span-full text-center py-8">No live games at the moment</p>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -48,12 +53,14 @@ function GameCard({ game, onSubscribe }: { game: any; onSubscribe: () => void })
       </div>
 
       <div className="space-y-2">
+        {/* Away team listed first (standard sports format) */}
         <div className="flex justify-between items-center">
-          <span>{game.away_team_abbrev}</span>
+          <span className="truncate max-w-[180px] text-gray-300">{game.away_team || 'Away'}</span>
           <span className="text-2xl font-mono">{game.away_score}</span>
         </div>
+        {/* Home team listed second */}
         <div className="flex justify-between items-center">
-          <span>{game.home_team_abbrev}</span>
+          <span className="truncate max-w-[180px]">{game.home_team || 'Home'}</span>
           <span className="text-2xl font-mono">{game.home_score}</span>
         </div>
       </div>

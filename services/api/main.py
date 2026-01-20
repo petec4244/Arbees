@@ -163,8 +163,8 @@ class OpportunityResponse(BaseModel):
 class GameStateResponse(BaseModel):
     game_id: str
     sport: str
-    home_team: str
-    away_team: str
+    home_team: Optional[str] = None
+    away_team: Optional[str] = None
     home_score: int
     away_score: int
     period: int
@@ -283,25 +283,57 @@ async def get_opportunity_stats():
 async def get_live_games(
     sport: Optional[str] = None,
 ):
-    """Get all live games."""
+    """Get all live games from game_states with team names."""
     if not db:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    games = await db.get_live_games(sport)
-    return games
+    pool = await get_pool()
+
+    # Get latest state for each game with team names from games table
+    query = """
+        SELECT DISTINCT ON (gs.game_id)
+            gs.game_id, gs.sport, gs.home_score, gs.away_score, gs.period,
+            gs.time_remaining, gs.status, gs.possession, gs.home_win_prob,
+            gs.time as last_update,
+            g.home_team, g.away_team, g.home_team_abbrev, g.away_team_abbrev
+        FROM game_states gs
+        LEFT JOIN games g ON gs.game_id = g.game_id
+        WHERE gs.status IN ('in_progress', 'halftime', 'end_period')
+    """
+    params = []
+
+    if sport:
+        query += " AND gs.sport = $1"
+        params.append(sport)
+
+    query += " ORDER BY gs.game_id, gs.time DESC"
+
+    rows = await pool.fetch(query, *params)
+    return [dict(row) for row in rows]
 
 
 @app.get("/api/live-games/{game_id}/state", response_model=GameStateResponse)
 async def get_game_state(game_id: str):
-    """Get current game state."""
+    """Get current game state with team names."""
     if not db:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    state = await db.get_latest_game_state(game_id)
-    if not state:
+    pool = await get_pool()
+    row = await pool.fetchrow("""
+        SELECT DISTINCT ON (gs.game_id)
+            gs.game_id, gs.sport, gs.home_score, gs.away_score, gs.period,
+            gs.time_remaining, gs.status, gs.home_win_prob,
+            g.home_team, g.away_team
+        FROM game_states gs
+        LEFT JOIN games g ON gs.game_id = g.game_id
+        WHERE gs.game_id = $1
+        ORDER BY gs.game_id, gs.time DESC
+    """, game_id)
+
+    if not row:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    return GameStateResponse(**state)
+    return GameStateResponse(**dict(row))
 
 
 @app.get("/api/live-games/{game_id}/plays")
@@ -373,9 +405,20 @@ async def get_paper_trading_status():
         WHERE account_name = 'default'
     """)
 
+    # Create default bankroll if not exists
+    if not bankroll:
+        await pool.execute("""
+            INSERT INTO bankroll (account_name, initial_balance, current_balance, peak_balance, trough_balance)
+            VALUES ('default', 1000, 1000, 1000, 1000)
+            ON CONFLICT (account_name) DO NOTHING
+        """)
+        bankroll = await pool.fetchrow("""
+            SELECT * FROM bankroll WHERE account_name = 'default'
+        """)
+
     return {
         "stats": stats,
-        "bankroll": dict(bankroll) if bankroll else None,
+        "bankroll": dict(bankroll) if bankroll else {"initial_balance": 1000, "current_balance": 1000},
     }
 
 
@@ -413,17 +456,27 @@ async def get_paper_trading_performance(
 
     stats = await db.get_performance_stats(days=days)
 
-    total = stats.get("total_trades", 0)
-    winning = stats.get("winning_trades", 0)
-    losing = stats.get("losing_trades", 0)
+    total = int(stats.get("total_trades") or 0)
+    winning = int(stats.get("winning_trades") or 0)
+    losing = int(stats.get("losing_trades") or 0)
 
     pool = await get_pool()
     bankroll = await pool.fetchrow("""
         SELECT * FROM bankroll WHERE account_name = 'default'
     """)
 
-    initial = float(bankroll["initial_balance"]) if bankroll else 1000.0
-    current = float(bankroll["current_balance"]) if bankroll else 1000.0
+    # Create default bankroll if not exists
+    if not bankroll:
+        await pool.execute("""
+            INSERT INTO bankroll (account_name, initial_balance, current_balance, peak_balance, trough_balance)
+            VALUES ('default', 1000, 1000, 1000, 1000)
+            ON CONFLICT (account_name) DO NOTHING
+        """)
+        initial = 1000.0
+        current = 1000.0
+    else:
+        initial = float(bankroll["initial_balance"])
+        current = float(bankroll["current_balance"])
 
     return PerformanceResponse(
         total_trades=total,
