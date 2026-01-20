@@ -1,0 +1,72 @@
+# Polymarket RPi Monitor - Docker Compose for Raspberry Pi
+#
+# Prerequisites:
+#   1. Place your OpenVPN config at ./openvpn/client.ovpn
+#   2. Include any required auth files in ./openvpn/
+#
+# Usage:
+#   docker-compose up -d
+#   docker-compose logs -f
+#
+# Test ZMQ locally:
+#   python scripts/zmq_polymarket_listener.py --address tcp://localhost:5555 --verbose
+
+version: '3.8'
+
+services:
+  polymarket-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-rpi-monitor
+    restart: unless-stopped
+
+    # Required for OpenVPN
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    # Port exposure
+    ports:
+      - "5555:5555"  # ZMQ publisher
+
+    # Mount OpenVPN config directory
+    volumes:
+      - ./openvpn:/etc/openvpn:ro
+
+    # Environment configuration
+    environment:
+      # ZMQ Settings
+      ZMQ_PUBLISH_ENABLED: "true"
+      ZMQ_PUBLISH_ADDRESS: "tcp://*:5555"
+
+      # Polling Settings
+      POLL_INTERVAL_SECONDS: "10"
+
+      # Logging
+      LOG_LEVEL: "INFO"
+
+      # VPN Settings
+      VPN_ENABLED: "true"
+      OPENVPN_CONFIG: "/etc/openvpn/client.ovpn"
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import zmq; c=zmq.Context(); s=c.socket(zmq.REQ); exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: separate network for isolation
+networks:
+  default:
+    driver: bridge

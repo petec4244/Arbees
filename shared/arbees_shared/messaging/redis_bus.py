@@ -32,6 +32,9 @@ class Channel(str, Enum):
     TRADES_OPENED = "trades:opened"
     TRADES_CLOSED = "trades:closed"
 
+    # ZMQ-bridged channels (from RPi monitor)
+    POLYMARKET_ZMQ = "polymarket:zmq:prices"
+
     # Service health
     SHARD_HEARTBEAT = "shard:{shard_id}:heartbeat"
     ORCHESTRATOR_COMMAND = "orchestrator:command"
@@ -156,6 +159,10 @@ class RedisBus:
         """Publish a shard heartbeat."""
         channel = Channel.SHARD_HEARTBEAT.format(shard_id=shard_id)
         return await self.publish(channel, status)
+
+    async def publish_zmq_polymarket_price(self, price: MarketPrice) -> int:
+        """Publish a ZMQ-sourced Polymarket price update."""
+        return await self.publish(Channel.POLYMARKET_ZMQ.value, price)
 
     # ==========================================================================
     # Subscribing
