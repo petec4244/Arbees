@@ -1085,10 +1085,10 @@ async def get_system_status():
     """Detailed system status for frontend."""
     # Check DB connection
     db_ok = False
-    if db:
+    if db and db._pool:
         try:
             # Simple query to check connection
-            await db.pool.fetchval("SELECT 1")
+            await db._pool.fetchval("SELECT 1")
             db_ok = True
         except Exception:
             pass
