@@ -254,9 +254,12 @@ class KalshiWebSocketClient(BaseWebSocketClient):
         # Reset sequence number
         self._seq_numbers[market_id] = data.get("seq", 0)
 
+        bid = book.best_yes_bid
+        ask = book.best_yes_ask
         logger.debug(
             f"Kalshi snapshot {market_id}: "
-            f"bid={book.best_yes_bid:.2f}, ask={book.best_yes_ask:.2f}"
+            f"bid={bid:.2f if bid is not None else 'N/A'}, "
+            f"ask={ask:.2f if ask is not None else 'N/A'}"
         )
 
         return book.to_market_price(

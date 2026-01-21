@@ -1095,9 +1095,9 @@ async def get_system_status():
 
     # Check Redis connection
     redis_ok = False
-    if redis and redis.redis:
+    if redis and redis._client:
         try:
-            await redis.redis.ping()
+            await redis._client.ping()
             redis_ok = True
         except Exception:
             pass
