@@ -1,0 +1,13 @@
+# Kalshi API Demo Requirements
+
+# Official Kalshi SDK (for SDK version)
+kalshi-python>=1.0.0
+
+# HTTP requests (for both versions)
+requests>=2.31.0
+
+# Cryptography for RSA signing (for raw HTTP version)
+cryptography>=41.0.0
+
+# Optional: Better error messages
+colorama>=0.4.6

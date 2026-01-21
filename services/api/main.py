@@ -173,6 +173,12 @@ class GameStateResponse(BaseModel):
     home_win_prob: Optional[float]
 
 
+class GameHistoryPoint(BaseModel):
+    time: datetime
+    home_win_prob: float
+
+
+
 class UpcomingGameResponse(BaseModel):
     """Response model for upcoming games."""
     game_id: str
@@ -443,6 +449,33 @@ async def get_game_signals(
     """, game_id, limit)
 
     return [SignalResponse(**dict(row)) for row in rows]
+
+
+@app.get("/api/live-games/{game_id}/history", response_model=list[GameHistoryPoint])
+async def get_game_history(
+    game_id: str,
+    limit: int = Query(100, le=500),
+):
+    """Get historical win probabilities for a game chart."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+    # Get history, filtering out null probabilities
+    rows = await pool.fetch("""
+        SELECT time, home_win_prob
+        FROM game_states
+        WHERE game_id = $1
+          AND home_win_prob IS NOT NULL
+        ORDER BY time ASC
+    """, game_id)
+
+    # Simple downsampling if too many points
+    if len(rows) > limit:
+        step = len(rows) // limit
+        rows = rows[::step]
+
+    return [GameHistoryPoint(time=row["time"], home_win_prob=row["home_win_prob"]) for row in rows]
 
 
 # =============================================================================

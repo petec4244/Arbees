@@ -16,7 +16,7 @@ services:
       - timescaledb_data:/var/lib/postgresql/data
       - ./shared/arbees_shared/db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U arbees"]
+      test: [ "CMD-SHELL", "pg_isready -U arbees" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -29,7 +29,7 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -72,6 +72,13 @@ services:
       REDIS_URL: redis://redis:6379
       SHARD_ID: shard-1
       LOG_LEVEL: INFO
+      POLL_INTERVAL: ${POLL_INTERVAL:-1.0}
+      CRUNCH_TIME_INTERVAL: ${CRUNCH_TIME_INTERVAL:-0.5}
+      HALFTIME_INTERVAL: ${HALFTIME_INTERVAL:-30.0}
+      MARKET_DATA_TTL: ${MARKET_DATA_TTL:-4.0}
+      SYNC_DELTA_TOLERANCE: ${SYNC_DELTA_TOLERANCE:-2.0}
+    ports:
+      - "8001:80"
     volumes:
       - ./:/app
     profiles:
@@ -116,10 +123,22 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: INFO
+      # Trading parameters
       INITIAL_BANKROLL: "1000"
       MIN_EDGE_PCT: "2.0"
       KELLY_FRACTION: "0.25"
       MAX_POSITION_PCT: "10.0"
+      # Exit monitoring parameters
+      TAKE_PROFIT_PCT: "3.0"           # Exit when prob moves 3%+ in our favor
+      DEFAULT_STOP_LOSS_PCT: "5.0"     # Fallback if sport not configured
+      EXIT_CHECK_INTERVAL: "1.0"       # Check positions every 1 second
+      # Sport-specific stop-loss thresholds (override defaults)
+      STOP_LOSS_NBA: "3.0"
+      STOP_LOSS_NCAAB: "3.0"
+      STOP_LOSS_NFL: "5.0"
+      STOP_LOSS_NHL: "7.0"
+      STOP_LOSS_MLB: "6.0"
+      STOP_LOSS_SOCCER: "7.0"
     volumes:
       - ./:/app
     profiles:
@@ -140,6 +159,7 @@ services:
 volumes:
   timescaledb_data:
   redis_data:
+
 
 networks:
   default:

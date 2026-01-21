@@ -112,6 +112,16 @@ export default function LiveGames() {
   )
 }
 
+
+function formatDataAge(timestamp?: string) {
+  if (!timestamp) return 'No data'
+  const age = Date.now() - new Date(timestamp).getTime()
+  if (age < 2000) return 'Just now'
+  if (age < 5000) return 'Active'
+  if (age < 30000) return `${Math.floor(age / 1000)}s ago`
+  return `${Math.floor(age / 60000)}m ago`
+}
+
 function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: () => void; isTracked: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const [prevHomeScore, setPrevHomeScore] = useState(game.home_score)
@@ -135,25 +145,39 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
     refetchInterval: expanded ? 2000 : 10000,
   })
 
-  const mockHistory = useMemo(() => {
-    if (!state || !state.home_win_prob) return []
-    const prob = state.home_win_prob * 100
-    return Array.from({ length: 10 }, (_, i) => ({
-      time: `${i * 5}m`,
-      prob: Math.max(0, Math.min(100, prob + (Math.random() - 0.5) * 10))
-    }))
-  }, [state])
+  const { data: history } = useQuery({
+    queryKey: ['gameHistory', game.game_id],
+    queryFn: async () => {
+      const res = await fetch(`/api/live-games/${game.game_id}/history`)
+      if (!res.ok) return []
+      const data = await res.json()
+      // Format for chart
+      return data.map((d: any) => ({
+        time: new Date(d.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        prob: d.home_win_prob * 100
+      }))
+    },
+    enabled: expanded && !!game.game_id,
+    staleTime: 60000, // Cache for 1 minute
+  })
 
   return (
     <div className={`bg-gray-800 rounded-lg overflow-hidden transition-all duration-300 ${expanded ? 'col-span-1 md:col-span-2 row-span-2 ring-2 ring-green-500/50' : 'hover:bg-gray-750'}`}>
       <div className="p-4">
         {/* Header */}
         <div className="flex justify-between items-start mb-4">
-          <div className="flex items-center space-x-2">
-            <span className="text-xs font-bold bg-gray-900 border border-gray-700 px-2 py-0.5 rounded text-gray-300 uppercase">
-              {game.sport}
-            </span>
-            <span className="text-xs text-red-400 font-semibold animate-pulse">● LIVE</span>
+          <div className="flex flex-col">
+            <div className="flex items-center space-x-2">
+              <span className="text-xs font-bold bg-gray-900 border border-gray-700 px-2 py-0.5 rounded text-gray-300 uppercase">
+                {game.sport}
+              </span>
+              <span className="text-xs text-red-400 font-semibold animate-pulse">● LIVE</span>
+            </div>
+            {state?.timestamp && (
+              <span className="text-[10px] text-gray-500 mt-1 ml-1" title={`Updated: ${new Date(state.timestamp).toLocaleTimeString()}`}>
+                Age: {formatDataAge(state.timestamp)}
+              </span>
+            )}
           </div>
           <button
             onClick={() => setExpanded(!expanded)}
@@ -203,8 +227,8 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
             onClick={(e) => { e.stopPropagation(); if (!isTracked) onSubscribe(); }}
             disabled={isTracked}
             className={`px-3 py-1.5 text-xs font-medium rounded transition-all flex items-center space-x-1 ${isTracked
-                ? 'bg-green-500/20 text-green-400 cursor-default'
-                : 'bg-blue-600 hover:bg-blue-500 text-white'
+              ? 'bg-green-500/20 text-green-400 cursor-default'
+              : 'bg-blue-600 hover:bg-blue-500 text-white'
               }`}
           >
             {isTracked && <CheckCircle className="w-3 h-3" />}
@@ -223,7 +247,7 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
             </div>
 
             <WinProbChart
-              data={mockHistory}
+              data={history || []}
               homeTeam={game.home_team}
               awayTeam={game.away_team}
             />

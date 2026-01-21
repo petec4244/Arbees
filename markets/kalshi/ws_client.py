@@ -258,8 +258,8 @@ class KalshiWebSocketClient(BaseWebSocketClient):
         ask = book.best_yes_ask
         logger.debug(
             f"Kalshi snapshot {market_id}: "
-            f"bid={bid:.2f if bid is not None else 'N/A'}, "
-            f"ask={ask:.2f if ask is not None else 'N/A'}"
+            f"bid={'N/A' if bid is None else f'{bid:.2f}'}, "
+            f"ask={'N/A' if ask is None else f'{ask:.2f}'}"
         )
 
         return book.to_market_price(

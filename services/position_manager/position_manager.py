@@ -21,13 +21,35 @@ from arbees_shared.messaging.redis_bus import RedisBus
 from arbees_shared.models.game import Sport
 from arbees_shared.models.market import MarketPrice, Platform
 from arbees_shared.models.signal import TradingSignal, SignalType, SignalDirection, ArbitrageOpportunity
-from arbees_shared.models.trade import TradeStatus
+from arbees_shared.models.trade import PaperTrade, TradeStatus, TradeSide
 from arbees_shared.risk import RiskController, RiskDecision, RiskRejection
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
 from markets.paper.engine import PaperTradingEngine
 
 logger = logging.getLogger(__name__)
+
+
+def _side_display(side: str) -> str:
+    """Convert buy/sell to HOME/AWAY for display."""
+    return "HOME" if side == "buy" else "AWAY"
+
+
+# Sport-specific stop-loss thresholds (% probability move against us)
+# Higher-scoring sports (basketball) = tighter stop-loss (more frequent score changes)
+# Lower-scoring sports (hockey, soccer) = wider stop-loss (score changes are bigger swings)
+SPORT_STOP_LOSS_DEFAULTS: dict[str, float] = {
+    "NBA": 3.0,      # Fast-paced, frequent scoring
+    "NCAAB": 3.0,    # Similar to NBA
+    "NFL": 5.0,      # Medium pace, touchdowns are 7pts
+    "NCAAF": 5.0,    # Similar to NFL
+    "NHL": 7.0,      # Low scoring, each goal is significant
+    "MLB": 6.0,      # Low scoring, but innings can swing
+    "MLS": 7.0,      # Low scoring like hockey
+    "SOCCER": 7.0,   # Low scoring
+    "TENNIS": 4.0,   # Point-by-point volatility
+    "MMA": 8.0,      # Binary outcome, big swings possible
+}
 
 
 class PositionManager:
@@ -54,6 +76,11 @@ class PositionManager:
         max_game_exposure: float = 50.0,
         max_sport_exposure: float = 200.0,
         max_latency_ms: float = 5000.0,
+        # Exit monitoring settings
+        take_profit_pct: float = 3.0,         # Exit when prob moves 3%+ in our favor
+        default_stop_loss_pct: float = 5.0,   # Fallback if sport not configured
+        exit_check_interval: float = 1.0,     # Check every 1 second
+        sport_stop_loss: Optional[dict[str, float]] = None,  # Sport-specific overrides
     ):
         """
         Initialize Position Manager.
@@ -83,6 +110,12 @@ class PositionManager:
         self.max_sport_exposure = max_sport_exposure
         self.max_latency_ms = max_latency_ms
 
+        # Exit monitoring settings
+        self.take_profit_pct = take_profit_pct
+        self.default_stop_loss_pct = default_stop_loss_pct
+        self.exit_check_interval = exit_check_interval
+        self.sport_stop_loss = sport_stop_loss or SPORT_STOP_LOSS_DEFAULTS.copy()
+
         # Connections
         self.db: Optional[DatabaseClient] = None
         self.redis: Optional[RedisBus] = None
@@ -101,6 +134,10 @@ class PositionManager:
         self._trade_count = 0
         self._arb_count = 0
         self._risk_rejected_count = 0
+        self._edge_rejected_count = 0
+        self._prob_rejected_count = 0
+        self._duplicate_rejected_count = 0
+        self._no_market_rejected_count = 0
 
     async def start(self) -> None:
         """Start the position manager and connect to services."""
@@ -167,7 +204,17 @@ class PositionManager:
         # Start risk monitoring
         asyncio.create_task(self._risk_monitor_loop())
 
-        logger.info("Position Manager started")
+        # Start position exit monitoring (polling fallback)
+        asyncio.create_task(self._position_monitor_loop())
+
+        # Subscribe to game state updates for real-time exit monitoring
+        await self.redis.psubscribe("game:*:state", self._handle_game_state_update)
+
+        logger.info(
+            f"Position Manager started with active exit monitoring "
+            f"(take_profit={self.take_profit_pct}%, default_stop_loss={self.default_stop_loss_pct}%, "
+            f"check_interval={self.exit_check_interval}s)"
+        )
 
     async def stop(self) -> None:
         """Stop the position manager gracefully."""
@@ -250,7 +297,9 @@ class PositionManager:
                 }
                 logger.info(
                     f"Position Manager status: {status['trades_executed']} trades, "
-                    f"{status['risk_rejected']} risk-rejected, "
+                    f"Rejected(Risk: {self._risk_rejected_count}, Edge: {self._edge_rejected_count}, "
+                    f"Prob: {self._prob_rejected_count}, Dup: {self._duplicate_rejected_count}, "
+                    f"NoMkt: {self._no_market_rejected_count}), "
                     f"${status['bankroll']:.2f} bankroll, "
                     f"daily P&L ${status['daily_pnl']:.2f}"
                 )
@@ -283,16 +332,26 @@ class PositionManager:
             signal = TradingSignal(**data)
             logger.info(f"Received signal: {signal.signal_type.value} {signal.direction.value} {signal.team} (edge: {signal.edge_pct:.1f}%)")
 
+            # CRITICAL: Only trade with real market prices - no synthetic prices
+            # Without real market data, we can't verify edge vs actual market
+            if signal.market_prob is None:
+                self._no_market_rejected_count += 1
+                logger.info(f"Signal rejected: no real market price available (synthetic prices disabled)")
+                return
+
             # Skip if edge below threshold
             if signal.edge_pct < self.min_edge_pct:
+                self._edge_rejected_count += 1
                 logger.debug(f"Signal rejected: edge {signal.edge_pct}% < min {self.min_edge_pct}%")
                 return
 
             # Probability guardrails - avoid extreme probabilities with poor risk/reward
             if signal.direction == SignalDirection.BUY and signal.model_prob > self.max_buy_prob:
+                self._prob_rejected_count += 1
                 logger.info(f"Signal rejected: BUY at {signal.model_prob*100:.1f}% > max {self.max_buy_prob*100:.0f}% (poor risk/reward)")
                 return
             if signal.direction == SignalDirection.SELL and signal.model_prob < self.min_sell_prob:
+                self._prob_rejected_count += 1
                 logger.info(f"Signal rejected: SELL at {signal.model_prob*100:.1f}% < min {self.min_sell_prob*100:.0f}% (poor risk/reward)")
                 return
 
@@ -305,21 +364,28 @@ class PositionManager:
 
                 if existing_side == new_side:
                     # Same direction - skip, don't double down
-                    logger.info(f"Skipping signal: already have {existing_side.upper()} position on game {signal.game_id}")
+                    self._duplicate_rejected_count += 1
+                    logger.info(f"Skipping signal: already have {_side_display(existing_side)} position on game {signal.game_id}")
                     return
                 else:
                     # Opposite direction - close existing position instead of opening new one
-                    logger.info(f"Closing existing {existing_side.upper()} position on game {signal.game_id} (opposite signal received)")
+                    logger.info(f"Closing existing {_side_display(existing_side)} position on game {signal.game_id} (opposite signal received)")
                     await self._close_position(existing_position, signal)
                     return
 
             # No existing position - open new one
-            # Get market price for execution
+            # Get market price for execution - REQUIRE real prices
             market_price = await self._get_market_price(signal)
             if not market_price:
-                logger.warning(f"No market price available for signal {signal.signal_id}")
-                # Create synthetic market price for paper trading
-                market_price = self._create_synthetic_price(signal)
+                # Use signal's market data if available (from signal generation time)
+                # This is real market data captured when the signal was created
+                if signal.market_prob is not None:
+                    market_price = self._create_price_from_signal(signal)
+                    logger.info(f"Using signal's market data: mid={signal.market_prob:.3f}")
+                else:
+                    self._no_market_rejected_count += 1
+                    logger.warning(f"No market price available for signal {signal.signal_id} - skipping (synthetic disabled)")
+                    return
 
             # Calculate proposed position size for risk check
             # Use paper engine's sizing logic to estimate
@@ -433,7 +499,7 @@ class PositionManager:
                 WHERE trade_id = $5
             """, outcome, exit_price, pnl, (pnl / (size * entry_price)) * 100 if entry_price > 0 else 0, position["trade_id"])
 
-            logger.info(f"Closed position {position['trade_id']}: {position['side'].upper()} -> PnL ${pnl:.2f} ({outcome})")
+            logger.info(f"Closed position {position['trade_id']}: {_side_display(position['side'])} -> PnL ${pnl:.2f} ({outcome})")
             return
 
         # Close using paper engine
@@ -480,18 +546,28 @@ class PositionManager:
 
         return None
 
-    def _create_synthetic_price(self, signal: TradingSignal) -> MarketPrice:
-        """Create synthetic market price for paper trading when no real price available."""
-        # Use model probability as market price proxy
-        model_prob = signal.model_prob
+    def _create_price_from_signal(self, signal: TradingSignal) -> MarketPrice:
+        """Create market price from signal's captured market data.
+
+        Uses the actual market_prob from the signal (captured at signal generation time)
+        rather than the model's probability estimate. This ensures we execute at
+        realistic market prices.
+        """
+        # Use the actual market probability from signal, NOT model_prob
+        # market_prob is the real market mid-price when signal was generated
+        market_prob = signal.market_prob
+
+        # Estimate a realistic spread (typically 2-4% for prediction markets)
+        spread = 0.02  # 2% spread
+
         return MarketPrice(
-            market_id=f"synthetic_{signal.game_id}",
+            market_id=f"signal_{signal.game_id}",
             platform=Platform.PAPER,
             market_title=f"{signal.team} to win",
-            yes_bid=max(0.01, model_prob - 0.02),
-            yes_ask=min(0.99, model_prob + 0.02),
+            yes_bid=max(0.01, market_prob - spread),
+            yes_ask=min(0.99, market_prob + spread),
             volume=0,
-            liquidity=10000,  # Assume unlimited liquidity for paper trading
+            liquidity=10000,  # Assume good liquidity for paper trading
         )
 
     async def _handle_game_ended(self, data: dict) -> None:
@@ -664,6 +740,169 @@ class PositionManager:
             f"Sell {sell_platform.value} @ {sell_price:.3f} (edge: {edge_pct:.1f}%)"
         )
 
+    # ==========================================================================
+    # Active Exit Monitoring
+    # ==========================================================================
+
+    async def _position_monitor_loop(self) -> None:
+        """Actively monitor open positions for exit conditions (polling fallback)."""
+        while self._running:
+            try:
+                await self._check_exit_conditions()
+            except Exception as e:
+                logger.error(f"Position monitor error: {e}")
+            await asyncio.sleep(self.exit_check_interval)
+
+    async def _check_exit_conditions(self) -> None:
+        """Check all open positions against current probabilities."""
+        if not self.paper_engine:
+            return
+
+        open_trades = self.paper_engine.get_open_trades()
+        if not open_trades:
+            return
+
+        for trade in open_trades:
+            prob_data = await self._get_current_probability(trade.game_id)
+            if prob_data is None:
+                continue
+
+            current_prob, sport = prob_data
+            should_exit, reason = self._evaluate_exit(trade, current_prob, sport)
+            if should_exit:
+                await self._execute_exit(trade, current_prob, reason)
+
+    def _get_stop_loss_for_sport(self, sport: str) -> float:
+        """Get stop-loss threshold for a sport.
+
+        Different sports have different scoring patterns:
+        - Basketball: Frequent scoring -> tighter stop-loss (3%)
+        - Hockey/Soccer: Rare but significant goals -> wider stop-loss (7%)
+        """
+        sport_upper = sport.upper() if sport else ""
+        return self.sport_stop_loss.get(sport_upper, self.default_stop_loss_pct)
+
+    def _evaluate_exit(
+        self,
+        trade: PaperTrade,
+        current_prob: float,
+        sport: str
+    ) -> tuple[bool, str]:
+        """Evaluate if position should be exited.
+
+        Args:
+            trade: The open trade to evaluate
+            current_prob: Current win probability (used as proxy for market price)
+            sport: Sport type for stop-loss lookup
+
+        Returns:
+            (should_exit: bool, reason: str)
+
+        Note: We compare against entry_price (actual execution price), not model_prob
+        (model's estimate at entry). This ensures take-profit/stop-loss decisions
+        are based on actual P&L, not theoretical edge.
+        """
+        # Use entry_price, not model_prob - we want actual P&L movement
+        entry_price = trade.entry_price
+        stop_loss_pct = self._get_stop_loss_for_sport(sport)
+
+        if trade.side == TradeSide.BUY:
+            # BUY position profits when price goes UP
+            price_move = current_prob - entry_price
+
+            if price_move >= self.take_profit_pct / 100:
+                return True, f"take_profit: +{price_move*100:.1f}%"
+
+            if price_move <= -stop_loss_pct / 100:
+                return True, f"stop_loss: {price_move*100:.1f}% (limit={stop_loss_pct}%)"
+
+        else:  # SELL position
+            # SELL position profits when price goes DOWN
+            price_move = entry_price - current_prob
+
+            if price_move >= self.take_profit_pct / 100:
+                return True, f"take_profit: +{price_move*100:.1f}%"
+
+            if price_move <= -stop_loss_pct / 100:
+                return True, f"stop_loss: {price_move*100:.1f}% (limit={stop_loss_pct}%)"
+
+        return False, ""
+
+    async def _get_current_probability(self, game_id: str) -> Optional[tuple[float, str]]:
+        """Get current win probability and sport for a game.
+
+        Returns:
+            Tuple of (probability, sport) or None if not found
+        """
+        # Try Redis cache first (fastest)
+        if self.redis:
+            cached = await self.redis.get(f"game:{game_id}:state")
+            if cached:
+                prob = cached.get("home_win_prob")
+                sport = cached.get("sport", "")
+                if prob is not None:
+                    return (float(prob), sport)
+
+        # Fall back to database
+        pool = await get_pool()
+        row = await pool.fetchrow("""
+            SELECT gs.home_win_prob, g.sport
+            FROM game_states gs
+            JOIN games g ON gs.game_id = g.game_id
+            WHERE gs.game_id = $1
+            ORDER BY gs.time DESC LIMIT 1
+        """, game_id)
+
+        if row:
+            return (float(row["home_win_prob"]), row["sport"] or "")
+        return None
+
+    async def _execute_exit(
+        self,
+        trade: PaperTrade,
+        current_prob: float,
+        reason: str
+    ) -> None:
+        """Execute position exit."""
+        logger.info(
+            f"EXIT {_side_display(trade.side.value)} {trade.game_id}: "
+            f"entry_price={trade.entry_price*100:.1f}% -> current={current_prob*100:.1f}% "
+            f"({reason})"
+        )
+
+        closed_trade = await self.paper_engine.close_trade(trade, current_prob)
+
+        logger.info(
+            f"Closed trade {closed_trade.trade_id}: "
+            f"PnL ${closed_trade.pnl:.2f} ({closed_trade.outcome.value})"
+        )
+
+    async def _handle_game_state_update(self, channel: str, data: dict) -> None:
+        """Handle real-time game state update for immediate exit evaluation."""
+        if not self.paper_engine:
+            return
+
+        # Extract game_id from channel (format: "game:{game_id}:state")
+        parts = channel.split(":")
+        if len(parts) < 2:
+            return
+        game_id = parts[1]
+
+        home_win_prob = data.get("home_win_prob")
+        sport = data.get("sport", "")
+
+        if home_win_prob is None:
+            return
+
+        # Check if we have open positions on this game
+        open_trades = [t for t in self.paper_engine.get_open_trades()
+                       if t.game_id == game_id]
+
+        for trade in open_trades:
+            should_exit, reason = self._evaluate_exit(trade, float(home_win_prob), sport)
+            if should_exit:
+                await self._execute_exit(trade, float(home_win_prob), reason)
+
 
 async def main():
     """Main entry point."""
@@ -671,6 +910,13 @@ async def main():
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+
+    # Build sport-specific stop-loss overrides from environment
+    sport_stop_loss = SPORT_STOP_LOSS_DEFAULTS.copy()
+    for sport in SPORT_STOP_LOSS_DEFAULTS:
+        env_key = f"STOP_LOSS_{sport}"
+        if env_val := os.environ.get(env_key):
+            sport_stop_loss[sport] = float(env_val)
 
     manager = PositionManager(
         # Trading parameters
@@ -685,6 +931,11 @@ async def main():
         max_game_exposure=float(os.environ.get("MAX_GAME_EXPOSURE", "50.0")),  # $50 max per game
         max_sport_exposure=float(os.environ.get("MAX_SPORT_EXPOSURE", "200.0")),  # $200 max per sport
         max_latency_ms=float(os.environ.get("MAX_LATENCY_MS", "5000.0")),  # 5 second max latency
+        # Exit monitoring parameters
+        take_profit_pct=float(os.environ.get("TAKE_PROFIT_PCT", "3.0")),  # Exit on 3% profit
+        default_stop_loss_pct=float(os.environ.get("DEFAULT_STOP_LOSS_PCT", "5.0")),  # Fallback stop-loss
+        exit_check_interval=float(os.environ.get("EXIT_CHECK_INTERVAL", "1.0")),  # Check every 1 second
+        sport_stop_loss=sport_stop_loss,
     )
 
     await manager.start()

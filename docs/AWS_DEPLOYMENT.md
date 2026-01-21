@@ -105,7 +105,15 @@ For each service, define a Task Definition using Fargate launch type.
 - `KALSHI_API_KEY`, `KALSHI_PRIVATE_KEY`
 - `POLYMARKET_API_KEY`
 - `POLYMARKET_PROXY_URL`: `http://user:pass@eu-proxy-ip:3128`
+- `POLYMARKET_API_KEY`
+- `POLYMARKET_PROXY_URL`: `http://user:pass@eu-proxy-ip:3128`
 - `ENV`: `production`
+
+**Latency Tuning:**
+- `POLL_INTERVAL`: `1.0` (Seconds between ESPN checks)
+- `CRUNCH_TIME_INTERVAL`: `0.5` (Faster polling for late game)
+- `MARKET_DATA_TTL`: `4.0` (Max age of market data before skipping signal)
+- `SYNC_DELTA_TOLERANCE`: `2.0` (Max allowed diff between Game vs Market timestamps)
 
 ### 5.2 Services
 1.  **Frontend Service**:

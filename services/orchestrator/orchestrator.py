@@ -574,8 +574,37 @@ class Orchestrator:
 
         return False
 
+    def _is_single_game_market(self, ticker: str) -> bool:
+        """Check if ticker is a single-game market (not a parlay/multi-game).
+
+        Single-game tickers contain patterns like:
+        - KXMVENBASINGLEGAME (NBA)
+        - KXMVENHLSINGLEGAME (NHL)
+        - KXMVENFLFLOORGAME (NFL)
+        - KXMVENFLSINGLEGAME (NFL)
+        - KXMVENCAABSINGLEGAME (NCAAB)
+
+        Multi-game/parlay tickers to skip:
+        - KXMVESPORTSMULTIGAMEEXTENDED
+        """
+        ticker_upper = ticker.upper()
+
+        # Skip multi-game markets
+        if "MULTIGAME" in ticker_upper or "PARLAY" in ticker_upper:
+            return False
+
+        # Accept single-game markets
+        if "SINGLEGAME" in ticker_upper or "FLOORGAME" in ticker_upper:
+            return True
+
+        # Unknown pattern - be conservative and skip
+        return False
+
     async def _find_kalshi_market(self, game: GameInfo) -> Optional[str]:
-        """Find Kalshi market for a game using cached markets and team matching."""
+        """Find Kalshi market for a game using cached markets and team matching.
+
+        Only matches single-game markets, skipping multi-game parlays.
+        """
         if not self.kalshi:
             return None
 
@@ -589,19 +618,24 @@ class Orchestrator:
             return cached.get(game.home_team) or cached.get(game.home_team_abbrev)
 
         try:
-            # Scan all markets for matches
+            # Scan all markets for matches - ONLY consider single-game markets
             home_market = None
             away_market = None
 
             for market in self._kalshi_markets:
                 title = market.get("title", "")
                 ticker = market.get("ticker", "")
+
+                # Skip multi-game/parlay markets
+                if not self._is_single_game_market(ticker):
+                    continue
+
                 combined = f"{title} {ticker}"
 
                 # Check for home team match
                 if self._match_team_in_text(combined, game.home_team, game.sport):
                     home_market = ticker
-                    logger.info(f"Kalshi match: {game.home_team} -> {ticker}")
+                    logger.info(f"Kalshi single-game match: {game.home_team} -> {ticker}")
 
                 # Check for away team match
                 if self._match_team_in_text(combined, game.away_team, game.sport):
@@ -618,6 +652,9 @@ class Orchestrator:
                     game.away_team: away_market,
                 }
             }
+
+            if not home_market:
+                logger.debug(f"No single-game Kalshi market found for {game.home_team} vs {game.away_team}")
 
             # Return home team market for win probability tracking
             return home_market

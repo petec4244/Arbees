@@ -251,8 +251,8 @@ class PolymarketWebSocketClient(BaseWebSocketClient):
 
         logger.debug(
             f"Polymarket book {token_id[:16]}...: "
-            f"bid={book.best_yes_bid:.2f if book.best_yes_bid else 0:.2f}, "
-            f"ask={book.best_yes_ask:.2f if book.best_yes_ask else 1:.2f}"
+            f"bid={0.0 if not book.best_yes_bid else book.best_yes_bid:.2f}, "
+            f"ask={1.0 if not book.best_yes_ask else book.best_yes_ask:.2f}"
         )
 
         meta = self._market_metadata.get(token_id, {})

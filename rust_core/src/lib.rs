@@ -2,6 +2,7 @@
 //!
 //! This module provides:
 //! - Cross-market arbitrage detection (Kalshi vs Polymarket)
+//! - Same-platform arbitrage detection (Kalshi-Kalshi, Poly-Poly)
 //! - Model edge detection (model probability vs market prices)
 //! - Win probability calculation for multiple sports
 //! - Batch processing with SIMD optimization via rayon
@@ -16,11 +17,13 @@ use std::collections::HashMap;
 pub use types::*;
 pub use win_prob::*;
 
-/// Find cross-market arbitrage opportunities between two platforms.
+/// Find cross-platform arbitrage opportunities (Kalshi vs Polymarket).
 ///
-/// Looks for situations where:
-/// - Platform A's YES ask < Platform B's YES bid (buy A, sell B)
-/// - Or vice versa
+/// CORRECT LOGIC: Looks for situations where YES + NO < $1.00:
+/// - Buy YES on Platform A + Buy NO on Platform B
+/// - Or: Buy YES on Platform B + Buy NO on Platform A
+///
+/// At expiry, exactly ONE side pays $1.00, guaranteeing profit.
 ///
 /// Returns a list of `ArbitrageOpportunity` objects.
 #[pyfunction]
@@ -33,76 +36,113 @@ fn find_cross_market_arbitrage(
 ) -> Vec<ArbitrageOpportunity> {
     let mut opportunities = Vec::new();
 
-    // Check if we can buy YES on A and sell YES on B
-    if market_a.yes_ask < market_b.yes_bid {
-        let edge_pct = (market_b.yes_bid - market_a.yes_ask) * 100.0;
-        opportunities.push(ArbitrageOpportunity::new(
-            "cross_market_arb".to_string(),
-            market_a.platform,
-            market_b.platform,
-            event_id.clone(),
-            sport,
-            market_title.clone(),
-            edge_pct,
-            market_a.yes_ask,
-            market_b.yes_bid,
-            market_a.liquidity,
-            market_b.liquidity,
-            true,
-        ));
-    }
-
-    // Check if we can buy YES on B and sell YES on A
-    if market_b.yes_ask < market_a.yes_bid {
-        let edge_pct = (market_a.yes_bid - market_b.yes_ask) * 100.0;
-        opportunities.push(ArbitrageOpportunity::new(
-            "cross_market_arb".to_string(),
-            market_b.platform,
-            market_a.platform,
-            event_id.clone(),
-            sport,
-            market_title.clone(),
-            edge_pct,
-            market_b.yes_ask,
-            market_a.yes_bid,
-            market_b.liquidity,
-            market_a.liquidity,
-            true,
-        ));
-    }
-
-    // Check NO side arbitrage (buy NO on A = sell YES on A, etc.)
-    // NO bid = 1 - YES ask, NO ask = 1 - YES bid
+    // NO ask = 1.0 - YES bid (to buy NO, we effectively sell YES at the bid price)
     let no_ask_a = 1.0 - market_a.yes_bid;
-    let no_bid_a = 1.0 - market_a.yes_ask;
     let no_ask_b = 1.0 - market_b.yes_bid;
-    let no_bid_b = 1.0 - market_b.yes_ask;
 
-    // Buy NO on A, sell NO on B
-    if no_ask_a < no_bid_b {
-        let edge_pct = (no_bid_b - no_ask_a) * 100.0;
+    // Strategy 1: Buy YES on A + Buy NO on B
+    let total_cost_1 = market_a.yes_ask + no_ask_b;
+    if total_cost_1 < 1.0 {
+        let profit = 1.0 - total_cost_1;
+        let edge_pct = profit * 100.0;
+        
         let mut opp = ArbitrageOpportunity::new(
-            "cross_market_arb_no".to_string(),
+            "cross_platform_arb".to_string(),
             market_a.platform,
             market_b.platform,
             event_id.clone(),
             sport,
             market_title.clone(),
             edge_pct,
-            no_ask_a,
-            no_bid_b,
+            market_a.yes_ask,   // Buy YES at ask
+            no_ask_b,           // Buy NO at ask
             market_a.liquidity,
             market_b.liquidity,
             true,
         );
         opp.description = format!(
-            "Buy NO {:?} @ {:.3}, Sell NO {:?} @ {:.3}",
-            market_a.platform, no_ask_a, market_b.platform, no_bid_b
+            "Buy YES {:?} @ {:.3} + Buy NO {:?} @ {:.3} = {:.3} < 1.00 (profit: {:.3})",
+            market_a.platform, market_a.yes_ask,
+            market_b.platform, no_ask_b,
+            total_cost_1, profit
+        );
+        opportunities.push(opp);
+    }
+
+    // Strategy 2: Buy YES on B + Buy NO on A
+    let total_cost_2 = market_b.yes_ask + no_ask_a;
+    if total_cost_2 < 1.0 {
+        let profit = 1.0 - total_cost_2;
+        let edge_pct = profit * 100.0;
+        
+        let mut opp = ArbitrageOpportunity::new(
+            "cross_platform_arb".to_string(),
+            market_b.platform,
+            market_a.platform,
+            event_id.clone(),
+            sport,
+            market_title.clone(),
+            edge_pct,
+            market_b.yes_ask,   // Buy YES at ask
+            no_ask_a,           // Buy NO at ask
+            market_b.liquidity,
+            market_a.liquidity,
+            true,
+        );
+        opp.description = format!(
+            "Buy YES {:?} @ {:.3} + Buy NO {:?} @ {:.3} = {:.3} < 1.00 (profit: {:.3})",
+            market_b.platform, market_b.yes_ask,
+            market_a.platform, no_ask_a,
+            total_cost_2, profit
         );
         opportunities.push(opp);
     }
 
     opportunities
+}
+
+/// Find same-platform arbitrage opportunities (Poly-Poly or Kalshi-Kalshi).
+///
+/// CORRECT LOGIC: YES + NO < $1.00 on the SAME market.
+/// Buy BOTH YES and NO, guaranteed $1.00 payout at expiry.
+///
+/// This is rare but happens during market inefficiencies.
+#[pyfunction]
+fn find_same_platform_arbitrage(
+    market: &MarketPrice,
+    event_id: String,
+    sport: Sport,
+    market_title: String,
+) -> Option<ArbitrageOpportunity> {
+    let no_ask = 1.0 - market.yes_bid;
+    let total_cost = market.yes_ask + no_ask;
+    
+    if total_cost < 1.0 {
+        let profit = 1.0 - total_cost;
+        let edge_pct = profit * 100.0;
+        
+        let mut opp = ArbitrageOpportunity::new(
+            "same_platform_arb".to_string(),
+            market.platform,
+            market.platform,
+            event_id,
+            sport,
+            market_title,
+            edge_pct,
+            market.yes_ask,
+            no_ask,
+            market.liquidity,
+            market.liquidity,
+            true,
+        );
+        opp.description = format!(
+            "Buy YES @ {:.3} + Buy NO @ {:.3} = {:.3} < 1.00 (profit: {:.3}) on {:?}",
+            market.yes_ask, no_ask, total_cost, profit, market.platform
+        );
+        return Some(opp);
+    }
+    
+    None
 }
 
 /// Find model edge opportunities comparing model probability to market prices.
@@ -315,6 +355,8 @@ fn batch_scan_arbitrage(
         .par_iter()
         .flat_map(|(event_id, prices)| {
             let mut opps = Vec::new();
+            
+            // Cross-platform arbitrage (all pairs)
             for i in 0..prices.len() {
                 for j in (i + 1)..prices.len() {
                     opps.extend(find_cross_market_arbitrage(
@@ -326,6 +368,19 @@ fn batch_scan_arbitrage(
                     ));
                 }
             }
+            
+            // Same-platform arbitrage (each market individually)
+            for price in prices {
+                if let Some(opp) = find_same_platform_arbitrage(
+                    price,
+                    event_id.clone(),
+                    sport,
+                    format!("Event {}", event_id),
+                ) {
+                    opps.push(opp);
+                }
+            }
+            
             opps
         })
         .collect()
@@ -344,6 +399,7 @@ fn arbees_core(_py: Python, m: &PyModule) -> PyResult<()> {
 
     // Arbitrage functions
     m.add_function(wrap_pyfunction!(find_cross_market_arbitrage, m)?)?;
+    m.add_function(wrap_pyfunction!(find_same_platform_arbitrage, m)?)?;
     m.add_function(wrap_pyfunction!(find_model_edges, m)?)?;
     m.add_function(wrap_pyfunction!(detect_lagging_market, m)?)?;
     m.add_function(wrap_pyfunction!(batch_scan_arbitrage, m)?)?;
@@ -377,25 +433,11 @@ mod tests {
     }
 
     #[test]
-    fn test_no_arbitrage() {
-        let kalshi = make_market(Platform::Kalshi, 0.50, 0.52);
-        let poly = make_market(Platform::Polymarket, 0.49, 0.51);
-
-        let opps = find_cross_market_arbitrage(
-            &kalshi,
-            &poly,
-            "event-1".to_string(),
-            Sport::NFL,
-            "KC vs SF".to_string(),
-        );
-
-        assert!(opps.is_empty());
-    }
-
-    #[test]
-    fn test_arbitrage_found() {
-        // Kalshi ask 0.48, Poly bid 0.52 = 4% edge
-        let kalshi = make_market(Platform::Kalshi, 0.46, 0.48);
+    fn test_cross_platform_arbitrage_found() {
+        // Kalshi YES ask: 0.48, NO ask: 0.50 (from bid of 0.50)
+        // Poly YES ask: 0.54, NO ask: 0.48 (from bid of 0.52)
+        // Strategy: Buy Kalshi YES (0.48) + Buy Poly NO (0.48) = 0.96 < 1.00 ✓
+        let kalshi = make_market(Platform::Kalshi, 0.50, 0.48);
         let poly = make_market(Platform::Polymarket, 0.52, 0.54);
 
         let opps = find_cross_market_arbitrage(
@@ -410,7 +452,47 @@ mod tests {
         let opp = &opps[0];
         assert_eq!(opp.platform_buy, Platform::Kalshi);
         assert_eq!(opp.platform_sell, Platform::Polymarket);
-        assert!((opp.edge_pct - 4.0).abs() < 0.1);
+        assert!((opp.edge_pct - 4.0).abs() < 0.1);  // 4% profit
+    }
+
+    #[test]
+    fn test_same_platform_arbitrage() {
+        // Market: YES ask 0.48, YES bid 0.50
+        // NO ask = 1.0 - YES bid = 1.0 - 0.50 = 0.50
+        // Total: 0.48 + 0.50 = 0.98 < 1.00 ✓
+        let market = make_market(Platform::Kalshi, 0.50, 0.48);
+
+        let opp = find_same_platform_arbitrage(
+            &market,
+            "event-1".to_string(),
+            Sport::NFL,
+            "KC wins".to_string(),
+        );
+
+        assert!(opp.is_some());
+        let opp = opp.unwrap();
+        assert_eq!(opp.platform_buy, Platform::Kalshi);
+        assert_eq!(opp.platform_sell, Platform::Kalshi);
+        assert!((opp.edge_pct - 2.0).abs() < 0.1);  // 2% profit
+    }
+
+    #[test]
+    fn test_no_arbitrage() {
+        // Efficient market: YES ask 0.52, YES bid 0.50
+        // NO ask = 1.0 - 0.50 = 0.50
+        // Total: 0.52 + 0.50 = 1.02 > 1.00 ✗
+        let kalshi = make_market(Platform::Kalshi, 0.50, 0.52);
+        let poly = make_market(Platform::Polymarket, 0.49, 0.51);
+
+        let opps = find_cross_market_arbitrage(
+            &kalshi,
+            &poly,
+            "event-1".to_string(),
+            Sport::NFL,
+            "KC vs SF".to_string(),
+        );
+
+        assert!(opps.is_empty());
     }
 
     #[test]

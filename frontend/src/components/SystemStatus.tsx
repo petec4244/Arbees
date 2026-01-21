@@ -9,7 +9,7 @@ export default function SystemStatus() {
             const res = await fetch('/api/monitoring/status')
             const end = performance.now()
             if (!res.ok) throw new Error('Status check failed')
-            return { ...(await res.json()), latency: Math.round(end - start) }
+            return { ...(await res.json()), ping: Math.round(end - start) }
         },
         refetchInterval: 10000,
     })
@@ -19,7 +19,7 @@ export default function SystemStatus() {
         redis: true,
         timescaledb: true,
         shards: 1,
-        latency: 0
+        ping: 0
     }
 
     const isHealthy = !isError && displayStatus.redis && displayStatus.timescaledb
@@ -41,9 +41,10 @@ export default function SystemStatus() {
                 <span className="hidden lg:inline">{displayStatus.shards} Shards</span>
             </div>
 
-            <div className="flex items-center space-x-2 w-20 justify-end font-mono">
-                <span className={`${displayStatus.latency > 500 ? 'text-yellow-400' : 'text-gray-400'}`}>
-                    {displayStatus.latency}ms
+            <div className="flex items-center space-x-2 w-24 justify-end font-mono" title="API Round-trip Time">
+                <span className="text-xs text-gray-500 mr-1">PING</span>
+                <span className={`${displayStatus.ping > 500 ? 'text-yellow-400' : 'text-gray-400'}`}>
+                    {displayStatus.ping}ms
                 </span>
             </div>
         </div>

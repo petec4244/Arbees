@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator, Optional
 
 from arbees_shared.models.market import MarketPrice, OrderBook, Platform
 from markets.kalshi.client import KalshiClient
-from markets.kalshi.ws_client import KalshiWebSocketClient
+from markets.kalshi.websocket.ws_client import KalshiWebSocketClient
 
 logger = logging.getLogger(__name__)
 

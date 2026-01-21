@@ -48,9 +48,9 @@ export default function RecentTradesList({
           >
             <div className="flex items-center gap-2">
               {trade.side === 'buy' ? (
-                <ArrowUpRight className="w-4 h-4 text-green-400" />
+                <ArrowUpRight className="w-4 h-4 text-blue-400" />
               ) : (
-                <ArrowDownRight className="w-4 h-4 text-red-400" />
+                <ArrowDownRight className="w-4 h-4 text-orange-400" />
               )}
               <span className="text-xs text-gray-400">
                 {new Date(trade.entry_time).toLocaleTimeString()}
@@ -86,12 +86,12 @@ export default function RecentTradesList({
         >
           <div className="flex items-center gap-3">
             {trade.side === 'buy' ? (
-              <div className="w-8 h-8 rounded-full bg-green-900/50 flex items-center justify-center">
-                <ArrowUpRight className="w-4 h-4 text-green-400" />
+              <div className="w-8 h-8 rounded-full bg-blue-900/50 flex items-center justify-center" title="HOME">
+                <ArrowUpRight className="w-4 h-4 text-blue-400" />
               </div>
             ) : (
-              <div className="w-8 h-8 rounded-full bg-red-900/50 flex items-center justify-center">
-                <ArrowDownRight className="w-4 h-4 text-red-400" />
+              <div className="w-8 h-8 rounded-full bg-orange-900/50 flex items-center justify-center" title="AWAY">
+                <ArrowDownRight className="w-4 h-4 text-orange-400" />
               </div>
             )}
             <div>
@@ -99,10 +99,28 @@ export default function RecentTradesList({
                 <span className="text-xs px-1.5 py-0.5 rounded bg-gray-600 text-gray-300 uppercase font-medium">
                   {trade.sport}
                 </span>
-                <span className="text-sm text-gray-300">
-                  {trade.away_team && trade.home_team
-                    ? `${trade.away_team} @ ${trade.home_team}`
-                    : `Game ${trade.game_id?.slice(0, 8)}`}
+                <span className="text-sm">
+                  {trade.away_team && trade.home_team ? (
+                    <>
+                      <span className={`${
+                        trade.entry_price < 0.5
+                          ? 'text-orange-300 font-medium'
+                          : 'text-orange-400/70'
+                      }`}>
+                        {trade.away_team}
+                      </span>
+                      <span className="text-gray-500"> @ </span>
+                      <span className={`${
+                        trade.entry_price >= 0.5
+                          ? 'text-blue-300 font-medium'
+                          : 'text-blue-400/70'
+                      }`}>
+                        {trade.home_team}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-gray-300">{`Game ${trade.game_id?.slice(0, 8)}`}</span>
+                  )}
                 </span>
               </div>
               <div className="flex items-center gap-2 mt-0.5 text-xs text-gray-500">

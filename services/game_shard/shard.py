@@ -21,12 +21,14 @@ from arbees_shared.db.connection import DatabaseClient, get_pool
 from arbees_shared.messaging.redis_bus import RedisBus, Channel
 from arbees_shared.models.game import GameState, Play, Sport
 from arbees_shared.models.market import MarketPrice, Platform
+from arbees_shared.models.market_types import MarketType, ParsedMarket
 from arbees_shared.models.signal import TradingSignal, SignalType, SignalDirection
 from data_providers.espn.client import ESPNClient
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
 from markets.kalshi.hybrid_client import HybridKalshiClient
 from markets.polymarket.hybrid_client import HybridPolymarketClient
+from services.market_discovery.parser import parse_market
 import arbees_core
 
 logger = logging.getLogger(__name__)
@@ -40,13 +42,22 @@ class GameContext:
     espn_client: ESPNClient
     last_state: Optional[GameState] = None
     last_home_win_prob: Optional[float] = None
+    # Multi-market type support: prices indexed by (MarketType, Platform)
     market_prices: dict[Platform, MarketPrice] = field(default_factory=dict)
+    market_prices_by_type: dict[tuple[MarketType, Platform], MarketPrice] = field(default_factory=dict)
+    # Legacy single market IDs (for backwards compatibility)
     market_ids: dict[Platform, str] = field(default_factory=dict)
+    # NEW: Multiple market types per game (3-8x more arbitrage opportunities)
+    market_ids_by_type: dict[MarketType, dict[Platform, str]] = field(default_factory=dict)
+    # Track market titles for parsing
+    market_titles: dict[str, str] = field(default_factory=dict)  # market_id -> title
     plays_detected: int = 0
     signals_generated: int = 0
     started_at: datetime = field(default_factory=datetime.utcnow)
     is_active: bool = True
-    active_signal: Optional[TradingSignal] = None  # Track current position for hysteresis
+    # Track active signals per market type for hysteresis
+    active_signal: Optional[TradingSignal] = None  # Legacy
+    active_signals_by_type: dict[MarketType, TradingSignal] = field(default_factory=dict)
 
 
 class GameShard:
@@ -64,9 +75,11 @@ class GameShard:
         self,
         shard_id: Optional[str] = None,
         max_games: int = 20,
-        default_poll_interval: float = 3.0,
-        crunch_time_interval: float = 1.0,
-        halftime_interval: float = 30.0,
+        default_poll_interval: float = float(os.environ.get("POLL_INTERVAL", 1.0)),
+        crunch_time_interval: float = float(os.environ.get("CRUNCH_TIME_INTERVAL", 0.5)),
+        halftime_interval: float = float(os.environ.get("HALFTIME_INTERVAL", 30.0)),
+        market_data_ttl: float = float(os.environ.get("MARKET_DATA_TTL", 4.0)),
+        sync_delta_tolerance: float = float(os.environ.get("SYNC_DELTA_TOLERANCE", 2.0)),
         use_websocket_streaming: bool = True,
     ):
         """
@@ -78,6 +91,8 @@ class GameShard:
             default_poll_interval: Normal poll interval in seconds
             crunch_time_interval: Poll interval for close games
             halftime_interval: Poll interval during halftime
+            market_data_ttl: Max age of market data in seconds
+            sync_delta_tolerance: Max allowed delta between game and market timestamps
             use_websocket_streaming: If True, use WebSocket for real-time prices (10-50ms latency)
         """
         self.shard_id = shard_id or os.environ.get("SHARD_ID", str(uuid.uuid4())[:8])
@@ -85,6 +100,8 @@ class GameShard:
         self.default_poll_interval = default_poll_interval
         self.crunch_time_interval = crunch_time_interval
         self.halftime_interval = halftime_interval
+        self.market_data_ttl = market_data_ttl
+        self.sync_delta_tolerance = sync_delta_tolerance
         self.use_websocket_streaming = use_websocket_streaming
 
         # Connections (shared across all games)
@@ -662,42 +679,43 @@ class GameShard:
         """
         logger.info(f"Starting WebSocket price stream for {platform.value}")
 
-        try:
-            if platform == Platform.KALSHI and self.kalshi_hybrid:
-                # Get currently subscribed markets
-                market_ids = list(self.kalshi_hybrid.subscribed_markets)
-                if not market_ids:
-                    logger.warning("No Kalshi markets subscribed, waiting...")
-                    await asyncio.sleep(5)
-                    return
+        while self._running:
+            try:
+                if platform == Platform.KALSHI and self.kalshi_hybrid:
+                    # Wait for markets to be subscribed
+                    market_ids = list(self.kalshi_hybrid.subscribed_markets)
+                    if not market_ids:
+                        logger.debug("No Kalshi markets subscribed yet, waiting...")
+                        await asyncio.sleep(2)
+                        continue
 
-                async for price in self.kalshi_hybrid.stream_prices(market_ids):
-                    if not self._running:
-                        break
-                    await self._handle_ws_price_update(platform, price)
+                    logger.info(f"Streaming prices for {len(market_ids)} Kalshi markets")
+                    async for price in self.kalshi_hybrid.stream_prices(market_ids):
+                        if not self._running:
+                            break
+                        await self._handle_ws_price_update(platform, price)
 
-            elif platform == Platform.POLYMARKET and self.polymarket_hybrid:
-                # Get currently subscribed token_ids
-                token_ids = list(self.polymarket_hybrid.subscribed_markets)
-                if not token_ids:
-                    logger.warning("No Polymarket markets subscribed, waiting...")
-                    await asyncio.sleep(5)
-                    return
+                elif platform == Platform.POLYMARKET and self.polymarket_hybrid:
+                    # Wait for token_ids to be subscribed
+                    token_ids = list(self.polymarket_hybrid.subscribed_markets)
+                    if not token_ids:
+                        logger.debug("No Polymarket markets subscribed yet, waiting...")
+                        await asyncio.sleep(2)
+                        continue
 
-                async for price in self.polymarket_hybrid.stream_prices(token_ids):
-                    if not self._running:
-                        break
-                    await self._handle_ws_price_update(platform, price)
+                    logger.info(f"Streaming prices for {len(token_ids)} Polymarket markets")
+                    async for price in self.polymarket_hybrid.stream_prices(token_ids):
+                        if not self._running:
+                            break
+                        await self._handle_ws_price_update(platform, price)
 
-        except asyncio.CancelledError:
-            logger.info(f"WebSocket stream cancelled for {platform.value}")
-        except Exception as e:
-            logger.error(f"WebSocket stream error for {platform.value}: {e}")
-            # Restart the stream after a delay
-            await asyncio.sleep(5)
-            if self._running:
-                task = asyncio.create_task(self._run_ws_price_stream(platform))
-                self._ws_stream_tasks[platform] = task
+            except asyncio.CancelledError:
+                logger.info(f"WebSocket stream cancelled for {platform.value}")
+                break
+            except Exception as e:
+                logger.error(f"WebSocket stream error for {platform.value}: {e}")
+                # Wait before retrying
+                await asyncio.sleep(5)
 
     async def _handle_ws_price_update(self, platform: Platform, price: MarketPrice) -> None:
         """Handle incoming WebSocket price update.
@@ -830,32 +848,45 @@ class GameShard:
         if not ctx.market_ids:
             return
 
-        # Skip polling if WebSocket streaming is active for these markets
-        if self.use_websocket_streaming:
-            # Only poll markets not in WebSocket subscriptions
-            kalshi_subscribed = (
-                self.kalshi_hybrid and
-                ctx.market_ids.get(Platform.KALSHI) in self.kalshi_hybrid.subscribed_markets
-            )
-            poly_subscribed = (
-                self.polymarket_hybrid and
-                ctx.market_ids.get(Platform.POLYMARKET) in self.polymarket_hybrid.subscribed_markets
-            )
+        # Check if we have recent market data (within 30 seconds)
+        # If WS is enabled but not delivering data, we need REST fallback
+        now = datetime.utcnow()
+        stale_threshold = 30.0  # seconds
 
-            # If both are subscribed via WS, skip polling entirely
-            if kalshi_subscribed and poly_subscribed:
-                return
-            if kalshi_subscribed and Platform.POLYMARKET not in ctx.market_ids:
-                return
-            if poly_subscribed and Platform.KALSHI not in ctx.market_ids:
-                return
+        def is_market_data_fresh(platform: Platform) -> bool:
+            price = ctx.market_prices.get(platform)
+            if not price:
+                return False
+            age = (now - price.timestamp).total_seconds()
+            return age < stale_threshold
+
+        # Only skip polling if we have fresh WS data
+        if self.use_websocket_streaming:
+            kalshi_fresh = is_market_data_fresh(Platform.KALSHI)
+            poly_fresh = is_market_data_fresh(Platform.POLYMARKET)
+
+            # If we have fresh data from both, skip polling
+            kalshi_needed = Platform.KALSHI in ctx.market_ids and not kalshi_fresh
+            poly_needed = Platform.POLYMARKET in ctx.market_ids and not poly_fresh
+
+            if not kalshi_needed and not poly_needed:
+                return  # All data is fresh, no need to poll
+
+            if kalshi_needed or poly_needed:
+                logger.info(f"REST fallback for {ctx.game_id}: kalshi_needed={kalshi_needed}, poly_needed={poly_needed}")
 
         try:
-            # Poll Kalshi
-            if ctx.market_ids.get(Platform.KALSHI) and self.kalshi:
+            # Poll Kalshi (if needed or not using WS)
+            should_poll_kalshi = ctx.market_ids.get(Platform.KALSHI) and self.kalshi
+            if self.use_websocket_streaming:
+                should_poll_kalshi = should_poll_kalshi and not is_market_data_fresh(Platform.KALSHI)
+
+            if should_poll_kalshi:
                 market_id = ctx.market_ids[Platform.KALSHI]
+                logger.info(f"Polling Kalshi REST for {ctx.game_id} market {market_id}")
                 price = await self.kalshi.get_market_price(market_id)
                 if price:
+                    logger.info(f"Got Kalshi price: bid={price.yes_bid:.3f}, ask={price.yes_ask:.3f}, mid={price.mid_price:.3f}")
                     ctx.market_prices[Platform.KALSHI] = price
 
                     # Persist to database
@@ -875,8 +906,12 @@ class GameShard:
                     if self.redis:
                         await self.redis.publish_market_price(ctx.game_id, price)
 
-            # Poll Polymarket
-            if ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket:
+            # Poll Polymarket (if needed or not using WS)
+            should_poll_poly = ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket
+            if self.use_websocket_streaming:
+                should_poll_poly = should_poll_poly and not is_market_data_fresh(Platform.POLYMARKET)
+
+            if should_poll_poly:
                 market_id = ctx.market_ids[Platform.POLYMARKET]
                 price = await self.polymarket.get_market_price(market_id)
                 if price:
@@ -964,6 +999,28 @@ class GameShard:
         market_price = ctx.market_prices.get(Platform.KALSHI) or ctx.market_prices.get(Platform.POLYMARKET)
 
         if market_price is not None:
+            # Check data freshness synchronization
+            # We want game state and market price to be from roughly the same time window
+            now = datetime.utcnow()
+            
+            # 1. Market Price Age
+            market_age = (now - market_price.timestamp).total_seconds()
+            if market_age > self.market_data_ttl:
+                 # Market data is too old
+                 logger.warning(f"Skipping signal for {ctx.game_id}: Market price stale ({market_age:.1f}s > {self.market_data_ttl}s)")
+                 return
+
+            # 2. Game State Age
+            game_age = (now - new_state.updated_at).total_seconds()
+            
+             # 3. Synchronization Delta
+            sync_delta = abs((new_state.updated_at - market_price.timestamp).total_seconds())
+            
+            if sync_delta > self.sync_delta_tolerance:
+                 # Data is de-synced (e.g. fast game update vs slow market poll)
+                 # We still signal but with reduced confidence or logging
+                 logger.info(f"Signal sync warning for {ctx.game_id}: Game/Market delta {sync_delta:.1f}s > {self.sync_delta_tolerance}s")
+            
             # With market data: calculate edge vs market
             market_prob = market_price.mid_price
             edge = (capped_new_prob - market_prob) * 100.0
@@ -976,11 +1033,10 @@ class GameShard:
             if abs(edge) < required_edge:
                 return
         else:
-            # Without market data: signal based on probability shift alone
-            # Use the probability change as a pseudo-edge
-            market_prob = None
-            edge = prob_change * 100.0  # Convert to percentage
-            required_edge = 3.0 # Higher threshold for naked prob changes
+            # Without market data: skip signal generation
+            # We require real market prices to validate edge and execute trades
+            logger.debug(f"Skipping signal for {ctx.game_id}: no market price available")
+            return
 
         # Determine direction based on probability change
         direction = SignalDirection.BUY if prob_change > 0 else SignalDirection.SELL

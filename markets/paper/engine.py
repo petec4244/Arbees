@@ -33,6 +33,11 @@ from markets.base import BaseMarketClient
 logger = logging.getLogger(__name__)
 
 
+def _side_display(side: str) -> str:
+    """Convert buy/sell to HOME/AWAY for display."""
+    return "HOME" if side == "buy" else "AWAY"
+
+
 class PaperTradingEngine(BaseMarketClient):
     """Paper trading engine for simulated trading."""
 
@@ -98,11 +103,17 @@ class PaperTradingEngine(BaseMarketClient):
 
     def calculate_kelly_bet(self, edge_pct: float, win_prob: float) -> float:
         """
-        Calculate Kelly criterion bet size.
+        Calculate Kelly criterion bet size for prediction markets.
+
+        For prediction markets, Kelly = edge / variance where:
+        - edge = edge_pct / 100 (the expected profit per dollar bet)
+        - variance = p * (1 - p) (Bernoulli variance)
+
+        This simplifies to: kelly = edge / (p * (1-p))
 
         Args:
-            edge_pct: Edge in percentage points
-            win_prob: Probability of winning
+            edge_pct: Edge in percentage points (e.g., 4.5 for 4.5% edge)
+            win_prob: Model's probability of winning (0-1)
 
         Returns:
             Optimal bet as fraction of bankroll
@@ -110,16 +121,19 @@ class PaperTradingEngine(BaseMarketClient):
         if edge_pct <= 0 or win_prob <= 0 or win_prob >= 1:
             return 0.0
 
-        # Kelly = (p * b - q) / b
-        # where p = win probability, q = loss probability, b = odds - 1
-        p = win_prob
-        q = 1.0 - p
-        b = 1.0 / (1.0 - win_prob) - 1.0  # Convert prob to odds
+        # Convert edge to decimal
+        edge = edge_pct / 100.0
 
-        if b <= 0:
-            return 0.0
+        # Variance of Bernoulli outcome
+        variance = win_prob * (1.0 - win_prob)
 
-        full_kelly = (p * b - q) / b
+        # Full Kelly = edge / variance
+        # This can be aggressive, so we apply kelly_fraction
+        full_kelly = edge / variance if variance > 0 else 0.0
+
+        # Cap at reasonable maximum (50% of bankroll before kelly_fraction)
+        full_kelly = min(full_kelly, 0.5)
+
         return max(0.0, full_kelly * self.kelly_fraction)
 
     def calculate_position_size(
@@ -251,7 +265,7 @@ class PaperTradingEngine(BaseMarketClient):
             await self.redis.publish_trade_opened(trade)
 
         logger.info(
-            f"Opened trade: {trade.side.value} {trade.size:.2f} @ {trade.entry_price:.3f} "
+            f"Opened trade: {_side_display(trade.side.value)} ${trade.size:.2f} @ {trade.entry_price:.3f} "
             f"(edge: {trade.edge_at_entry:.1f}%)"
         )
 

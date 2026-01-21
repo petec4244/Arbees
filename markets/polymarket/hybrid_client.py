@@ -18,7 +18,7 @@ from typing import Any, AsyncIterator, Optional
 
 from arbees_shared.models.market import MarketPrice, OrderBook, Platform
 from markets.polymarket.client import PolymarketClient
-from markets.polymarket.ws_client import PolymarketWebSocketClient
+from markets.polymarket.websocket.ws_client import PolymarketWebSocketClient
 
 logger = logging.getLogger(__name__)
 

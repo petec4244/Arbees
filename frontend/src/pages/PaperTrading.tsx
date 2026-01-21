@@ -289,10 +289,10 @@ export default function PaperTrading() {
               <tr>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Time</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Game</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Side</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Position</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Size</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Entry Prob</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Exit Prob</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Entry Price</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Exit Price</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">P&L</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-300 uppercase">Status</th>
               </tr>
@@ -310,10 +310,27 @@ export default function PaperTrading() {
                       </span>
                       <div>
                         <div className="font-medium">
-                          {trade.away_team && trade.home_team
-                            ? `${trade.away_team} @ ${trade.home_team}`
-                            : `Game ${trade.game_id}`
-                          }
+                          {trade.away_team && trade.home_team ? (
+                            <>
+                              <span className={`${
+                                trade.entry_price < 0.5
+                                  ? 'text-orange-300 font-semibold'
+                                  : 'text-orange-400/70'
+                              }`}>
+                                {trade.away_team}
+                              </span>
+                              <span className="text-gray-500"> @ </span>
+                              <span className={`${
+                                trade.entry_price >= 0.5
+                                  ? 'text-blue-300 font-semibold'
+                                  : 'text-blue-400/70'
+                              }`}>
+                                {trade.home_team}
+                              </span>
+                            </>
+                          ) : (
+                            `Game ${trade.game_id}`
+                          )}
                         </div>
                         {trade.edge_at_entry && (
                           <div className="text-xs text-gray-400">
@@ -326,10 +343,10 @@ export default function PaperTrading() {
                   <td className="px-4 py-3 whitespace-nowrap">
                     <span className={`px-2 py-1 rounded text-xs font-medium ${
                       trade.side === 'buy'
-                        ? 'bg-green-900/50 text-green-300 border border-green-700'
-                        : 'bg-red-900/50 text-red-300 border border-red-700'
+                        ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
+                        : 'bg-orange-900/50 text-orange-300 border border-orange-700'
                     }`}>
-                      {trade.side.toUpperCase()}
+                      {trade.side === 'buy' ? 'HOME' : 'AWAY'}
                     </span>
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
@@ -473,10 +490,10 @@ function PositionCard({ position }: { position: any }) {
           </span>
           <span className={`px-2 py-0.5 rounded text-xs font-medium ${
             position.side === 'buy'
-              ? 'bg-green-900/50 text-green-300'
-              : 'bg-red-900/50 text-red-300'
+              ? 'bg-blue-900/50 text-blue-300'
+              : 'bg-orange-900/50 text-orange-300'
           }`}>
-            {position.side.toUpperCase()}
+            {position.side === 'buy' ? 'HOME' : 'AWAY'}
           </span>
         </div>
         <span className="text-xs text-gray-500">
@@ -484,10 +501,27 @@ function PositionCard({ position }: { position: any }) {
         </span>
       </div>
       <div className="font-medium mb-1">
-        {position.away_team && position.home_team
-          ? `${position.away_team} @ ${position.home_team}`
-          : `Game ${position.game_id}`
-        }
+        {position.away_team && position.home_team ? (
+          <>
+            <span className={`${
+              position.entry_price < 0.5
+                ? 'text-orange-300 font-semibold'
+                : 'text-orange-400/70'
+            }`}>
+              {position.away_team}
+            </span>
+            <span className="text-gray-500"> @ </span>
+            <span className={`${
+              position.entry_price >= 0.5
+                ? 'text-blue-300 font-semibold'
+                : 'text-blue-400/70'
+            }`}>
+              {position.home_team}
+            </span>
+          </>
+        ) : (
+          `Game ${position.game_id}`
+        )}
       </div>
       <div className="flex justify-between text-sm text-gray-400">
         <span>Size: <span className="text-white font-mono">${position.size.toFixed(2)}</span></span>
