@@ -33,6 +33,8 @@ class MarketParser:
         r"(\w+(?:\s+\w+)*)\s+(?:wins|victory)",
         # Kalshi: "yes Miami" (simple team mention without spread)
         r"^(?:yes|no)\s+([A-Z][a-zA-Z\s\.]+?)(?:,|$)",
+        # VS format: "Lakers vs Celtics" or "Lakers @ Celtics" - assumes first team is subject or just identifies event
+        r"(\w+(?:\s+\w+)*)\s+(?:vs\.?|@|versus)\s+(\w+(?:\s+\w+)*)",
     ]
 
     SPREAD_PATTERNS = [

@@ -38,6 +38,7 @@ class PolymarketClient(BaseMarketClient):
     # Sports-related tags
     SPORTS_TAGS = [
         "sports", "nfl", "nba", "nhl", "mlb",
+        "ncaaf", "ncaab", "college football", "college basketball",
         "soccer", "football", "basketball", "hockey", "baseball",
         "mma", "ufc", "tennis", "golf",
     ]
@@ -246,12 +247,20 @@ class PolymarketClient(BaseMarketClient):
         sport: Optional[str] = None,
         status: str = "open",
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict]:
         """Get markets from Polymarket."""
-        params: dict[str, Any] = {"limit": limit}
+        # Default sort by volume to get most relevant markets first
+        params: dict[str, Any] = {
+            "limit": limit, 
+            "offset": offset,
+            "order": "volume",
+            "ascending": "false"
+        }
 
         if status == "open":
             params["active"] = "true"
+            params["closed"] = "false" # Explicitly exclude closed
 
         # Map sport to tag
         if sport:
@@ -422,11 +431,92 @@ class PolymarketClient(BaseMarketClient):
 
         return all_markets
 
-    async def search_markets(self, query: str, limit: int = 50) -> list[dict]:
-        """Search for markets by keyword."""
+    async def search_markets(
+        self,
+        query: str,
+        limit: int = 50,
+        sport: Optional[str] = None
+    ) -> list[dict]:
+        """Search for markets by keyword, optionally filtered by sport."""
         try:
-            # Gamma API doesn't have search, filter in memory
-            markets = await self.get_markets(limit=1000)
+            # Gamma API doesn't have search, so we fetch markets and filter in memory.
+            # Using sport filter significantly improves discovery probability
+            # by fetching the relevant category bucket instead of global top 1000.
+            
+            all_markets = []
+            MAX_FETCH = 5000  # Safety limit
+            BATCH_SIZE = 500   # Max often 1000, keep safe
+            
+            fetch_sport = sport if sport else None
+            
+            # Map sport to all relevant tags
+            tags_to_fetch = []
+            if fetch_sport:
+                sport_lower = fetch_sport.lower()
+                tags_to_fetch.append(sport_lower)
+                
+                # Add broader categories
+                if sport_lower in ["nba", "ncaab", "college basketball"]:
+                    tags_to_fetch.append("basketball")
+                elif sport_lower in ["nfl", "ncaaf", "college football"]:
+                    tags_to_fetch.append("football")
+                elif sport_lower in ["nhl"]:
+                    tags_to_fetch.append("hockey")
+                elif sport_lower in ["mlb"]:
+                    tags_to_fetch.append("baseball")
+                elif sport_lower in ["ufc"]:
+                    tags_to_fetch.append("mma")
+                
+                # Deduplicate
+                tags_to_fetch = list(dict.fromkeys(tags_to_fetch))
+            else:
+                # Fallback to get_sports_markets logic if no sport provided
+                pass
+
+            all_markets = []
+            
+            if tags_to_fetch:
+                for tag in tags_to_fetch:
+                    offset = 0
+                    tag_markets = []
+                    while True:
+                        # We pass the tag directly to get_markets by using it as 'sport' 
+                        # (since get_markets maps sport->tag if it's in SPORTS_TAGS)
+                        # Ensure 'basketball' etc are in SPORTS_TAGS
+                        batch = await self.get_markets(sport=tag, limit=BATCH_SIZE, offset=offset)
+                        if not batch:
+                            break
+                        
+                        tag_markets.extend(batch)
+                        offset += len(batch)
+                        
+                        if len(batch) < BATCH_SIZE or len(tag_markets) >= MAX_FETCH:
+                            break
+                    
+                    logger.debug(f"DEBUG: Fetched {len(tag_markets)} raw markets for tag {tag}")
+                    all_markets.extend(tag_markets)
+                
+                # Deduplicate markets by ID
+                seen_ids = set()
+                unique_markets = []
+                for m in all_markets:
+                    mid = m.get("condition_id") or m.get("id")
+                    if mid and mid not in seen_ids:
+                        seen_ids.add(mid)
+                        unique_markets.append(m)
+                
+                markets = unique_markets
+                logger.debug(f"DEBUG: Total unique markets fetched: {len(markets)}")
+            else:
+                markets = [] # Fallback handled in else block below if I kept it structure
+                # But to preserve logic flow:
+                pass
+            
+            if not tags_to_fetch:
+                 # Default to fetching valid sports markets if no sport specified
+                markets = await self.get_sports_markets(limit=1000)
+                logger.debug(f"DEBUG: Fetched {len(markets)} raw sports markets")
+
             query_lower = query.lower()
             return [
                 m for m in markets

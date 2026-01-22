@@ -661,10 +661,11 @@ class Orchestrator:
         # Find matching aliases
         for full_name, team_aliases in alias_map.items():
             if name_lower in full_name or any(a in name_lower for a in team_aliases):
-                aliases.extend(team_aliases)
-                break
+                # Return mapped aliases first (they are usually shorter/better for search)
+                # plus the original name
+                return team_aliases + [name_lower]
 
-        return list(set(aliases))
+        return aliases
 
     def _match_team_in_text(self, text: str, team_name: str, sport: Sport) -> bool:
         """Check if market text contains team (with win context)."""
@@ -932,8 +933,12 @@ class Orchestrator:
 
         try:
             for query in queries:
-                logger.debug(f"Searching Polymarket for: {query}")
-                markets = await self.polymarket.search_markets(query, limit=50)
+                logger.debug(f"Searching Polymarket for: {query} (Sport: {game.sport.value})")
+                markets = await self.polymarket.search_markets(
+                    query, 
+                    limit=50, 
+                    sport=game.sport.value
+                )
                 
                 logger.debug(f"Polymarket search '{query}' returned {len(markets)} results")
                 
@@ -946,6 +951,7 @@ class Orchestrator:
                     # Parse the market title to determine type
                     parsed = parse_market(title, platform="polymarket")
                     if not parsed or parsed.market_type != market_type:
+                        # logger.debug(f"Skipping {title}: Parsed {parsed} mismatch {market_type}")
                         continue
 
                     # Strict match: Check BOTH teams are in title
@@ -960,6 +966,8 @@ class Orchestrator:
                     if home_match and away_match:
                         logger.debug(f"Polymarket {market_type.value} match: {title}")
                         return market.get("condition_id") or market.get("id")
+                    else:
+                        logger.debug(f"Title {title} missing teams. Home: {home_match} ({home_aliases}), Away: {away_match} ({away_aliases})")
                 
                 # If we found nothing in this query, try the next one (unless it was the last one)
 
