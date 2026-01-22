@@ -31,7 +31,9 @@ class PolymarketWebSocketClient:
     """
     
     WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    PING_INTERVAL = 30  # seconds
+    # The Rust reference bot pings every 30s using WS ping frames. Polymarket docs
+    # sometimes require more frequent pings; we use 5s to be safe.
+    PING_INTERVAL = 5  # seconds
     RECONNECT_DELAY_BASE = 1.0  # seconds
     RECONNECT_DELAY_MAX = 60.0  # seconds
     
@@ -58,7 +60,22 @@ class PolymarketWebSocketClient:
     @property
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
-        return self._ws is not None and not self._ws.closed
+        if self._ws is None:
+            return False
+
+        # websockets API changed across major versions. Depending on the version,
+        # the connection object may expose `closed` (bool) or `close_code` (None when open).
+        closed_attr = getattr(self._ws, "closed", None)
+        if isinstance(closed_attr, bool):
+            return not closed_attr
+
+        close_code = getattr(self._ws, "close_code", None)
+        if close_code is not None:
+            # If close_code is an int, the connection is closed. If None, it's open.
+            return close_code is None
+
+        # Last resort: assume connected if we have a connection object.
+        return True
     
     async def connect(self) -> None:
         """Connect to Polymarket WebSocket."""
@@ -112,7 +129,7 @@ class PolymarketWebSocketClient:
                 pass
         
         # Close connection
-        if self._ws and not self._ws.closed:
+        if self._ws and self.is_connected:
             await self._ws.close()
         
         self._ws = None
@@ -146,14 +163,13 @@ class PolymarketWebSocketClient:
         if not new_tokens:
             return
         
-        # Subscribe to orderbook updates for these tokens
+        # Subscribe payload per Rust bot:
+        #   {"type":"market","assets_ids":[token_id_1,...]}
         subscribe_msg = {
-            "type": "subscribe",
-            "channel": "market",
-            "markets": new_tokens,
-            "assets_ids": new_tokens,  # Alternative field name
+            "type": "market",
+            "assets_ids": new_tokens,
         }
-        
+
         await self._ws.send(json.dumps(subscribe_msg))
         self._subscribed_token_ids.update(new_tokens)
         
@@ -183,13 +199,7 @@ class PolymarketWebSocketClient:
         if not tokens_to_remove:
             return
         
-        # Send unsubscribe message
-        unsubscribe_msg = {
-            "type": "unsubscribe",
-            "markets": list(tokens_to_remove),
-        }
-        
-        await self._ws.send(json.dumps(unsubscribe_msg))
+        # This WS endpoint does not reliably support unsubscribe; drop local state only.
         self._subscribed_token_ids -= tokens_to_remove
         
         # Clean up metadata
@@ -240,22 +250,23 @@ class PolymarketWebSocketClient:
                 
                 try:
                     data = json.loads(message)
-                    
-                    # Polymarket sends orderbook snapshots and updates
-                    msg_type = data.get("type") or data.get("event_type")
-                    
-                    if msg_type in ("book", "price_change", "last_trade_price"):
-                        # Price update - add to queue
-                        try:
-                            self._message_queue.put_nowait(data)
-                        except asyncio.QueueFull:
-                            logger.warning("Message queue full, dropping Polymarket price update")
-                    
-                    elif msg_type == "subscribed":
-                        logger.debug(f"Polymarket subscription confirmed: {data.get('market')}")
-                    
-                    elif msg_type == "error":
-                        logger.error(f"Polymarket WebSocket error: {data}")
+
+                    # Polymarket can send arrays (book snapshots) or objects (events)
+                    events = data if isinstance(data, list) else [data]
+                    for event in events:
+                        if not isinstance(event, dict):
+                            continue
+
+                        msg_type = event.get("type") or event.get("event_type")
+
+                        # Book snapshots often don't include event_type; they include asset_id/bids/asks
+                        if msg_type in ("book", "price_change", "last_trade_price") or "asset_id" in event:
+                            try:
+                                self._message_queue.put_nowait(event)
+                            except asyncio.QueueFull:
+                                logger.warning("Message queue full, dropping Polymarket price update")
+                        elif msg_type == "error":
+                            logger.error(f"Polymarket WebSocket error: {event}")
                     
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid JSON from Polymarket WebSocket: {message}")
@@ -263,7 +274,9 @@ class PolymarketWebSocketClient:
                     logger.error(f"Error processing Polymarket WebSocket message: {e}")
         
         except websockets.exceptions.ConnectionClosed:
-            logger.warning("Polymarket WebSocket connection closed")
+            close_code = getattr(self._ws, "close_code", None)
+            close_reason = getattr(self._ws, "close_reason", None)
+            logger.warning(f"Polymarket WebSocket connection closed (code={close_code}, reason={close_reason})")
             if self._running:
                 asyncio.create_task(self._handle_reconnect())
         except Exception as e:
@@ -278,8 +291,8 @@ class PolymarketWebSocketClient:
                 await asyncio.sleep(self.PING_INTERVAL)
                 
                 if self.is_connected:
-                    ping_msg = {"type": "ping"}
-                    await self._ws.send(json.dumps(ping_msg))
+                    # Send a WS ping frame (matches Rust bot behavior)
+                    await self._ws.ping()
                     logger.debug("Sent ping to Polymarket")
             
             except Exception as e:
@@ -354,16 +367,45 @@ class PolymarketWebSocketClient:
             title = metadata.get("title", token_id)
             game_id = metadata.get("game_id")
             
-            # Extract best bid/ask
-            # Polymarket format: {"bids": [[price, size], ...], "asks": [[price, size], ...]}
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-            
-            yes_bid = float(bids[0][0]) if bids else 0.0
-            yes_ask = float(asks[0][0]) if asks else 1.0
-            
+            # Extract best bid/ask.
+            # Polymarket book snapshots commonly look like:
+            #   {"asset_id": "...", "bids": [{"price":"0.55","size":"100"}, ...], "asks":[...]}
+            # Some implementations may emit lists: [["0.55","100"], ...]
+            bids = data.get("bids", []) or []
+            asks = data.get("asks", []) or []
+
+            def _iter_levels(levels):
+                for lvl in levels:
+                    # dict style: {"price": "...", "size": "..."}
+                    if isinstance(lvl, dict):
+                        yield lvl.get("price"), lvl.get("size")
+                    # list/tuple style: ["0.55","100"] or [0.55,100]
+                    elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                        yield lvl[0], lvl[1]
+
+            bid_levels = []
+            for price_raw, size_raw in _iter_levels(bids):
+                try:
+                    price = float(price_raw)
+                    size = float(size_raw)
+                    bid_levels.append((price, size))
+                except (TypeError, ValueError):
+                    continue
+
+            ask_levels = []
+            for price_raw, size_raw in _iter_levels(asks):
+                try:
+                    price = float(price_raw)
+                    size = float(size_raw)
+                    ask_levels.append((price, size))
+                except (TypeError, ValueError):
+                    continue
+
+            yes_bid = max((p for p, _ in bid_levels), default=0.0)
+            yes_ask = min((p for p, _ in ask_levels), default=1.0)
+
             # Calculate liquidity (sum of bid sizes)
-            liquidity = sum(float(bid[1]) for bid in bids) if bids else 0.0
+            liquidity = sum((s for _, s in bid_levels), 0.0)
             
             return MarketPrice(
                 market_id=condition_id,  # Use condition_id as market_id

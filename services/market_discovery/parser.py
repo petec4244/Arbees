@@ -46,6 +46,8 @@ class MarketParser:
     ]
 
     TOTAL_PATTERNS = [
+        # Common Polymarket format: "TeamA vs. TeamB: O/U 153.5"
+        r"\b(?:o\/u|ou)\s+(\d+\.?\d*)\b",
         r"(?:will\s+)?total\s+(?:score\s+)?(?:be\s+)?(?:over|exceed|above)\s+(\d+\.?\d*)",
         r"over\s+(\d+\.?\d*)\s+points",
         r"(?:will\s+)?(?:total\s+)?(?:points?\s+)?(?:be\s+)?over\s+(\d+\.?\d*)",

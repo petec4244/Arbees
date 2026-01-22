@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust_core"]
+members = ["rust_core", "services/market_discovery_rust"]
 resolver = "2"
 
 [workspace.package]

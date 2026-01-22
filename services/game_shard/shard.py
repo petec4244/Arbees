@@ -343,9 +343,44 @@ class GameShard:
         Returns:
             True if game was added
         """
+        # Allow id updates if the orchestrator re-sends assignments (e.g. market discovery correction).
         if game_id in self._games:
-            logger.warning(f"Game {game_id} already being monitored")
-            return False
+            ctx = self._games[game_id]
+
+            updated = False
+
+            # Update multi-market mapping if provided
+            if market_ids_by_type:
+                ctx.market_ids_by_type = market_ids_by_type
+                for market_type, platforms in market_ids_by_type.items():
+                    for platform, market_id in platforms.items():
+                        self._market_to_game[market_id] = game_id
+                        logger.info(
+                            f"Game {game_id}: UPDATED {market_type.value} {platform.value} market -> {market_id}"
+                        )
+                # Back-compat: keep legacy moneyline mapping up to date
+                if MarketType.MONEYLINE in market_ids_by_type:
+                    ctx.market_ids.update(market_ids_by_type[MarketType.MONEYLINE])
+                updated = True
+
+            # Legacy: update single market IDs
+            if kalshi_market_id and ctx.market_ids.get(Platform.KALSHI) != kalshi_market_id:
+                old = ctx.market_ids.get(Platform.KALSHI)
+                ctx.market_ids[Platform.KALSHI] = kalshi_market_id
+                self._market_to_game[kalshi_market_id] = game_id
+                logger.info(f"Game {game_id}: UPDATED Kalshi market {old} -> {kalshi_market_id}")
+                updated = True
+
+            if polymarket_market_id and ctx.market_ids.get(Platform.POLYMARKET) != polymarket_market_id:
+                old = ctx.market_ids.get(Platform.POLYMARKET)
+                ctx.market_ids[Platform.POLYMARKET] = polymarket_market_id
+                self._market_to_game[polymarket_market_id] = game_id
+                logger.info(f"Game {game_id}: UPDATED Polymarket market {old} -> {polymarket_market_id}")
+                updated = True
+
+            if not updated:
+                logger.warning(f"Game {game_id} already being monitored")
+            return updated
 
         if not self.can_accept_games:
             logger.warning(f"Shard at capacity ({self.game_count}/{self.max_games})")

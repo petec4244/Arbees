@@ -755,7 +755,7 @@ class PositionManager:
             await asyncio.sleep(self.exit_check_interval)
 
     async def _check_exit_conditions(self) -> None:
-        """Check all open positions against current probabilities."""
+        """Check all open positions against current market prices."""
         if not self.paper_engine:
             return
 
@@ -764,14 +764,14 @@ class PositionManager:
             return
 
         for trade in open_trades:
-            prob_data = await self._get_current_probability(trade.game_id)
-            if prob_data is None:
+            current_price = await self._get_current_price(trade)
+            if current_price is None:
                 continue
 
-            current_prob, sport = prob_data
-            should_exit, reason = self._evaluate_exit(trade, current_prob, sport)
+            sport = (trade.sport.value if trade.sport else "")
+            should_exit, reason = self._evaluate_exit(trade, current_price, sport)
             if should_exit:
-                await self._execute_exit(trade, current_prob, reason)
+                await self._execute_exit(trade, current_price, reason)
 
     def _get_stop_loss_for_sport(self, sport: str) -> float:
         """Get stop-loss threshold for a sport.
@@ -786,14 +786,14 @@ class PositionManager:
     def _evaluate_exit(
         self,
         trade: PaperTrade,
-        current_prob: float,
+        current_price: float,
         sport: str
     ) -> tuple[bool, str]:
         """Evaluate if position should be exited.
 
         Args:
             trade: The open trade to evaluate
-            current_prob: Current win probability (used as proxy for market price)
+            current_price: Current market mid-price (0-1)
             sport: Sport type for stop-loss lookup
 
         Returns:
@@ -809,7 +809,7 @@ class PositionManager:
 
         if trade.side == TradeSide.BUY:
             # BUY position profits when price goes UP
-            price_move = current_prob - entry_price
+            price_move = current_price - entry_price
 
             if price_move >= self.take_profit_pct / 100:
                 return True, f"take_profit: +{price_move*100:.1f}%"
@@ -819,7 +819,7 @@ class PositionManager:
 
         else:  # SELL position
             # SELL position profits when price goes DOWN
-            price_move = entry_price - current_prob
+            price_move = entry_price - current_price
 
             if price_move >= self.take_profit_pct / 100:
                 return True, f"take_profit: +{price_move*100:.1f}%"
@@ -829,49 +829,45 @@ class PositionManager:
 
         return False, ""
 
-    async def _get_current_probability(self, game_id: str) -> Optional[tuple[float, str]]:
-        """Get current win probability and sport for a game.
+    async def _get_current_price(self, trade: PaperTrade) -> Optional[float]:
+        """Get current market mid-price (0-1) for an open trade.
 
-        Returns:
-            Tuple of (probability, sport) or None if not found
+        Important: For Polymarket we may be behind geo restrictions in this container,
+        so we rely on the `market_prices` table (fed by shard + polymarket_monitor) rather
+        than calling Polymarket directly.
         """
-        # Try Redis cache first (fastest)
-        if self.redis:
-            cached = await self.redis.get(f"game:{game_id}:state")
-            if cached:
-                prob = cached.get("home_win_prob")
-                sport = cached.get("sport", "")
-                if prob is not None:
-                    return (float(prob), sport)
-
-        # Fall back to database
         pool = await get_pool()
-        row = await pool.fetchrow("""
-            SELECT gs.home_win_prob, g.sport
-            FROM game_states gs
-            JOIN games g ON gs.game_id = g.game_id
-            WHERE gs.game_id = $1
-            ORDER BY gs.time DESC LIMIT 1
-        """, game_id)
-
-        if row:
-            return (float(row["home_win_prob"]), row["sport"] or "")
-        return None
+        row = await pool.fetchrow(
+            """
+            SELECT yes_bid, yes_ask
+            FROM market_prices
+            WHERE platform = $1 AND market_id = $2
+            ORDER BY time DESC
+            LIMIT 1
+            """,
+            trade.platform.value,
+            trade.market_id,
+        )
+        if not row:
+            return None
+        bid = float(row["yes_bid"])
+        ask = float(row["yes_ask"])
+        return (bid + ask) / 2.0
 
     async def _execute_exit(
         self,
         trade: PaperTrade,
-        current_prob: float,
+        current_price: float,
         reason: str
     ) -> None:
         """Execute position exit."""
         logger.info(
             f"EXIT {_side_display(trade.side.value)} {trade.game_id}: "
-            f"entry_price={trade.entry_price*100:.1f}% -> current={current_prob*100:.1f}% "
+            f"entry_price={trade.entry_price*100:.1f}% -> current={current_price*100:.1f}% "
             f"({reason})"
         )
 
-        closed_trade = await self.paper_engine.close_trade(trade, current_prob)
+        closed_trade = await self.paper_engine.close_trade(trade, current_price)
 
         logger.info(
             f"Closed trade {closed_trade.trade_id}: "
@@ -879,30 +875,14 @@ class PositionManager:
         )
 
     async def _handle_game_state_update(self, channel: str, data: dict) -> None:
-        """Handle real-time game state update for immediate exit evaluation."""
+        """Handle real-time game state updates.
+
+        We no longer use win probability as a proxy for market price for exits. The polling
+        loop (`_position_monitor_loop`) evaluates exits against actual market prices.
+        """
         if not self.paper_engine:
             return
-
-        # Extract game_id from channel (format: "game:{game_id}:state")
-        parts = channel.split(":")
-        if len(parts) < 2:
-            return
-        game_id = parts[1]
-
-        home_win_prob = data.get("home_win_prob")
-        sport = data.get("sport", "")
-
-        if home_win_prob is None:
-            return
-
-        # Check if we have open positions on this game
-        open_trades = [t for t in self.paper_engine.get_open_trades()
-                       if t.game_id == game_id]
-
-        for trade in open_trades:
-            should_exit, reason = self._evaluate_exit(trade, float(home_win_prob), sport)
-            if should_exit:
-                await self._execute_exit(trade, float(home_win_prob), reason)
+        return
 
 
 async def main():

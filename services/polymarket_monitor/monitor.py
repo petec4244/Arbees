@@ -56,6 +56,7 @@ class PolymarketMonitor:
         self._health_ok = False
         self._last_price_time: Optional[datetime] = None
         self._prices_published = 0
+        self._poll_interval_s = float(os.environ.get("POLYMARKET_POLL_INTERVAL_SECONDS", "2.0"))
 
     async def start(self):
         """Initialize connections and start monitoring."""
@@ -89,6 +90,7 @@ class PolymarketMonitor:
         await asyncio.gather(
             self._assignment_listener(),
             self._price_streaming_loop(),
+            self._rest_poll_loop(),
             self._health_check_loop(),
             return_exceptions=True,
         )
@@ -299,6 +301,59 @@ class PolymarketMonitor:
             f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
             f"game={game_id}"
         )
+
+    async def _rest_poll_loop(self) -> None:
+        """Fallback poller to ensure we publish prices even if WS is quiet/flaky."""
+        logger.info(f"Starting REST poll loop (interval={self._poll_interval_s}s)...")
+
+        while self._running:
+            try:
+                if not self.subscribed_conditions:
+                    await asyncio.sleep(self._poll_interval_s)
+                    continue
+
+                condition_ids = list(self.subscribed_conditions)
+                for condition_id in condition_ids:
+                    meta = self._market_metadata.get(condition_id, {})
+                    game_id = meta.get("game_id")
+                    if not game_id:
+                        continue
+
+                    try:
+                        polled = await self.poly_client.get_market_price(condition_id)
+                    except Exception as e:
+                        logger.warning(f"REST poll failed for {condition_id}: {e}")
+                        continue
+
+                    if not polled:
+                        continue
+
+                    normalized = MarketPrice(
+                        market_id=condition_id,
+                        platform=Platform.POLYMARKET,
+                        game_id=game_id,
+                        market_title=meta.get("title", polled.market_title),
+                        yes_bid=polled.yes_bid,
+                        yes_ask=polled.yes_ask,
+                        volume=meta.get("volume", polled.volume),
+                        liquidity=polled.liquidity,
+                        status=polled.status,
+                        timestamp=polled.timestamp,
+                        last_trade_price=polled.last_trade_price,
+                    )
+                    await self.redis.publish_market_price(game_id, normalized)
+                    self._prices_published += 1
+                    self._last_price_time = datetime.utcnow()
+                    if self._prices_published == 1:
+                        logger.info(
+                            f"REST poll publishing is working (example): game={game_id} "
+                            f"market={condition_id} bid={normalized.yes_bid:.3f} ask={normalized.yes_ask:.3f}"
+                        )
+
+            except Exception as e:
+                logger.warning(f"REST poll loop error: {e}")
+
+            await asyncio.sleep(self._poll_interval_s)
 
     async def _health_check_loop(self):
         """Periodic health checks."""

@@ -11,9 +11,13 @@ Responsibilities:
 import asyncio
 import os
 import logging
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
+
+from datetime import timezone
+import redis.asyncio as redis
 
 from arbees_shared.db.connection import DatabaseClient, get_pool
 from arbees_shared.messaging.redis_bus import RedisBus, Channel
@@ -119,6 +123,19 @@ class Orchestrator:
         self._kalshi_markets: list[dict] = []  # All open Kalshi markets
         self._kalshi_refresh_time: Optional[datetime] = None
 
+        # Market discovery mode:
+        # - "rust": Orchestrator requests markets from Rust service (fast, concurrent, heavy work offloaded)
+        # - "python": Orchestrator performs its own market discovery (legacy / fallback)
+        self._market_discovery_mode = os.environ.get("MARKET_DISCOVERY_MODE", "rust").lower()
+        self._pending_discovery: dict[str, GameInfo] = {}
+        self._discovery_cache: dict[str, dict] = {}  # game_id -> discovery result payload
+        self._discovery_client: Optional[redis.Redis] = None
+        self._discovery_pubsub_task: Optional[asyncio.Task] = None
+
+        # Pregame discovery (warm caches + subscribe monitor before start)
+        self._pregame_discovery_window_hours = int(os.environ.get("PREGAME_DISCOVERY_WINDOW_HOURS", "6"))
+        self._pregame_discovery_max_games = int(os.environ.get("PREGAME_DISCOVERY_MAX_GAMES", "25"))
+
         # Tasks
         self._discovery_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
@@ -142,6 +159,7 @@ class Orchestrator:
             "shard:*:heartbeat",
             self._handle_shard_heartbeat,
         )
+
         await self.redis.start_listening()
 
         # Connect to market clients
@@ -159,6 +177,16 @@ class Orchestrator:
 
         self._running = True
 
+        # Subscribe to Rust market discovery results (JSON pubsub, lowest-latency)
+        # Must start after self._running is True, otherwise the loop exits immediately.
+        if self._market_discovery_mode == "rust":
+            self._discovery_client = redis.from_url(
+                os.environ.get("REDIS_URL", "redis://redis:6379"),
+                decode_responses=False,
+            )
+            await self._discovery_client.ping()
+            self._discovery_pubsub_task = asyncio.create_task(self._listen_discovery_results())
+
         # Start background tasks
         self._discovery_task = asyncio.create_task(self._discovery_loop())
         self._health_task = asyncio.create_task(self._health_check_loop())
@@ -166,13 +194,107 @@ class Orchestrator:
 
         logger.info("Orchestrator started")
 
+    async def _listen_discovery_results(self) -> None:
+        """Listen for JSON discovery results from the Rust market_discovery_rust service."""
+        if not self._discovery_client:
+            return
+        pubsub = self._discovery_client.pubsub()
+        await pubsub.subscribe(Channel.DISCOVERY_RESULTS.value)
+        try:
+            while self._running:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if not msg:
+                    continue
+                data = msg.get("data")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                try:
+                    payload = json.loads(data.decode("utf-8"))
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    await self._handle_discovery_result(payload)
+        finally:
+            await pubsub.close()
+
+    async def _handle_discovery_result(self, data: dict) -> None:
+        """Handle a market discovery result from the Rust discovery service."""
+        game_id = data.get("game_id") or data.get("id")
+        if not game_id:
+            return
+
+        # Cache for later
+        self._discovery_cache[str(game_id)] = data
+
+        # If this game is pending assignment, try to assign immediately.
+        game = self._pending_discovery.pop(str(game_id), None)
+        if not game:
+            return
+
+        logger.info(
+            f"Discovery result received for game={game_id}: polymarket_moneyline={data.get('polymarket_moneyline')}"
+        )
+
+        poly_id = data.get("polymarket_moneyline")
+        if not poly_id:
+            # Nothing actionable yet; keep pending.
+            return
+
+        # Always publish Polymarket assignment so the VPN-backed monitor can start streaming,
+        # even if we can't (yet) resolve a Kalshi market / assign the shard.
+        await self.redis.publish(
+            Channel.MARKET_ASSIGNMENTS.value,
+            {
+                "type": "polymarket_assign",
+                "game_id": game.game_id,
+                "sport": game.sport.value,
+                "markets": [
+                    {"market_type": MarketType.MONEYLINE.value, "condition_id": str(poly_id)}
+                ],
+            },
+        )
+
+        shard = self._get_best_shard()
+        if not shard:
+            return
+
+        # Kalshi discovery is handled locally (fast cache + authenticated client).
+        # Try to resolve a moneyline ticker quickly; if we can't, keep pending and retry later.
+        kalshi_id = await self._find_kalshi_market_by_type(game, MarketType.MONEYLINE)
+        if not kalshi_id:
+            # Still assign the game with Polymarket-only so the shard can generate
+            # MARKET_MISPRICING signals (ESPN win prob vs Polymarket mid price).
+            await self._assign_game_to_shard(
+                game,
+                shard,
+                kalshi_market_id=None,
+                polymarket_market_id=str(poly_id),
+                market_ids_by_type={},
+            )
+            return
+
+        market_ids_by_type: dict[MarketType, dict[Platform, str]] = {
+            MarketType.MONEYLINE: {
+                Platform.KALSHI: str(kalshi_id),
+                Platform.POLYMARKET: str(poly_id),
+            }
+        }
+
+        await self._assign_game_to_shard(
+            game,
+            shard,
+            kalshi_market_id=str(kalshi_id),
+            polymarket_market_id=str(poly_id),
+            market_ids_by_type=market_ids_by_type,
+        )
+
     async def stop(self) -> None:
         """Stop the orchestrator gracefully."""
         logger.info("Stopping Orchestrator")
         self._running = False
 
         # Cancel tasks
-        for task in [self._discovery_task, self._health_task, self._heartbeat_task, self._scheduled_sync_task]:
+        for task in [self._discovery_task, self._health_task, self._heartbeat_task, self._scheduled_sync_task, self._discovery_pubsub_task]:
             if task:
                 task.cancel()
                 try:
@@ -193,6 +315,8 @@ class Orchestrator:
         # Disconnect Redis
         if self.redis:
             await self.redis.disconnect()
+        if self._discovery_client:
+            await self._discovery_client.close()
 
         logger.info("Orchestrator stopped")
 
@@ -399,6 +523,70 @@ class Orchestrator:
 
         # Assign new games
         for game in new_games:
+            # Fast path: offload discovery to Rust service and assign as soon as results arrive.
+            if self._market_discovery_mode == "rust":
+                # Dedupe: if we already have discovery results for this game, don't re-request.
+                cached = self._discovery_cache.get(game.game_id)
+                if cached and cached.get("polymarket_moneyline"):
+                    # Ensure monitor has the assignment (idempotent on its side).
+                    await self.redis.publish(
+                        Channel.MARKET_ASSIGNMENTS.value,
+                        {
+                            "type": "polymarket_assign",
+                            "game_id": game.game_id,
+                            "sport": game.sport.value,
+                            "markets": [
+                                {
+                                    "market_type": MarketType.MONEYLINE.value,
+                                    "condition_id": str(cached.get("polymarket_moneyline")),
+                                }
+                            ],
+                        },
+                    )
+
+                    # If we're live and can resolve Kalshi now, assign the shard using cached Polymarket id.
+                    shard = self._get_best_shard()
+                    if shard:
+                        kalshi_id = await self._find_kalshi_market_by_type(game, MarketType.MONEYLINE)
+                        if kalshi_id:
+                            market_ids_by_type: dict[MarketType, dict[Platform, str]] = {
+                                MarketType.MONEYLINE: {
+                                    Platform.KALSHI: str(kalshi_id),
+                                    Platform.POLYMARKET: str(cached.get("polymarket_moneyline")),
+                                }
+                            }
+                            await self._assign_game_to_shard(
+                                game,
+                                shard,
+                                kalshi_market_id=str(kalshi_id),
+                                polymarket_market_id=str(cached.get("polymarket_moneyline")),
+                                market_ids_by_type=market_ids_by_type,
+                            )
+                    continue
+
+                if game.game_id in self._pending_discovery:
+                    continue
+
+                # Ask Rust discovery service for markets for this game.
+                # It will respond on Channel.DISCOVERY_RESULTS; we assign in _handle_discovery_result.
+                request = {
+                    "game_id": game.game_id,
+                    "sport": game.sport.value,
+                    "home_team": game.home_team,
+                    "away_team": game.away_team,
+                    "home_abbr": game.home_team_abbrev,
+                    "away_abbr": game.away_team_abbrev,
+                }
+                # Publish JSON so Rust can deserialize without msgpack dependencies.
+                if self._discovery_client:
+                    await self._discovery_client.publish(
+                        Channel.DISCOVERY_REQUESTS.value,
+                        json.dumps(request).encode("utf-8"),
+                    )
+                self._pending_discovery[game.game_id] = game
+                continue
+
+            # Legacy path: Orchestrator performs its own market discovery (slower).
             shard = self._get_best_shard()
             if not shard:
                 logger.warning(f"No available shards for game {game.game_id}")
@@ -471,6 +659,63 @@ class Orchestrator:
                 logger.warning(f"Error upserting game {game.game_id}: {e}")
 
         logger.info(f"Synced {synced_count} scheduled games to database")
+
+        # Pregame discovery: request Polymarket market IDs before games start.
+        # This warms Rust caches and allows polymarket_monitor to subscribe early.
+        if self._market_discovery_mode == "rust" and self._discovery_client:
+            now = datetime.utcnow()
+            window_end = now + timedelta(hours=self._pregame_discovery_window_hours)
+
+            upcoming = [
+                g for g in all_games
+                if (
+                    # ESPN sometimes returns tz-aware datetimes; normalize to naive UTC for comparison.
+                    now <= (
+                        g.scheduled_time.astimezone(timezone.utc).replace(tzinfo=None)
+                        if getattr(g.scheduled_time, "tzinfo", None) is not None
+                        else g.scheduled_time
+                    ) <= window_end
+                )
+            ]
+            upcoming.sort(key=lambda g: g.scheduled_time)
+            upcoming = upcoming[: self._pregame_discovery_max_games]
+
+            for game in upcoming:
+                # If we already have a Polymarket mapping, ensure monitor has it and skip.
+                cached = self._discovery_cache.get(game.game_id)
+                if cached and cached.get("polymarket_moneyline"):
+                    await self.redis.publish(
+                        Channel.MARKET_ASSIGNMENTS.value,
+                        {
+                            "type": "polymarket_assign",
+                            "game_id": game.game_id,
+                            "sport": game.sport.value,
+                            "markets": [
+                                {
+                                    "market_type": MarketType.MONEYLINE.value,
+                                    "condition_id": str(cached.get("polymarket_moneyline")),
+                                }
+                            ],
+                        },
+                    )
+                    continue
+
+                if game.game_id in self._pending_discovery:
+                    continue
+
+                request = {
+                    "game_id": game.game_id,
+                    "sport": game.sport.value,
+                    "home_team": game.home_team,
+                    "away_team": game.away_team,
+                    "home_abbr": game.home_team_abbrev,
+                    "away_abbr": game.away_team_abbrev,
+                }
+                await self._discovery_client.publish(
+                    Channel.DISCOVERY_REQUESTS.value,
+                    json.dumps(request).encode("utf-8"),
+                )
+                self._pending_discovery[game.game_id] = game
 
     async def _refresh_kalshi_markets(self) -> None:
         """Refresh the Kalshi markets cache (every 5 minutes)."""
@@ -660,7 +905,13 @@ class Orchestrator:
 
         # Find matching aliases
         for full_name, team_aliases in alias_map.items():
-            if name_lower in full_name or any(a in name_lower for a in team_aliases):
+            # Match rules:
+            # - Allow partial match against the canonical full name (e.g. "kansas city" in "kansas city chiefs")
+            # - Allow exact match against an alias (e.g. "kc" == "kc")
+            #
+            # IMPORTANT: Do NOT use substring matching against aliases (e.g. "fla" in "flames"),
+            # as it causes cross-team false positives (Florida Panthers vs Calgary Flames, etc.).
+            if name_lower in full_name or any(a == name_lower for a in team_aliases):
                 # Return mapped aliases first (they are usually shorter/better for search)
                 # plus the original name
                 return team_aliases + [name_lower]
@@ -965,7 +1216,9 @@ class Orchestrator:
 
                     if home_match and away_match:
                         logger.debug(f"Polymarket {market_type.value} match: {title}")
-                        return market.get("condition_id") or market.get("id")
+                        # IMPORTANT: Return the Gamma market id (numeric string).
+                        # The Polymarket monitor resolves token_ids itself for WS subscriptions.
+                        return market.get("id")
                     else:
                         logger.debug(f"Title {title} missing teams. Home: {home_match} ({home_aliases}), Away: {away_match} ({away_aliases})")
                 

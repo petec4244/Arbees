@@ -43,6 +43,19 @@ class PolymarketClient(BaseMarketClient):
         "mma", "ufc", "tennis", "golf",
     ]
 
+    # Gamma tag slug -> numeric tag_id (from https://gamma-api.polymarket.com/tags).
+    # IMPORTANT: Gamma /markets does NOT reliably filter with `tag=<slug>`, but it does with `tag_id=<int>`.
+    TAG_ID_BY_SLUG: dict[str, int] = {
+        "sports": 1,
+        "basketball": 28,
+        "football": 10,
+        "hockey": 100088,
+        "nba": 745,
+        "nfl": 450,
+        "nhl": 899,
+        "ncaab": 101952,
+    }
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -238,6 +251,61 @@ class PolymarketClient(BaseMarketClient):
         self._token_id_cache[condition_id] = token_id
         return token_id
 
+    def resolve_outcome_token_id(self, market: dict, candidates: str | list[str]) -> Optional[str]:
+        """
+        Resolve the token_id for a specific outcome name or aliases.
+        Useful for 'Team A vs Team B' markets where we want the token for one specific team.
+        Supports substring matching (alias in outcome).
+        """
+        if not candidates:
+            return None
+            
+        targets = [candidates] if isinstance(candidates, str) else candidates
+        targets = [t.lower().strip() for t in targets if t]
+        
+        # Helper to check match
+        def is_match(outcome_text: str) -> bool:
+            o_norm = str(outcome_text).lower().strip()
+            # Exact match first
+            if o_norm in targets:
+                return True
+            # Substring key match (e.g. "notre dame" in "notre dame fighting irish")
+            for t in targets:
+                if t in o_norm:
+                    return True
+            return False
+
+        # 1. Check outcomes/clobTokenIds (Parallel Arrays)
+        outcomes = market.get("outcomes")
+        clob_ids = market.get("clobTokenIds")
+        
+        # Parse clobTokenIds if string
+        if isinstance(clob_ids, str):
+            try:
+                clob_ids = json.loads(clob_ids)
+            except json.JSONDecodeError:
+                pass
+                
+        if isinstance(outcomes, list) and isinstance(clob_ids, list):
+            if len(outcomes) == len(clob_ids):
+                for idx, outcome in enumerate(outcomes):
+                    if is_match(outcome):
+                        raw_id = clob_ids[idx]
+                        if self._is_valid_token_id(str(raw_id)):
+                            return str(raw_id)
+
+        # 2. Check tokens array (array of dicts)
+        tokens = market.get("tokens")
+        if isinstance(tokens, list):
+            for t in tokens:
+                t_outcome = t.get("outcome", "")
+                if is_match(t_outcome):
+                    tid = t.get("token_id") or t.get("id")
+                    if self._is_valid_token_id(str(tid)):
+                        return str(tid)
+                        
+        return None
+
     # ==========================================================================
     # Market Data Methods
     # ==========================================================================
@@ -265,11 +333,12 @@ class PolymarketClient(BaseMarketClient):
         # Map sport to tag
         if sport:
             sport_lower = sport.lower()
-            if sport_lower in self.SPORTS_TAGS:
-                params["tag"] = sport_lower
+            # Prefer tag_id filtering (correct Gamma behavior)
+            if sport_lower in self.TAG_ID_BY_SLUG:
+                params["tag_id"] = self.TAG_ID_BY_SLUG[sport_lower]
             else:
-                # Try "sports" tag as fallback
-                params["tag"] = "sports"
+                # Fall back to broad Sports tag_id to avoid pulling non-sports markets.
+                params["tag_id"] = self.TAG_ID_BY_SLUG["sports"]
 
         try:
             data = await self._gamma_request("GET", "/markets", params=params)

@@ -43,6 +43,10 @@ class Channel(str, Enum):
     MARKET_ASSIGNMENTS = "orchestrator:market_assignments"
     SYSTEM_ALERTS = "system:alerts"
 
+    # Low-latency market discovery (Rust service)
+    DISCOVERY_REQUESTS = "discovery:requests"
+    DISCOVERY_RESULTS = "discovery:results"
+
     def format(self, **kwargs) -> str:
         """Format channel name with parameters."""
         return self.value.format(**kwargs)

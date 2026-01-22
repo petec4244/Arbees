@@ -94,7 +94,14 @@ class HybridPolymarketClient:
     @property
     def ws_connected(self) -> bool:
         """Check if WebSocket is connected."""
-        return self._ws.connected
+        # Support both websocket client implementations:
+        # - aiohttp-based BaseWebSocketClient exposes `.connected`
+        # - websockets-based client exposes `.is_connected`
+        if hasattr(self._ws, "connected"):
+            return bool(getattr(self._ws, "connected"))
+        if hasattr(self._ws, "is_connected"):
+            return bool(getattr(self._ws, "is_connected"))
+        return False
 
     @property
     def subscribed_markets(self) -> set[str]:
@@ -225,17 +232,25 @@ class HybridPolymarketClient:
         """
         # Check if it's a token_id
         if self._prefer_websocket and market_id in self._ws.subscribed_markets:
-            price = self._ws.get_market_price(market_id)
-            if price:
-                return price
+            # Not all WS client implementations support local orderbook -> MarketPrice.
+            # Fall back to REST cleanly if the method isn't implemented.
+            try:
+                price = self._ws.get_market_price(market_id)  # type: ignore[attr-defined]
+                if price:
+                    return price
+            except AttributeError:
+                pass
 
         # Check if it's a condition_id
         if market_id in self._token_id_cache:
             token_id = self._token_id_cache[market_id]
             if token_id in self._ws.subscribed_markets:
-                price = self._ws.get_market_price(token_id)
-                if price:
-                    return price
+                try:
+                    price = self._ws.get_market_price(token_id)  # type: ignore[attr-defined]
+                    if price:
+                        return price
+                except AttributeError:
+                    pass
 
         return await self._rest.get_market_price(market_id)
 
@@ -265,6 +280,11 @@ class HybridPolymarketClient:
         Args:
             token_ids: List of token IDs (not condition IDs!)
         """
+        # The websocket-based client requires an explicit connect() before subscribing.
+        # (It will raise "Not connected to Polymarket WebSocket" otherwise.)
+        if not self._ws.is_connected:
+            await self._ws.connect()
+
         await self._ws.subscribe(token_ids)
 
     async def unsubscribe(self, token_ids: list[str]) -> None:
@@ -283,7 +303,11 @@ class HybridPolymarketClient:
         Yields:
             MarketPrice objects on each update
         """
-        async for price in self._ws.stream_prices(token_ids):
+        # Ensure we're subscribed first (this also ensures WS is connected).
+        await self.subscribe(token_ids)
+
+        # The websocket-based WS client streams prices without taking token_ids.
+        async for price in self._ws.stream_prices():
             yield price
 
     async def subscribe_with_metadata(
@@ -302,6 +326,10 @@ class HybridPolymarketClient:
             if token_id and condition_id:
                 self._token_id_cache[condition_id] = token_id
                 self._condition_id_cache[token_id] = condition_id
+
+        # The websocket-based client requires an explicit connect() before subscribing.
+        if not self._ws.is_connected:
+            await self._ws.connect()
 
         await self._ws.subscribe_with_metadata(markets)
 
