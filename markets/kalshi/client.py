@@ -88,7 +88,7 @@ class KalshiClient(BaseMarketClient):
         api_key: Optional[str] = None,
         private_key_path: Optional[str] = None,
         private_key_str: Optional[str] = None,
-        rate_limit: float = 10.0,
+        rate_limit: float = 2.0,  # Kalshi rate limits to ~2 req/sec
     ):
         """
         Initialize Kalshi client.
@@ -97,7 +97,7 @@ class KalshiClient(BaseMarketClient):
             api_key: Kalshi API key ID (or KALSHI_API_KEY env var)
             private_key_path: Path to RSA private key PEM file
             private_key_str: RSA private key as string (or KALSHI_PRIVATE_KEY env var)
-            rate_limit: Max requests per second
+            rate_limit: Max requests per second (default 2.0 to avoid Kalshi rate limits)
         """
         super().__init__(
             base_url=self.BASE_URL,

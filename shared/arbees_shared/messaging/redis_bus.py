@@ -32,12 +32,16 @@ class Channel(str, Enum):
     TRADES_OPENED = "trades:opened"
     TRADES_CLOSED = "trades:closed"
 
-    # ZMQ-bridged channels (from RPi monitor)
+    # ZMQ-bridged channels (from RPi monitor) - LEGACY, prefer VPN monitor
     POLYMARKET_ZMQ = "polymarket:zmq:prices"
 
     # Service health
     SHARD_HEARTBEAT = "shard:{shard_id}:heartbeat"
     ORCHESTRATOR_COMMAND = "orchestrator:command"
+
+    # VPN-based Polymarket monitor channels
+    MARKET_ASSIGNMENTS = "orchestrator:market_assignments"
+    SYSTEM_ALERTS = "system:alerts"
 
     def format(self, **kwargs) -> str:
         """Format channel name with parameters."""

@@ -617,14 +617,15 @@ class PositionManager:
         # Get recent prices from both platforms
         rows = await pool.fetch("""
             WITH recent_prices AS (
-                SELECT DISTINCT ON (game_id, platform)
-                    game_id, platform, market_id, yes_bid, yes_ask, volume, liquidity, time
+                SELECT DISTINCT ON (game_id, platform, market_type)
+                    game_id, platform, market_id, market_type, yes_bid, yes_ask, volume, liquidity, time
                 FROM market_prices
                 WHERE time > NOW() - INTERVAL '5 minutes'
-                ORDER BY game_id, platform, time DESC
+                ORDER BY game_id, platform, market_type, time DESC
             )
             SELECT
                 k.game_id,
+                k.market_type,
                 k.market_id as kalshi_market,
                 k.yes_bid as kalshi_bid,
                 k.yes_ask as kalshi_ask,
@@ -634,7 +635,7 @@ class PositionManager:
                 p.yes_ask as poly_ask,
                 p.liquidity as poly_liquidity
             FROM recent_prices k
-            JOIN recent_prices p ON k.game_id = p.game_id
+            JOIN recent_prices p ON k.game_id = p.game_id AND k.market_type = p.market_type
             WHERE k.platform = 'kalshi' AND p.platform = 'polymarket'
         """)
 

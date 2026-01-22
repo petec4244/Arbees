@@ -17,6 +17,11 @@ serde_json.workspace = true
 chrono.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+# New dependencies for terauss integration
+rustc-hash.workspace = true
+parking_lot.workspace = true
+wide = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["simd"]
+simd = ["wide"]

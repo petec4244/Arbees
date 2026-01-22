@@ -283,6 +283,7 @@ class DatabaseClient:
         liquidity: float = 0,
         game_id: Optional[str] = None,
         market_title: Optional[str] = None,
+        market_type: str = "moneyline",
         **kwargs
     ) -> None:
         """Insert a market price snapshot."""
@@ -292,15 +293,16 @@ class DatabaseClient:
             INSERT INTO market_prices (
                 time, market_id, platform, game_id, market_title,
                 yes_bid, yes_ask, volume, open_interest, liquidity,
-                status, last_trade_price
+                status, last_trade_price, market_type
             ) VALUES (
-                NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+                NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
             )
             """,
             market_id, platform, game_id, market_title,
             yes_bid, yes_ask, volume,
             kwargs.get('open_interest', 0), liquidity,
-            kwargs.get('status', 'open'), kwargs.get('last_trade_price')
+            kwargs.get('status', 'open'), kwargs.get('last_trade_price'),
+            market_type
         )
 
     async def get_latest_market_price(

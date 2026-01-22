@@ -9,6 +9,7 @@ Responsibilities:
 """
 
 import asyncio
+import os
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -17,9 +18,12 @@ from typing import Optional
 from arbees_shared.db.connection import DatabaseClient, get_pool
 from arbees_shared.messaging.redis_bus import RedisBus, Channel
 from arbees_shared.models.game import GameInfo, Sport
+from arbees_shared.models.market import Platform
+from arbees_shared.models.market_types import MarketType
 from data_providers.espn.client import ESPNClient
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
+from services.market_discovery.parser import parse_market
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,8 @@ class GameAssignment:
     shard_id: str
     kalshi_market_id: Optional[str] = None
     polymarket_market_id: Optional[str] = None
+    # NEW: Multi-market type support for 3-8x more opportunities
+    market_ids_by_type: dict[MarketType, dict[Platform, str]] = field(default_factory=dict)
     assigned_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -231,6 +237,7 @@ class Orchestrator:
         shard: ShardInfo,
         kalshi_market_id: Optional[str] = None,
         polymarket_market_id: Optional[str] = None,
+        market_ids_by_type: Optional[dict[MarketType, dict[Platform, str]]] = None,
     ) -> bool:
         """Assign a game to a shard via Redis command."""
         assignment = GameAssignment(
@@ -239,6 +246,7 @@ class Orchestrator:
             shard_id=shard.shard_id,
             kalshi_market_id=kalshi_market_id,
             polymarket_market_id=polymarket_market_id,
+            market_ids_by_type=market_ids_by_type or {},
         )
 
         # Send command to shard via Redis
@@ -250,15 +258,35 @@ class Orchestrator:
             "polymarket_market_id": polymarket_market_id,
         }
 
+        # NEW: Include multi-market type data if available
+        if market_ids_by_type:
+            # Convert to serializable format
+            command["market_ids_by_type"] = {
+                market_type.value: {
+                    platform.value: market_id
+                    for platform, market_id in platforms.items()
+                }
+                for market_type, platforms in market_ids_by_type.items()
+            }
+
         if self.redis:
             channel = f"shard:{shard.shard_id}:command"
             await self.redis.publish(channel, command)
+
+            # Publish Polymarket assignments to dedicated monitor service
+            await self._publish_polymarket_assignments(
+                game=game,
+                shard_id=shard.shard_id,
+                polymarket_market_id=polymarket_market_id,
+                market_ids_by_type=market_ids_by_type,
+            )
 
         self._assignments[game.game_id] = assignment
         shard.game_count += 1
         shard.games.append(game.game_id)
 
-        logger.info(f"Assigned game {game.game_id} to shard {shard.shard_id}")
+        market_count = len(market_ids_by_type) if market_ids_by_type else (1 if kalshi_market_id or polymarket_market_id else 0)
+        logger.info(f"Assigned game {game.game_id} to shard {shard.shard_id} with {market_count} market type(s)")
         return True
 
     async def _unassign_game(self, game_id: str) -> None:
@@ -286,6 +314,56 @@ class Orchestrator:
 
         del self._assignments[game_id]
         logger.info(f"Unassigned game {game_id}")
+
+    async def _publish_polymarket_assignments(
+        self,
+        game: GameInfo,
+        shard_id: str,
+        polymarket_market_id: Optional[str],
+        market_ids_by_type: Optional[dict[MarketType, dict[Platform, str]]],
+    ) -> None:
+        """Publish Polymarket market assignments to the VPN-based monitor service.
+
+        The polymarket_monitor service subscribes to Channel.MARKET_ASSIGNMENTS
+        and will subscribe to these markets via WebSocket, publishing prices
+        back to Redis for GameShards to consume.
+        """
+        if not self.redis:
+            return
+
+        # Collect Polymarket condition_ids to assign
+        poly_markets: list[dict] = []
+
+        # From multi-market type mapping (preferred)
+        if market_ids_by_type:
+            for market_type, platforms in market_ids_by_type.items():
+                if Platform.POLYMARKET in platforms:
+                    poly_markets.append({
+                        "market_type": market_type.value,
+                        "condition_id": platforms[Platform.POLYMARKET],
+                    })
+
+        # From legacy single market ID
+        elif polymarket_market_id:
+            poly_markets.append({
+                "market_type": "moneyline",
+                "condition_id": polymarket_market_id,
+            })
+
+        if not poly_markets:
+            return
+
+        # Publish assignment message
+        assignment_msg = {
+            "type": "polymarket_assign",
+            "game_id": game.game_id,
+            "shard_id": shard_id,
+            "sport": game.sport.value,
+            "markets": poly_markets,
+        }
+
+        await self.redis.publish(Channel.MARKET_ASSIGNMENTS.value, assignment_msg)
+        logger.debug(f"Published Polymarket assignment: {game.game_id} ({len(poly_markets)} markets)")
 
     # ==========================================================================
     # Game Discovery
@@ -326,11 +404,17 @@ class Orchestrator:
                 logger.warning(f"No available shards for game {game.game_id}")
                 continue
 
-            # Look up market IDs
-            kalshi_id = await self._find_kalshi_market(game)
-            poly_id = await self._find_polymarket_market(game)
+            # NEW: Try multi-market discovery first (3-8x more opportunities)
+            market_ids_by_type = await self._find_all_market_types(game)
 
-            await self._assign_game_to_shard(game, shard, kalshi_id, poly_id)
+            # Fall back to single market discovery if multi-market fails
+            kalshi_id = None
+            poly_id = None
+            if not market_ids_by_type:
+                kalshi_id = await self._find_kalshi_market(game)
+                poly_id = await self._find_polymarket_market(game)
+
+            await self._assign_game_to_shard(game, shard, kalshi_id, poly_id, market_ids_by_type)
 
         # Clean up finished games
         live_ids = {g.game_id for g in live_games}
@@ -402,11 +486,11 @@ class Orchestrator:
             # Fetch all open markets across sports
             all_markets = []
             for sport in ["nfl", "nba", "nhl", "mlb", "ncaaf", "ncaab"]:
-                markets = await self.kalshi.get_markets(sport=sport, limit=200)
+                markets = await self.kalshi.get_markets(sport=sport, limit=500)
                 all_markets.extend(markets)
 
             # Also fetch without sport filter (catches multi-sport events)
-            general_markets = await self.kalshi.get_markets(limit=200)
+            general_markets = await self.kalshi.get_markets(limit=500)
             all_markets.extend(general_markets)
 
             # Deduplicate by ticker
@@ -537,11 +621,38 @@ class Orchestrator:
             "columbus blue jackets": ["columbus", "blue jackets", "cbj"],
         }
 
+        NCAAB_ALIASES = {
+            "north carolina tar heels": ["north carolina", "unc", "tar heels"],
+            "notre dame fighting irish": ["notre dame", "nd", "fighting irish"],
+            "duke blue devils": ["duke", "blue devils"],
+            "kansas jayhawks": ["kansas", "ku", "jayhawks"],
+            "kentucky wildcats": ["kentucky", "uk", "wildcats"],
+            "uconn huskies": ["uconn", "connecticut", "huskies"],
+            "purdue boilermakers": ["purdue", "boilermakers"],
+            "houston cougars": ["houston", "cougars"],
+            "tennessee volunteers": ["tennessee", "vols", "ut"],
+            "arizona wildcats": ["arizona", "wildcats"],
+            "marquette golden eagles": ["marquette", "golden eagles"],
+            "creighton bluejays": ["creighton", "bluejays"],
+            "illinois fighting illini": ["illinois", "illini"],
+            "baylor bears": ["baylor", "bears"],
+            "auburn tigers": ["auburn", "tigers"],
+            "alabama crimson tide": ["alabama", "bama", "crimson tide"],
+            "virginia cavaliers": ["virginia", "uva", "cavaliers"],
+            "miami hurricanes": ["miami", "canes", "hurricanes"],
+            "gonzaga bulldogs": ["gonzaga", "zags", "bulldogs"],
+            "michigan state spartans": ["michigan state", "msu", "spartans"],
+        }
+
         # Select alias map based on sport
-        if sport in (Sport.NFL, Sport.NCAAF):
+        if sport == Sport.NFL:
             alias_map = NFL_ALIASES
-        elif sport in (Sport.NBA, Sport.NCAAB):
+        elif sport == Sport.NCAAF:
+            alias_map = NFL_ALIASES # Often share names, but ideally split
+        elif sport == Sport.NBA:
             alias_map = NBA_ALIASES
+        elif sport == Sport.NCAAB:
+            alias_map = NCAAB_ALIASES
         elif sport == Sport.NHL:
             alias_map = NHL_ALIASES
         else:
@@ -688,6 +799,176 @@ class Orchestrator:
         return None
 
     # ==========================================================================
+    # Multi-Market Type Discovery (3-8x more arbitrage opportunities)
+    # ==========================================================================
+
+    async def _find_all_market_types(
+        self,
+        game: GameInfo,
+    ) -> dict[MarketType, dict[Platform, str]]:
+        """
+        Find multiple market types (moneyline, spread, total) for a game.
+
+        This enables 3-8x more arbitrage opportunities by discovering
+        all available market types across both platforms.
+
+        Returns:
+            {
+                MarketType.MONEYLINE: {Platform.KALSHI: "id1", Platform.POLYMARKET: "id2"},
+                MarketType.SPREAD: {Platform.KALSHI: "id3", Platform.POLYMARKET: "id4"},
+                MarketType.TOTAL: {Platform.KALSHI: "id5", Platform.POLYMARKET: "id6"},
+            }
+        """
+        results: dict[MarketType, dict[Platform, str]] = {}
+
+        # Refresh Kalshi markets cache
+        await self._refresh_kalshi_markets()
+
+        market_types_to_find = [
+            MarketType.MONEYLINE,
+            MarketType.SPREAD,
+            MarketType.TOTAL,
+        ]
+
+        for market_type in market_types_to_find:
+            kalshi_id = await self._find_kalshi_market_by_type(game, market_type)
+            poly_id = await self._find_polymarket_market_by_type(game, market_type)
+
+            # Only include if we found on BOTH platforms (enables arbitrage)
+            if kalshi_id and poly_id:
+                results[market_type] = {
+                    Platform.KALSHI: kalshi_id,
+                    Platform.POLYMARKET: poly_id,
+                }
+                logger.info(f"Found {market_type.value} for {game.away_team} @ {game.home_team} on both platforms")
+
+        return results
+
+    async def _find_kalshi_market_by_type(
+        self,
+        game: GameInfo,
+        market_type: MarketType,
+    ) -> Optional[str]:
+        """Find Kalshi market of a specific type for a game."""
+        if not self.kalshi:
+            return None
+
+        # Debug: Log cache state
+        if not hasattr(self, "_logged_cache_sample"):
+            sample = [m.get("title", "No Title") for m in self._kalshi_markets[:3]]
+            logger.debug(f"Kalshi Cache Sample: {sample}")
+            self._logged_cache_sample = True
+
+        try:
+            for market in self._kalshi_markets:
+                title = market.get("title", "")
+                ticker = market.get("ticker", "")
+
+                # Skip multi-game/parlay markets
+                if not self._is_single_game_market(ticker):
+                    continue
+
+                # Parse the market title to determine type
+                parsed = parse_market(title, platform="kalshi")
+                if not parsed or parsed.market_type != market_type:
+                    # Very verbose, maybe limit?
+                    # logger.debug(f"Skipping {title}: Parsed {parsed} != {market_type}")
+                    continue
+
+                # Must match one of the teams
+                combined = f"{title} {ticker}".lower()
+                home_aliases = self._get_team_aliases(game.home_team, game.sport)
+                away_aliases = self._get_team_aliases(game.away_team, game.sport)
+                
+                home_match = any(alias in combined for alias in home_aliases)
+                away_match = any(alias in combined for alias in away_aliases)
+
+                if home_match or away_match:
+                    logger.debug(f"Kalshi {market_type.value} match: {title}")
+                    return ticker
+                # else:
+                #    logger.debug(f"No match for {game.home_team} vs {game.away_team} in {title}")
+
+        except Exception as e:
+            logger.debug(f"Error finding Kalshi {market_type.value} market: {e}")
+
+        return None
+
+    async def _find_polymarket_market_by_type(
+        self,
+        game: GameInfo,
+        market_type: MarketType,
+    ) -> Optional[str]:
+        """Find Polymarket market of a specific type for a game."""
+        if not self.polymarket:
+            return None
+
+        # Try multiple query strategies:
+        # 1. "Away Home"
+        # 2. "Away" (if 1 fails)
+        # 3. "Home" (if 2 fails)
+        # Prepare search terms using aliases
+        away_aliases = self._get_team_aliases(game.away_team, game.sport)
+        home_aliases = self._get_team_aliases(game.home_team, game.sport)
+
+        # Prioritize shorter, common names (usually the first alias if available, else full name)
+        away_term = away_aliases[0] if away_aliases else game.away_team
+        home_term = home_aliases[0] if home_aliases else game.home_team
+
+        # Try multiple query strategies:
+        # 1. "AwayAlias HomeAlias" (e.g. "Notre Dame North Carolina") - Best for VS matches
+        # 2. "AwayFull HomeFull" (Fallback)
+        # 3. "AwayAlias" (Broad search)
+        # 4. "HomeAlias" (Broad search)
+        queries = [
+            f"{away_term} {home_term}",
+            f"{game.away_team} {game.home_team}",
+            f"{away_term}",
+            f"{home_term}",
+        ]
+
+        # Deduplicate queries
+        queries = list(dict.fromkeys(queries))
+
+        try:
+            for query in queries:
+                logger.debug(f"Searching Polymarket for: {query}")
+                markets = await self.polymarket.search_markets(query, limit=50)
+                
+                logger.debug(f"Polymarket search '{query}' returned {len(markets)} results")
+                
+                if not markets:
+                    continue
+
+                for market in markets:
+                    title = market.get("question", market.get("title", ""))
+
+                    # Parse the market title to determine type
+                    parsed = parse_market(title, platform="polymarket")
+                    if not parsed or parsed.market_type != market_type:
+                        continue
+
+                    # Strict match: Check BOTH teams are in title
+                    title_lower = title.lower()
+                    
+                    home_aliases = self._get_team_aliases(game.home_team, game.sport)
+                    away_aliases = self._get_team_aliases(game.away_team, game.sport)
+
+                    home_match = any(a in title_lower for a in home_aliases)
+                    away_match = any(a in title_lower for a in away_aliases)
+
+                    if home_match and away_match:
+                        logger.debug(f"Polymarket {market_type.value} match: {title}")
+                        return market.get("condition_id") or market.get("id")
+                
+                # If we found nothing in this query, try the next one (unless it was the last one)
+
+        except Exception as e:
+            logger.debug(f"Error finding Polymarket {market_type.value} market: {e}")
+
+        return None
+
+    # ==========================================================================
     # Health Monitoring
     # ==========================================================================
 
@@ -757,6 +1038,7 @@ class Orchestrator:
                 new_shard,
                 assignment.kalshi_market_id,
                 assignment.polymarket_market_id,
+                assignment.market_ids_by_type,  # Fix: Include multi-market types
             )
 
     # ==========================================================================
@@ -796,7 +1078,8 @@ class Orchestrator:
 # Entry point for running as service
 async def main():
     """Run Orchestrator as standalone service."""
-    logging.basicConfig(level=logging.INFO)
+    log_level = os.environ.get("LOG_LEVEL", "INFO")
+    logging.basicConfig(level=getattr(logging, log_level))
 
     orchestrator = Orchestrator()
     await orchestrator.start()

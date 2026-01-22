@@ -6,9 +6,23 @@
 //! - Model edge detection (model probability vs market prices)
 //! - Win probability calculation for multiple sports
 //! - Batch processing with SIMD optimization via rayon
+//! - Lock-free atomic orderbook for real-time price tracking
+//! - SIMD-accelerated arbitrage detection
+//! - Circuit breaker for risk management
+//! - Execution tracking and deduplication
+//! - Position tracking and P&L calculation
 
 mod types;
 mod win_prob;
+
+// New modules from terauss integration
+pub mod atomic_orderbook;
+pub mod simd;
+pub mod circuit_breaker;
+pub mod execution;
+pub mod position_tracker;
+pub mod team_cache;
+pub mod league_config;
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -389,7 +403,9 @@ fn batch_scan_arbitrage(
 /// Python module definition
 #[pymodule]
 fn arbees_core(_py: Python, m: &PyModule) -> PyResult<()> {
-    // Types
+    // ============================================================================
+    // Original Types
+    // ============================================================================
     m.add_class::<Sport>()?;
     m.add_class::<Platform>()?;
     m.add_class::<GameState>()?;
@@ -397,21 +413,73 @@ fn arbees_core(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ArbitrageOpportunity>()?;
     m.add_class::<TradingSignal>()?;
 
-    // Arbitrage functions
+    // ============================================================================
+    // Original Arbitrage Functions
+    // ============================================================================
     m.add_function(wrap_pyfunction!(find_cross_market_arbitrage, m)?)?;
     m.add_function(wrap_pyfunction!(find_same_platform_arbitrage, m)?)?;
     m.add_function(wrap_pyfunction!(find_model_edges, m)?)?;
     m.add_function(wrap_pyfunction!(detect_lagging_market, m)?)?;
     m.add_function(wrap_pyfunction!(batch_scan_arbitrage, m)?)?;
 
-    // Win probability functions
+    // ============================================================================
+    // Win Probability Functions
+    // ============================================================================
     m.add_function(wrap_pyfunction!(py_calculate_win_probability, m)?)?;
     m.add_function(wrap_pyfunction!(py_batch_calculate_win_probs, m)?)?;
     m.add_function(wrap_pyfunction!(py_calculate_win_prob_delta, m)?)?;
     m.add_function(wrap_pyfunction!(py_expected_points, m)?)?;
 
-    // Signal generation
+    // ============================================================================
+    // Signal Generation
+    // ============================================================================
     m.add_function(wrap_pyfunction!(generate_signal_from_prob_change, m)?)?;
+
+    // ============================================================================
+    // NEW: Atomic Orderbook (terauss integration)
+    // ============================================================================
+    m.add_class::<atomic_orderbook::PyAtomicOrderbook>()?;
+    m.add_class::<atomic_orderbook::PyGlobalState>()?;
+    m.add_function(wrap_pyfunction!(atomic_orderbook::py_kalshi_fee_cents, m)?)?;
+
+    // ============================================================================
+    // NEW: SIMD Arbitrage Detection (terauss integration)
+    // ============================================================================
+    m.add_function(wrap_pyfunction!(simd::py_simd_check_arbs, m)?)?;
+    m.add_function(wrap_pyfunction!(simd::py_simd_batch_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(simd::py_simd_calculate_profit, m)?)?;
+    m.add_function(wrap_pyfunction!(simd::py_simd_decode_mask, m)?)?;
+
+    // ============================================================================
+    // NEW: Circuit Breaker (terauss integration)
+    // ============================================================================
+    m.add_class::<circuit_breaker::PyCircuitBreakerConfig>()?;
+    m.add_class::<circuit_breaker::PyCircuitBreaker>()?;
+
+    // ============================================================================
+    // NEW: Execution Tracker (terauss integration)
+    // ============================================================================
+    m.add_class::<execution::PyExecutionTracker>()?;
+    m.add_class::<execution::PyFastExecutionRequest>()?;
+
+    // ============================================================================
+    // NEW: Position Tracker (terauss integration)
+    // ============================================================================
+    m.add_class::<position_tracker::PyArbPosition>()?;
+    m.add_class::<position_tracker::PyPositionTracker>()?;
+
+    // ============================================================================
+    // NEW: Team Cache (terauss integration)
+    // ============================================================================
+    m.add_class::<team_cache::PyTeamCache>()?;
+
+    // ============================================================================
+    // NEW: League Config (terauss integration)
+    // ============================================================================
+    m.add_class::<league_config::PyLeagueConfig>()?;
+    m.add_function(wrap_pyfunction!(league_config::py_get_league_configs, m)?)?;
+    m.add_function(wrap_pyfunction!(league_config::py_get_league_config, m)?)?;
+    m.add_function(wrap_pyfunction!(league_config::py_get_league_codes, m)?)?;
 
     Ok(())
 }

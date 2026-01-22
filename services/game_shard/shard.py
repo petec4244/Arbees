@@ -104,6 +104,10 @@ class GameShard:
         self.sync_delta_tolerance = sync_delta_tolerance
         self.use_websocket_streaming = use_websocket_streaming
 
+        # VPN-based Polymarket mode: consume Polymarket prices from Redis
+        # instead of connecting directly (requires polymarket_monitor service)
+        self.polymarket_via_redis = os.environ.get("POLYMARKET_VIA_REDIS", "false").lower() == "true"
+
         # Connections (shared across all games)
         self.db: Optional[DatabaseClient] = None
         self.redis: Optional[RedisBus] = None
@@ -124,6 +128,19 @@ class GameShard:
         self._ws_stream_tasks: dict[Platform, asyncio.Task] = {}
         self._market_to_game: dict[str, str] = {}  # market_id -> game_id mapping
 
+        # NEW: Circuit breaker from Rust (terauss integration)
+        self.circuit_breaker = arbees_core.CircuitBreaker(
+            arbees_core.CircuitBreakerConfig(
+                max_position_per_market=int(os.environ.get("MAX_POSITION_PER_MARKET", 50000)),
+                max_total_position=int(os.environ.get("MAX_TOTAL_POSITION", 100000)),
+                max_daily_loss=float(os.environ.get("MAX_DAILY_LOSS", 500.0)),
+                max_consecutive_errors=int(os.environ.get("MAX_CONSECUTIVE_ERRORS", 5)),
+                cooldown_secs=int(os.environ.get("CIRCUIT_BREAKER_COOLDOWN", 300)),
+                enabled=os.environ.get("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true",
+            )
+        )
+        logger.info(f"Circuit breaker initialized (enabled={self.circuit_breaker.is_trading_allowed()})")
+
     @property
     def game_count(self) -> int:
         """Number of active games."""
@@ -136,7 +153,11 @@ class GameShard:
 
     async def start(self) -> None:
         """Start the shard and connect to services."""
-        logger.info(f"Starting GameShard {self.shard_id} (websocket_streaming={self.use_websocket_streaming})")
+        logger.info(
+            f"Starting GameShard {self.shard_id} "
+            f"(websocket_streaming={self.use_websocket_streaming}, "
+            f"polymarket_via_redis={self.polymarket_via_redis})"
+        )
 
         # Connect to database
         pool = await get_pool()
@@ -154,20 +175,30 @@ class GameShard:
             # Also keep REST client as fallback
             self.kalshi = self.kalshi_hybrid._rest
 
-            self.polymarket_hybrid = HybridPolymarketClient()
-            await self.polymarket_hybrid.connect()
-            self.polymarket = self.polymarket_hybrid._rest
+            # Only connect to Polymarket directly if NOT using Redis mode
+            if not self.polymarket_via_redis:
+                self.polymarket_hybrid = HybridPolymarketClient()
+                await self.polymarket_hybrid.connect()
+                self.polymarket = self.polymarket_hybrid._rest
+                logger.info("Using WebSocket streaming for Polymarket prices (direct)")
+            else:
+                logger.info("Polymarket prices via Redis (VPN monitor)")
 
-            logger.info("Using WebSocket streaming for market prices (10-50ms latency)")
+            logger.info("Using WebSocket streaming for Kalshi prices (10-50ms latency)")
         else:
             # REST-only clients
             self.kalshi = KalshiClient()
             await self.kalshi.connect()
 
-            self.polymarket = PolymarketClient()
-            await self.polymarket.connect()
+            # Only connect to Polymarket directly if NOT using Redis mode
+            if not self.polymarket_via_redis:
+                self.polymarket = PolymarketClient()
+                await self.polymarket.connect()
+                logger.info("Using REST polling for Polymarket prices (direct)")
+            else:
+                logger.info("Polymarket prices via Redis (VPN monitor)")
 
-            logger.info("Using REST polling for market prices")
+            logger.info("Using REST polling for Kalshi prices")
 
         self._running = True
 
@@ -191,10 +222,27 @@ class GameShard:
             kalshi_id = data.get("kalshi_market_id")
             poly_id = data.get("polymarket_market_id")
 
+            # NEW: Support multi-market type format
+            # Format: {"moneyline": {"kalshi": "id1", "polymarket": "id2"}, ...}
+            market_ids_by_type_raw = data.get("market_ids_by_type")
+            market_ids_by_type = None
+
+            if market_ids_by_type_raw:
+                market_ids_by_type = {}
+                for type_str, platforms in market_ids_by_type_raw.items():
+                    try:
+                        market_type = MarketType(type_str)
+                        market_ids_by_type[market_type] = {}
+                        for plat_str, market_id in platforms.items():
+                            platform = Platform(plat_str)
+                            market_ids_by_type[market_type][platform] = market_id
+                    except ValueError as e:
+                        logger.warning(f"Unknown market type or platform: {e}")
+
             if game_id and sport_str:
                 sport = Sport(sport_str)
-                logger.info(f"Received add_game command: {game_id} ({sport_str}) kalshi={kalshi_id} poly={poly_id}")
-                await self.add_game(game_id, sport, kalshi_id, poly_id)
+                logger.info(f"Received add_game command: {game_id} ({sport_str}) kalshi={kalshi_id} poly={poly_id} multi_market={market_ids_by_type is not None}")
+                await self.add_game(game_id, sport, kalshi_id, poly_id, market_ids_by_type)
 
         elif cmd_type == "remove_game":
             game_id = data.get("game_id")
@@ -242,12 +290,21 @@ class GameShard:
         """Send periodic heartbeats to orchestrator."""
         while self._running:
             try:
+                # Get circuit breaker status
+                cb_status = self.circuit_breaker.status()
+
                 status = {
                     "shard_id": self.shard_id,
                     "game_count": self.game_count,
                     "max_games": self.max_games,
                     "games": list(self._games.keys()),
                     "timestamp": datetime.utcnow().isoformat(),
+                    # NEW: Circuit breaker status (terauss integration)
+                    "circuit_breaker": {
+                        "trading_allowed": self.circuit_breaker.is_trading_allowed(),
+                        "daily_pnl": cb_status.get("daily_pnl_dollars", 0.0),
+                        "consecutive_errors": cb_status.get("consecutive_errors", 0),
+                    },
                 }
                 if self.redis:
                     await self.redis.publish_shard_heartbeat(self.shard_id, status)
@@ -266,6 +323,7 @@ class GameShard:
         sport: Sport,
         kalshi_market_id: Optional[str] = None,
         polymarket_market_id: Optional[str] = None,
+        market_ids_by_type: Optional[dict[MarketType, dict[Platform, str]]] = None,
     ) -> bool:
         """
         Start monitoring a game.
@@ -273,8 +331,14 @@ class GameShard:
         Args:
             game_id: ESPN game ID
             sport: Sport type
-            kalshi_market_id: Optional Kalshi market to monitor
-            polymarket_market_id: Optional Polymarket market to monitor
+            kalshi_market_id: Optional Kalshi market to monitor (legacy, for backwards compat)
+            polymarket_market_id: Optional Polymarket market to monitor (legacy)
+            market_ids_by_type: NEW - Multiple market types per game for 3-8x more opportunities
+                Example: {
+                    MarketType.MONEYLINE: {Platform.KALSHI: "id1", Platform.POLYMARKET: "id2"},
+                    MarketType.SPREAD: {Platform.KALSHI: "id3", Platform.POLYMARKET: "id4"},
+                    MarketType.TOTAL: {Platform.KALSHI: "id5", Platform.POLYMARKET: "id6"},
+                }
 
         Returns:
             True if game was added
@@ -298,7 +362,19 @@ class GameShard:
             espn_client=espn_client,
         )
 
-        # Track market IDs
+        # NEW: Multi-market type support (3-8x more arbitrage opportunities)
+        if market_ids_by_type:
+            ctx.market_ids_by_type = market_ids_by_type
+            for market_type, platforms in market_ids_by_type.items():
+                for platform, market_id in platforms.items():
+                    self._market_to_game[market_id] = game_id
+                    logger.info(f"Game {game_id}: {market_type.value} {platform.value} market set to {market_id}")
+
+            # Also populate legacy market_ids with moneyline for backwards compat
+            if MarketType.MONEYLINE in market_ids_by_type:
+                ctx.market_ids = market_ids_by_type[MarketType.MONEYLINE].copy()
+
+        # Legacy: Track single market IDs (backwards compatibility)
         if kalshi_market_id:
             ctx.market_ids[Platform.KALSHI] = kalshi_market_id
             self._market_to_game[kalshi_market_id] = game_id
@@ -310,15 +386,20 @@ class GameShard:
 
         self._games[game_id] = ctx
 
-        # Subscribe to WebSocket streaming if enabled
+        # Subscribe to WebSocket streaming if enabled (for Kalshi, and Polymarket if not via Redis)
         if self.use_websocket_streaming:
             await self._subscribe_to_ws_streams(ctx)
+
+        # Subscribe to Redis price channel for Polymarket prices when using VPN monitor
+        if self.polymarket_via_redis and self.redis:
+            await self._subscribe_to_polymarket_redis(ctx)
 
         # Start monitoring task
         task = asyncio.create_task(self._monitor_game(ctx))
         self._game_tasks[game_id] = task
 
-        logger.info(f"Added game {game_id} ({sport.value}) to shard {self.shard_id}")
+        market_count = len(ctx.market_ids_by_type) if ctx.market_ids_by_type else len(ctx.market_ids)
+        logger.info(f"Added game {game_id} ({sport.value}) to shard {self.shard_id} with {market_count} market type(s)")
         return True
 
     async def remove_game(self, game_id: str) -> bool:
@@ -343,9 +424,14 @@ class GameShard:
         if self.use_websocket_streaming:
             await self._unsubscribe_from_ws_streams(ctx)
 
-        # Clean up market_to_game mappings
+        # Clean up market_to_game mappings (legacy)
         for platform, market_id in ctx.market_ids.items():
             self._market_to_game.pop(market_id, None)
+
+        # Clean up multi-market type mappings
+        for market_type, platforms in ctx.market_ids_by_type.items():
+            for platform, market_id in platforms.items():
+                self._market_to_game.pop(market_id, None)
 
         # Disconnect ESPN client
         await ctx.espn_client.disconnect()
@@ -576,7 +662,6 @@ class GameShard:
             old_prob = ctx.last_home_win_prob
 
             # Calculate new win probability
-            # TODO: Use Rust core for this
             new_prob = self._calculate_win_prob(new_state)
 
             # Update context
@@ -622,54 +707,198 @@ class GameShard:
     # ==========================================================================
 
     async def _subscribe_to_ws_streams(self, ctx: GameContext) -> None:
-        """Subscribe to WebSocket streams for a game's markets."""
-        # Subscribe to Kalshi
-        if ctx.market_ids.get(Platform.KALSHI) and self.kalshi_hybrid:
-            market_id = ctx.market_ids[Platform.KALSHI]
-            await self.kalshi_hybrid.subscribe_with_metadata([{
-                "market_id": market_id,
-                "title": "",
-                "game_id": ctx.game_id,
-            }])
-            logger.info(f"Subscribed to Kalshi WebSocket for {market_id}")
+        """Subscribe to WebSocket streams for a game's markets (all market types).
+
+        Note: When polymarket_via_redis=True, Polymarket subscriptions are skipped
+        here and handled via Redis instead (see _subscribe_to_polymarket_redis).
+        """
+        # Collect all market IDs to subscribe to
+        kalshi_markets_to_sub = []
+        poly_markets_to_sub = []
+
+        # NEW: Subscribe to all market types
+        for market_type, platforms in ctx.market_ids_by_type.items():
+            if Platform.KALSHI in platforms and self.kalshi_hybrid:
+                market_id = platforms[Platform.KALSHI]
+                kalshi_markets_to_sub.append({
+                    "market_id": market_id,
+                    "title": "",
+                    "game_id": ctx.game_id,
+                    "market_type": market_type.value,
+                })
+
+            # Only subscribe to Polymarket WebSocket if NOT using Redis mode
+            if Platform.POLYMARKET in platforms and self.polymarket_hybrid and not self.polymarket_via_redis:
+                market_id = platforms[Platform.POLYMARKET]
+                poly_markets_to_sub.append({
+                    "condition_id": market_id,
+                    "game_id": ctx.game_id,
+                    "market_type": market_type.value,
+                })
+
+        # Legacy: Subscribe to single market IDs (backwards compatibility)
+        if not ctx.market_ids_by_type:
+            if ctx.market_ids.get(Platform.KALSHI) and self.kalshi_hybrid:
+                market_id = ctx.market_ids[Platform.KALSHI]
+                kalshi_markets_to_sub.append({
+                    "market_id": market_id,
+                    "title": "",
+                    "game_id": ctx.game_id,
+                })
+
+            # Only subscribe to Polymarket WebSocket if NOT using Redis mode
+            if ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket_hybrid and not self.polymarket_via_redis:
+                market_id = ctx.market_ids[Platform.POLYMARKET]
+                poly_markets_to_sub.append({
+                    "condition_id": market_id,
+                    "game_id": ctx.game_id,
+                })
+
+        # Subscribe to Kalshi markets
+        if kalshi_markets_to_sub and self.kalshi_hybrid:
+            await self.kalshi_hybrid.subscribe_with_metadata(kalshi_markets_to_sub)
+            logger.info(f"Subscribed to {len(kalshi_markets_to_sub)} Kalshi WebSocket market(s) for game {ctx.game_id}")
 
             # Start stream task if not running
             if Platform.KALSHI not in self._ws_stream_tasks:
                 task = asyncio.create_task(self._run_ws_price_stream(Platform.KALSHI))
                 self._ws_stream_tasks[Platform.KALSHI] = task
 
-        # Subscribe to Polymarket
-        if ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket_hybrid:
-            market_id = ctx.market_ids[Platform.POLYMARKET]
+        # Subscribe to Polymarket markets
+        if poly_markets_to_sub and self.polymarket_hybrid:
+            for sub in poly_markets_to_sub:
+                market_id = sub["condition_id"]
+                # Resolve token_id if needed (Polymarket requires token_ids for WS)
+                market = await self.polymarket_hybrid.get_market(market_id)
+                if market:
+                    token_id = await self.polymarket_hybrid.resolve_yes_token_id(market)
+                    if token_id:
+                        title = market.get("question", market.get("title", ""))
+                        ctx.market_titles[market_id] = title
+                        await self.polymarket_hybrid.subscribe_with_metadata([{
+                            "token_id": token_id,
+                            "condition_id": market_id,
+                            "title": title,
+                            "game_id": ctx.game_id,
+                            "market_type": sub.get("market_type", "moneyline"),
+                        }])
 
-            # Resolve token_id if needed (Polymarket requires token_ids for WS)
-            market = await self.polymarket_hybrid.get_market(market_id)
-            if market:
-                token_id = await self.polymarket_hybrid.resolve_yes_token_id(market)
-                if token_id:
-                    await self.polymarket_hybrid.subscribe_with_metadata([{
-                        "token_id": token_id,
-                        "condition_id": market_id,
-                        "title": market.get("question", market.get("title", "")),
-                        "game_id": ctx.game_id,
-                    }])
-                    logger.info(f"Subscribed to Polymarket WebSocket for {token_id}")
+            logger.info(f"Subscribed to {len(poly_markets_to_sub)} Polymarket WebSocket market(s) for game {ctx.game_id}")
 
-                    # Start stream task if not running
-                    if Platform.POLYMARKET not in self._ws_stream_tasks:
-                        task = asyncio.create_task(self._run_ws_price_stream(Platform.POLYMARKET))
-                        self._ws_stream_tasks[Platform.POLYMARKET] = task
+            # Start stream task if not running
+            if Platform.POLYMARKET not in self._ws_stream_tasks:
+                task = asyncio.create_task(self._run_ws_price_stream(Platform.POLYMARKET))
+                self._ws_stream_tasks[Platform.POLYMARKET] = task
 
     async def _unsubscribe_from_ws_streams(self, ctx: GameContext) -> None:
         """Unsubscribe from WebSocket streams when removing a game."""
-        if ctx.market_ids.get(Platform.KALSHI) and self.kalshi_hybrid:
-            market_id = ctx.market_ids[Platform.KALSHI]
-            await self.kalshi_hybrid.unsubscribe([market_id])
-            logger.debug(f"Unsubscribed from Kalshi WebSocket for {market_id}")
+        # Collect all Kalshi market IDs to unsubscribe
+        kalshi_ids_to_unsub = []
 
-        if ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket_hybrid:
-            # Note: Polymarket doesn't have explicit unsubscribe
-            pass
+        # From multi-market types
+        for market_type, platforms in ctx.market_ids_by_type.items():
+            if Platform.KALSHI in platforms:
+                kalshi_ids_to_unsub.append(platforms[Platform.KALSHI])
+
+        # From legacy single market
+        if ctx.market_ids.get(Platform.KALSHI):
+            kalshi_ids_to_unsub.append(ctx.market_ids[Platform.KALSHI])
+
+        # Unsubscribe from Kalshi
+        if kalshi_ids_to_unsub and self.kalshi_hybrid:
+            await self.kalshi_hybrid.unsubscribe(kalshi_ids_to_unsub)
+            logger.debug(f"Unsubscribed from {len(kalshi_ids_to_unsub)} Kalshi WebSocket market(s) for game {ctx.game_id}")
+
+        # Note: Polymarket doesn't have explicit unsubscribe
+
+    # ==========================================================================
+    # Polymarket via Redis (VPN Monitor)
+    # ==========================================================================
+
+    async def _subscribe_to_polymarket_redis(self, ctx: GameContext) -> None:
+        """Subscribe to Polymarket prices from Redis (published by VPN monitor).
+
+        When POLYMARKET_VIA_REDIS=true, the shard doesn't connect to Polymarket
+        directly. Instead, the polymarket_monitor service (running behind VPN)
+        publishes prices to Redis on game:{game_id}:price channels.
+        """
+        if not self.redis:
+            return
+
+        # Subscribe to the game's price channel
+        price_channel = Channel.GAME_PRICE.format(game_id=ctx.game_id)
+
+        async def handle_polymarket_price(data: dict) -> None:
+            """Handle incoming Polymarket price from Redis."""
+            await self._handle_redis_polymarket_price(ctx, data)
+
+        await self.redis.subscribe(price_channel, handle_polymarket_price)
+        logger.info(f"Subscribed to Redis price channel for Polymarket: {price_channel}")
+
+    async def _handle_redis_polymarket_price(self, ctx: GameContext, data: dict) -> None:
+        """Handle Polymarket price update received from Redis (VPN monitor).
+
+        The polymarket_monitor publishes MarketPrice objects to game:{game_id}:price.
+        We filter for platform=polymarket and update the game context accordingly.
+        """
+        # Check if this is a Polymarket price
+        platform_str = data.get("platform")
+        if platform_str != Platform.POLYMARKET.value:
+            return  # Ignore non-Polymarket prices (e.g., Kalshi publishes here too)
+
+        # Reconstruct MarketPrice from dict
+        try:
+            price = MarketPrice(
+                market_id=data.get("market_id", ""),
+                platform=Platform.POLYMARKET,
+                game_id=data.get("game_id"),
+                market_title=data.get("market_title", ""),
+                yes_bid=float(data.get("yes_bid", 0)),
+                yes_ask=float(data.get("yes_ask", 1)),
+                volume=float(data.get("volume", 0)),
+                liquidity=float(data.get("liquidity", 0)),
+                timestamp=datetime.fromisoformat(data["timestamp"]) if "timestamp" in data else datetime.utcnow(),
+            )
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse Polymarket price from Redis: {e}")
+            return
+
+        # Update context with new price (legacy)
+        ctx.market_prices[Platform.POLYMARKET] = price
+
+        # Determine market type and update by-type mapping
+        market_type = self._determine_market_type(ctx, price.market_id, Platform.POLYMARKET)
+        if market_type:
+            ctx.market_prices_by_type[(market_type, Platform.POLYMARKET)] = price
+
+        # Store market title for parsing
+        if price.market_title:
+            ctx.market_titles[price.market_id] = price.market_title
+
+        # Persist to database
+        if self.db:
+            await self.db.insert_market_price(
+                market_id=price.market_id,
+                platform=Platform.POLYMARKET.value,
+                yes_bid=price.yes_bid,
+                yes_ask=price.yes_ask,
+                volume=price.volume,
+                liquidity=price.liquidity,
+                game_id=ctx.game_id,
+                market_title=price.market_title,
+                market_type=data.get("market_type", "moneyline"),
+            )
+
+        # Check for signal generation based on market price change
+        await self._check_market_signals(ctx, Platform.POLYMARKET, price)
+
+        # Check for cross-market arbitrage opportunities
+        await self._check_cross_market_arbitrage(ctx)
+
+        logger.debug(
+            f"[Redis] Polymarket price for {ctx.game_id}: "
+            f"bid={price.yes_bid:.3f} ask={price.yes_ask:.3f}"
+        )
 
     async def _run_ws_price_stream(self, platform: Platform) -> None:
         """Background task to process WebSocket price updates.
@@ -734,8 +963,17 @@ class GameShard:
 
         ctx = self._games[game_id]
 
-        # Update context with new price
+        # Update context with new price (legacy)
         ctx.market_prices[platform] = price
+
+        # NEW: Store by market type if we can determine it
+        market_type = self._determine_market_type(ctx, price.market_id, platform)
+        if market_type:
+            ctx.market_prices_by_type[(market_type, platform)] = price
+
+        # Store market title for parsing
+        if price.market_title:
+            ctx.market_titles[price.market_id] = price.market_title
 
         # Persist to database
         if self.db:
@@ -756,6 +994,27 @@ class GameShard:
 
         # Check for signal generation based on market price change
         await self._check_market_signals(ctx, platform, price)
+
+        # NEW: Check for cross-market arbitrage opportunities
+        await self._check_cross_market_arbitrage(ctx)
+
+    def _determine_market_type(
+        self,
+        ctx: GameContext,
+        market_id: str,
+        platform: Platform,
+    ) -> Optional[MarketType]:
+        """Determine the market type for a given market ID."""
+        # Check multi-market type mappings
+        for market_type, platforms in ctx.market_ids_by_type.items():
+            if platforms.get(platform) == market_id:
+                return market_type
+
+        # Legacy: assume moneyline for single market
+        if ctx.market_ids.get(platform) == market_id:
+            return MarketType.MONEYLINE
+
+        return None
 
     async def _check_market_signals(
         self,
@@ -838,14 +1097,187 @@ class GameShard:
             f"(edge: {signal.edge_pct:.1f}%, platform: {platform.value})"
         )
 
+    async def _check_cross_market_arbitrage(self, ctx: GameContext) -> None:
+        """
+        Check for cross-market arbitrage opportunities across all market types.
+
+        Uses SIMD-accelerated arbitrage detection from Rust core (terauss integration)
+        for sub-microsecond detection across all market types.
+
+        This is where the 3-8x opportunity multiplier comes from:
+        - Compare SAME market type across platforms (Kalshi vs Polymarket)
+        - Only compare compatible markets (verified via parser)
+        - Generate arbitrage signals when pricing discrepancy exists
+        """
+        # Check circuit breaker first
+        if not self.circuit_breaker.is_trading_allowed():
+            return
+
+        for market_type, platforms in ctx.market_ids_by_type.items():
+            # Need both platforms for arbitrage
+            if Platform.KALSHI not in platforms or Platform.POLYMARKET not in platforms:
+                continue
+
+            kalshi_id = platforms[Platform.KALSHI]
+            poly_id = platforms[Platform.POLYMARKET]
+
+            # Get prices for both platforms
+            kalshi_price = ctx.market_prices_by_type.get((market_type, Platform.KALSHI))
+            poly_price = ctx.market_prices_by_type.get((market_type, Platform.POLYMARKET))
+
+            if not kalshi_price or not poly_price:
+                continue
+
+            # Parse market titles to verify compatibility
+            kalshi_title = ctx.market_titles.get(kalshi_id, "")
+            poly_title = ctx.market_titles.get(poly_id, "")
+
+            if kalshi_title and poly_title:
+                kalshi_parsed = parse_market(kalshi_title, platform="kalshi")
+                poly_parsed = parse_market(poly_title, platform="polymarket")
+
+                if kalshi_parsed and poly_parsed:
+                    if not kalshi_parsed.is_compatible_with(poly_parsed):
+                        logger.warning(
+                            f"Market incompatibility detected for {market_type.value}: "
+                            f"Kalshi='{kalshi_title}' vs Poly='{poly_title}'"
+                        )
+                        continue
+
+            # NEW: SIMD-accelerated arbitrage detection (terauss integration)
+            # Convert prices to cents (0-100 scale)
+            kalshi_yes = int(kalshi_price.yes_ask * 100)
+            kalshi_no = int((1.0 - kalshi_price.yes_bid) * 100)  # NO ask = 1 - YES bid
+            poly_yes = int(poly_price.yes_ask * 100)
+            poly_no = int((1.0 - poly_price.yes_bid) * 100)
+
+            # SIMD check for all arb types in parallel
+            # Returns bitmask: bit 0 = PolyYes+KalshiNo, bit 1 = KalshiYes+PolyNo
+            arb_mask = arbees_core.simd_check_arbs(
+                kalshi_yes, kalshi_no, poly_yes, poly_no, 100
+            )
+
+            if arb_mask == 0:
+                continue  # No arbitrage detected
+
+            # Decode the arb types detected
+            arb_types = arbees_core.simd_decode_mask(arb_mask)
+            logger.debug(f"SIMD detected arb types: {arb_types} for {market_type.value}")
+
+            # Process each detected arb type
+            # Note: arb_type values are bit flags: 1=PolyYes+KalshiNo, 2=KalshiYes+PolyNo
+            if arb_mask & 1:  # PolyYes + KalshiNo
+                profit_cents = arbees_core.simd_calculate_profit(
+                    kalshi_yes, kalshi_no, poly_yes, poly_no, 1  # arb_type=1 (bit flag)
+                )
+                if profit_cents > 0:
+                    await self._emit_arbitrage_signal(
+                        ctx, market_type,
+                        buy_platform=Platform.POLYMARKET,
+                        sell_platform=Platform.KALSHI,
+                        buy_price=poly_price.yes_ask,
+                        sell_price=1.0 - kalshi_price.yes_bid,  # NO price
+                        edge_pct=float(profit_cents),  # Already in cents, use as percentage
+                        arb_type="PolyYes+KalshiNo",
+                    )
+
+            if arb_mask & 2:  # KalshiYes + PolyNo
+                profit_cents = arbees_core.simd_calculate_profit(
+                    kalshi_yes, kalshi_no, poly_yes, poly_no, 2  # arb_type=2 (bit flag)
+                )
+                if profit_cents > 0:
+                    await self._emit_arbitrage_signal(
+                        ctx, market_type,
+                        buy_platform=Platform.KALSHI,
+                        sell_platform=Platform.POLYMARKET,
+                        buy_price=kalshi_price.yes_ask,
+                        sell_price=1.0 - poly_price.yes_bid,  # NO price
+                        edge_pct=float(profit_cents),
+                        arb_type="KalshiYes+PolyNo",
+                    )
+
+    async def _emit_arbitrage_signal(
+        self,
+        ctx: GameContext,
+        market_type: MarketType,
+        buy_platform: Platform,
+        sell_platform: Platform,
+        buy_price: float,
+        sell_price: float,
+        edge_pct: float,
+        arb_type: Optional[str] = None,
+    ) -> None:
+        """Emit a cross-market arbitrage signal.
+
+        Args:
+            ctx: Game context
+            market_type: Type of market (moneyline, spread, etc.)
+            buy_platform: Platform to buy on
+            sell_platform: Platform to sell on
+            buy_price: Price to buy at (0-1 scale)
+            sell_price: Price to sell at (0-1 scale)
+            edge_pct: Expected edge percentage
+            arb_type: Optional SIMD arb type string (e.g., "PolyYes+KalshiNo")
+        """
+        # Check circuit breaker before emitting
+        if not self.circuit_breaker.is_trading_allowed():
+            logger.warning(f"Circuit breaker halted - skipping arb signal for {ctx.game_id}")
+            return
+
+        arb_type_str = f" ({arb_type})" if arb_type else ""
+        signal = TradingSignal(
+            signal_id=str(uuid.uuid4()),
+            signal_type=SignalType.CROSS_MARKET_ARB,
+            game_id=ctx.game_id,
+            sport=ctx.sport,
+            team=ctx.last_state.home_team if ctx.last_state else None,
+            direction=SignalDirection.BUY,  # Buy on buy_platform
+            model_prob=sell_price,  # Use sell price as "model" expectation
+            market_prob=buy_price,  # Buy price is what we pay
+            edge_pct=edge_pct,
+            confidence=min(1.0, edge_pct / 5.0),  # Higher edge = higher confidence
+            reason=(
+                f"Cross-market arb{arb_type_str} on {market_type.value}: "
+                f"BUY {buy_platform.value} @ {buy_price*100:.1f}¢, "
+                f"SELL {sell_platform.value} @ {sell_price*100:.1f}¢"
+            ),
+        )
+
+        ctx.signals_generated += 1
+
+        # Persist signal
+        if self.db:
+            await self.db.insert_trading_signal(
+                signal_id=signal.signal_id,
+                signal_type=signal.signal_type.value,
+                direction=signal.direction.value,
+                edge_pct=signal.edge_pct,
+                game_id=signal.game_id,
+                sport=signal.sport.value if signal.sport else None,
+                team=signal.team,
+                model_prob=signal.model_prob,
+                market_prob=signal.market_prob,
+                confidence=signal.confidence,
+                reason=signal.reason,
+            )
+
+        # Publish signal
+        if self.redis:
+            await self.redis.publish_signal(signal)
+
+        logger.info(
+            f"[ARB] {market_type.value}: BUY {buy_platform.value}@{buy_price*100:.1f}¢ "
+            f"SELL {sell_platform.value}@{sell_price*100:.1f}¢ (edge: {edge_pct:.1f}%)"
+        )
+
     async def _poll_market_prices(self, ctx: GameContext) -> None:
         """Poll market prices for the game.
 
         Note: When WebSocket streaming is enabled, this serves as a fallback
         for markets not subscribed via WebSocket.
         """
-        # Skip if no market IDs configured
-        if not ctx.market_ids:
+        # Skip if no market IDs configured (check both legacy and multi-market)
+        if not ctx.market_ids and not ctx.market_ids_by_type:
             return
 
         # Check if we have recent market data (within 30 seconds)
@@ -853,84 +1285,141 @@ class GameShard:
         now = datetime.utcnow()
         stale_threshold = 30.0  # seconds
 
-        def is_market_data_fresh(platform: Platform) -> bool:
-            price = ctx.market_prices.get(platform)
+        def is_market_data_fresh(platform: Platform, market_type: Optional[MarketType] = None) -> bool:
+            if market_type:
+                price = ctx.market_prices_by_type.get((market_type, platform))
+            else:
+                price = ctx.market_prices.get(platform)
             if not price:
                 return False
             age = (now - price.timestamp).total_seconds()
             return age < stale_threshold
 
-        # Only skip polling if we have fresh WS data
-        if self.use_websocket_streaming:
-            kalshi_fresh = is_market_data_fresh(Platform.KALSHI)
-            poly_fresh = is_market_data_fresh(Platform.POLYMARKET)
-
-            # If we have fresh data from both, skip polling
-            kalshi_needed = Platform.KALSHI in ctx.market_ids and not kalshi_fresh
-            poly_needed = Platform.POLYMARKET in ctx.market_ids and not poly_fresh
-
-            if not kalshi_needed and not poly_needed:
-                return  # All data is fresh, no need to poll
-
-            if kalshi_needed or poly_needed:
-                logger.info(f"REST fallback for {ctx.game_id}: kalshi_needed={kalshi_needed}, poly_needed={poly_needed}")
-
         try:
-            # Poll Kalshi (if needed or not using WS)
-            should_poll_kalshi = ctx.market_ids.get(Platform.KALSHI) and self.kalshi
-            if self.use_websocket_streaming:
-                should_poll_kalshi = should_poll_kalshi and not is_market_data_fresh(Platform.KALSHI)
+            # NEW: Poll all market types
+            for market_type, platforms in ctx.market_ids_by_type.items():
+                # Poll Kalshi for this market type
+                if Platform.KALSHI in platforms and self.kalshi:
+                    market_id = platforms[Platform.KALSHI]
+                    if not self.use_websocket_streaming or not is_market_data_fresh(Platform.KALSHI, market_type):
+                        price = await self.kalshi.get_market_price(market_id)
+                        if price:
+                            ctx.market_prices_by_type[(market_type, Platform.KALSHI)] = price
+                            if price.market_title:
+                                ctx.market_titles[market_id] = price.market_title
 
-            if should_poll_kalshi:
-                market_id = ctx.market_ids[Platform.KALSHI]
-                logger.info(f"Polling Kalshi REST for {ctx.game_id} market {market_id}")
-                price = await self.kalshi.get_market_price(market_id)
-                if price:
-                    logger.info(f"Got Kalshi price: bid={price.yes_bid:.3f}, ask={price.yes_ask:.3f}, mid={price.mid_price:.3f}")
-                    ctx.market_prices[Platform.KALSHI] = price
+                            if self.db:
+                                await self.db.insert_market_price(
+                                    market_id=market_id,
+                                    platform="kalshi",
+                                    yes_bid=price.yes_bid,
+                                    yes_ask=price.yes_ask,
+                                    volume=price.volume,
+                                    liquidity=price.liquidity,
+                                    game_id=ctx.game_id,
+                                    market_title=price.market_title,
+                                )
 
-                    # Persist to database
-                    if self.db:
-                        await self.db.insert_market_price(
-                            market_id=market_id,
-                            platform="kalshi",
-                            yes_bid=price.yes_bid,
-                            yes_ask=price.yes_ask,
-                            volume=price.volume,
-                            liquidity=price.liquidity,
-                            game_id=ctx.game_id,
-                            market_title=price.market_title,
-                        )
+                            if self.redis:
+                                await self.redis.publish_market_price(ctx.game_id, price)
 
-                    # Publish to Redis
-                    if self.redis:
-                        await self.redis.publish_market_price(ctx.game_id, price)
+                # Poll Polymarket for this market type
+                if Platform.POLYMARKET in platforms and self.polymarket:
+                    market_id = platforms[Platform.POLYMARKET]
+                    if not self.use_websocket_streaming or not is_market_data_fresh(Platform.POLYMARKET, market_type):
+                        price = await self.polymarket.get_market_price(market_id)
+                        if price:
+                            ctx.market_prices_by_type[(market_type, Platform.POLYMARKET)] = price
+                            if price.market_title:
+                                ctx.market_titles[market_id] = price.market_title
 
-            # Poll Polymarket (if needed or not using WS)
-            should_poll_poly = ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket
-            if self.use_websocket_streaming:
-                should_poll_poly = should_poll_poly and not is_market_data_fresh(Platform.POLYMARKET)
+                            if self.db:
+                                await self.db.insert_market_price(
+                                    market_id=market_id,
+                                    platform="polymarket",
+                                    yes_bid=price.yes_bid,
+                                    yes_ask=price.yes_ask,
+                                    volume=price.volume,
+                                    liquidity=price.liquidity,
+                                    game_id=ctx.game_id,
+                                    market_title=price.market_title,
+                                )
 
-            if should_poll_poly:
-                market_id = ctx.market_ids[Platform.POLYMARKET]
-                price = await self.polymarket.get_market_price(market_id)
-                if price:
-                    ctx.market_prices[Platform.POLYMARKET] = price
+                            if self.redis:
+                                await self.redis.publish_market_price(ctx.game_id, price)
 
-                    if self.db:
-                        await self.db.insert_market_price(
-                            market_id=market_id,
-                            platform="polymarket",
-                            yes_bid=price.yes_bid,
-                            yes_ask=price.yes_ask,
-                            volume=price.volume,
-                            liquidity=price.liquidity,
-                            game_id=ctx.game_id,
-                            market_title=price.market_title,
-                        )
+            # Legacy: Poll single market IDs (backwards compatibility)
+            if not ctx.market_ids_by_type:
+                # Only skip polling if we have fresh WS data
+                if self.use_websocket_streaming:
+                    kalshi_fresh = is_market_data_fresh(Platform.KALSHI)
+                    poly_fresh = is_market_data_fresh(Platform.POLYMARKET)
 
-                    if self.redis:
-                        await self.redis.publish_market_price(ctx.game_id, price)
+                    kalshi_needed = Platform.KALSHI in ctx.market_ids and not kalshi_fresh
+                    poly_needed = Platform.POLYMARKET in ctx.market_ids and not poly_fresh
+
+                    if not kalshi_needed and not poly_needed:
+                        return  # All data is fresh, no need to poll
+
+                    if kalshi_needed or poly_needed:
+                        logger.info(f"REST fallback for {ctx.game_id}: kalshi_needed={kalshi_needed}, poly_needed={poly_needed}")
+
+                # Poll Kalshi
+                should_poll_kalshi = ctx.market_ids.get(Platform.KALSHI) and self.kalshi
+                if self.use_websocket_streaming:
+                    should_poll_kalshi = should_poll_kalshi and not is_market_data_fresh(Platform.KALSHI)
+
+                if should_poll_kalshi:
+                    market_id = ctx.market_ids[Platform.KALSHI]
+                    logger.info(f"Polling Kalshi REST for {ctx.game_id} market {market_id}")
+                    price = await self.kalshi.get_market_price(market_id)
+                    if price:
+                        logger.info(f"Got Kalshi price: bid={price.yes_bid:.3f}, ask={price.yes_ask:.3f}, mid={price.mid_price:.3f}")
+                        ctx.market_prices[Platform.KALSHI] = price
+
+                        if self.db:
+                            await self.db.insert_market_price(
+                                market_id=market_id,
+                                platform="kalshi",
+                                yes_bid=price.yes_bid,
+                                yes_ask=price.yes_ask,
+                                volume=price.volume,
+                                liquidity=price.liquidity,
+                                game_id=ctx.game_id,
+                                market_title=price.market_title,
+                            )
+
+                        if self.redis:
+                            await self.redis.publish_market_price(ctx.game_id, price)
+
+                # Poll Polymarket
+                should_poll_poly = ctx.market_ids.get(Platform.POLYMARKET) and self.polymarket
+                if self.use_websocket_streaming:
+                    should_poll_poly = should_poll_poly and not is_market_data_fresh(Platform.POLYMARKET)
+
+                if should_poll_poly:
+                    market_id = ctx.market_ids[Platform.POLYMARKET]
+                    price = await self.polymarket.get_market_price(market_id)
+                    if price:
+                        ctx.market_prices[Platform.POLYMARKET] = price
+
+                        if self.db:
+                            await self.db.insert_market_price(
+                                market_id=market_id,
+                                platform="polymarket",
+                                yes_bid=price.yes_bid,
+                                yes_ask=price.yes_ask,
+                                volume=price.volume,
+                                liquidity=price.liquidity,
+                                game_id=ctx.game_id,
+                                market_title=price.market_title,
+                            )
+
+                        if self.redis:
+                            await self.redis.publish_market_price(ctx.game_id, price)
+
+            # Check for cross-market arbitrage opportunities
+            await self._check_cross_market_arbitrage(ctx)
 
         except Exception as e:
             logger.error(f"Error polling market prices for {ctx.game_id}: {e}")
@@ -1166,7 +1655,9 @@ class GameShard:
     # ==========================================================================
 
     def get_status(self) -> dict:
-        """Get shard status."""
+        """Get shard status including circuit breaker state."""
+        cb_status = self.circuit_breaker.status()
+
         return {
             "shard_id": self.shard_id,
             "running": self._running,
@@ -1184,6 +1675,14 @@ class GameShard:
                 }
                 for ctx in self._games.values()
             ],
+            # NEW: Circuit breaker status (terauss integration)
+            "circuit_breaker": {
+                "trading_allowed": self.circuit_breaker.is_trading_allowed(),
+                "halted": cb_status.get("halted", False),
+                "daily_pnl": cb_status.get("daily_pnl_dollars", 0.0),
+                "consecutive_errors": cb_status.get("consecutive_errors", 0),
+                "trip_reason": cb_status.get("trip_reason"),
+            },
         }
 
 

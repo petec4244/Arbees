@@ -15,6 +15,10 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.8"
 thiserror = "1.0"
+# New dependencies for terauss integration
+rustc-hash = "2.0"           # Fast hashing for GlobalState lookups
+parking_lot = "0.12"         # Faster RwLock than std
+wide = "0.7"                 # SIMD support
 
 [profile.release]
 lto = true

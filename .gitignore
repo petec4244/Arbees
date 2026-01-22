@@ -82,3 +82,6 @@ frontend/*.local
 # Claude
 .claude/
 CLAUDE.md
+
+# Polymarket-Kalshi-Arbitrage-bot
+Polymarket-Kalshi-Arbitrage-bot/
