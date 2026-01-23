@@ -352,6 +352,10 @@ class KalshiWebSocketClient:
             yes_bid = yes_bids[0][0] / 100.0 if yes_bids else 0.0
             yes_ask = yes_asks[0][0] / 100.0 if yes_asks else 1.0
             
+            # Extract depth (size at top of book)
+            yes_bid_size = float(yes_bids[0][1]) if yes_bids else 0.0
+            yes_ask_size = float(yes_asks[0][1]) if yes_asks else 0.0
+            
             # Calculate liquidity (sum of bid quantities)
             liquidity = sum(bid[1] for bid in yes_bids) if yes_bids else 0.0
             
@@ -363,6 +367,8 @@ class KalshiWebSocketClient:
                 market_title=data.get("title", market_ticker),
                 yes_bid=yes_bid,
                 yes_ask=yes_ask,
+                yes_bid_size=yes_bid_size,
+                yes_ask_size=yes_ask_size,
                 volume=0.0,  # Not in delta updates
                 liquidity=liquidity,
                 timestamp=datetime.fromtimestamp(timestamp_ms / 1000.0),

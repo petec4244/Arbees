@@ -8,6 +8,7 @@ import Opportunities from './pages/Opportunities'
 import LiveGames from './pages/LiveGames'
 import UpcomingGames from './pages/UpcomingGames'
 import PaperTrading from './pages/PaperTrading'
+import HistoricalGames from './pages/HistoricalGames'
 import SystemStatus from './components/SystemStatus'
 
 function NavLink({ to, children, onClick }: { to: string; children: React.ReactNode; onClick?: () => void }) {
@@ -84,6 +85,7 @@ function App() {
                 <NavLink to="/opportunities">Opportunities</NavLink>
                 <NavLink to="/live-games">Live Games</NavLink>
                 <NavLink to="/upcoming-games">Upcoming</NavLink>
+                <NavLink to="/historical">Historical</NavLink>
                 <NavLink to="/paper-trading">Paper Trading</NavLink>
               </div>
             </div>
@@ -111,6 +113,7 @@ function App() {
               <MobileNavLink to="/opportunities" onClick={closeMobileMenu}>Opportunities</MobileNavLink>
               <MobileNavLink to="/live-games" onClick={closeMobileMenu}>Live Games</MobileNavLink>
               <MobileNavLink to="/upcoming-games" onClick={closeMobileMenu}>Upcoming Games</MobileNavLink>
+              <MobileNavLink to="/historical" onClick={closeMobileMenu}>Historical Games</MobileNavLink>
               <MobileNavLink to="/paper-trading" onClick={closeMobileMenu}>Paper Trading</MobileNavLink>
             </div>
             <div className="px-4 py-3 border-t border-gray-700">
@@ -128,6 +131,7 @@ function App() {
           <Route path="/opportunities" element={<Opportunities />} />
           <Route path="/live-games" element={<LiveGames />} />
           <Route path="/upcoming-games" element={<UpcomingGames />} />
+          <Route path="/historical" element={<HistoricalGames />} />
           <Route path="/paper-trading" element={<PaperTrading />} />
         </Routes>
       </main>

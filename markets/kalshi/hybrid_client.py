@@ -65,6 +65,12 @@ class HybridKalshiClient:
         )
         self._prefer_websocket = prefer_websocket
         self._ws_stream_task: Optional[asyncio.Task] = None
+        
+        # Volume tracking (since WS doesn't provide it)
+        self._volume_cache: dict[str, float] = {}
+        self._volume_poll_task: Optional[asyncio.Task] = None
+        self._volume_poll_interval: float = 60.0  # Poll volume every minute
+        self._running = False
 
     async def __aenter__(self) -> "HybridKalshiClient":
         await self.connect()
@@ -77,9 +83,14 @@ class HybridKalshiClient:
         """Connect both REST and WebSocket clients."""
         await self._rest.connect()
         # WebSocket connects on first subscribe
+        
+        self._running = True
+        self._volume_poll_task = asyncio.create_task(self._poll_volume_loop())
 
     async def disconnect(self) -> None:
         """Disconnect both clients."""
+        self._running = False
+        
         if self._ws_stream_task:
             self._ws_stream_task.cancel()
             try:
@@ -87,6 +98,14 @@ class HybridKalshiClient:
             except asyncio.CancelledError:
                 pass
             self._ws_stream_task = None
+            
+        if self._volume_poll_task:
+            self._volume_poll_task.cancel()
+            try:
+                await self._volume_poll_task
+            except asyncio.CancelledError:
+                pass
+            self._volume_poll_task = None
 
         await self._ws.disconnect()
         await self._rest.disconnect()
@@ -224,6 +243,11 @@ class HybridKalshiClient:
             MarketPrice objects on each update
         """
         async for price in self._ws.stream_prices(market_ids):
+            # Inject cached volume
+            if price.market_id in self._volume_cache:
+                # Create a new copy with volume set (since pydantic models are immutable/frozen)
+                # Using model_copy with update is cleaner
+                price = price.model_copy(update={"volume": self._volume_cache[price.market_id]})
             yield price
 
     async def subscribe_with_metadata(
@@ -315,3 +339,39 @@ class HybridKalshiClient:
                     results[market_id] = price
 
         return results
+        
+    async def _poll_volume_loop(self) -> None:
+        """Periodic task to poll volume data (missing from WS)."""
+        logger.info(f"Starting Kalshi volume poller (interval={self._volume_poll_interval}s)")
+        
+        while self._running:
+            try:
+                # Get list of subscribed markets
+                subscribed = list(self._ws.subscribed_markets)
+                if not subscribed:
+                    await asyncio.sleep(5.0)
+                    continue
+                
+                # Poll each market via REST
+                # TODO: Optimization - use batch endpoint or get_markets with filter if possible
+                # For now, simplistic iteration with rate limiting handled by REST client
+                for market_id in subscribed:
+                    if not self._running:
+                        break
+                        
+                    try:
+                        market = await self._rest.get_market(market_id)
+                        if market:
+                            vol = float(market.get("volume", 0) or 0)
+                            self._volume_cache[market_id] = vol
+                    except Exception as e:
+                        logger.debug(f"Volume poll failed for {market_id}: {e}")
+                    
+                    # Be nice to the rate limiter
+                    await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error in volume poll loop: {e}")
+            
+            # Wait for next cycle
+            await asyncio.sleep(self._volume_poll_interval)

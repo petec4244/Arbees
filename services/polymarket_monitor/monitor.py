@@ -394,6 +394,8 @@ class PolymarketMonitor:
             contract_team=contract_team,  # CRITICAL: which team's YES contract
             yes_bid=price.yes_bid,
             yes_ask=price.yes_ask,
+            yes_bid_size=price.yes_bid_size,
+            yes_ask_size=price.yes_ask_size,
             volume=meta.get("volume", price.volume),
             liquidity=price.liquidity,
             status=price.status,

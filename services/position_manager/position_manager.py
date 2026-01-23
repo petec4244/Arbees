@@ -91,8 +91,8 @@ class PositionManager:
         min_edge_pct: float = 2.0,
         kelly_fraction: float = 0.25,
         max_position_pct: float = 10.0,
-        max_buy_prob: float = 0.85,  # Don't buy above 85% - limited upside
-        min_sell_prob: float = 0.15,  # Don't sell below 15% - limited upside
+        max_buy_prob: float = 0.95,  # Don't buy above 95% - limited upside
+        min_sell_prob: float = 0.05,  # Don't sell below 5% - limited upside
         # Risk management settings
         max_daily_loss: float = 100.0,
         max_game_exposure: float = 50.0,
@@ -103,6 +103,9 @@ class PositionManager:
         default_stop_loss_pct: float = 5.0,   # Fallback if sport not configured
         exit_check_interval: float = 1.0,     # Check every 1 second
         sport_stop_loss: Optional[dict[str, float]] = None,  # Sport-specific overrides
+        # Cooldown settings (prevent rapid re-entry)
+        win_cooldown_seconds: float = 180.0,   # 3 minutes after a win
+        loss_cooldown_seconds: float = 300.0,  # 5 minutes after a loss
     ):
         """
         Initialize Position Manager.
@@ -118,6 +121,8 @@ class PositionManager:
             max_game_exposure: Maximum exposure to single game ($)
             max_sport_exposure: Maximum exposure to single sport ($)
             max_latency_ms: Maximum signal latency before rejection (ms)
+            win_cooldown_seconds: Cooldown after a winning trade (default 3 min)
+            loss_cooldown_seconds: Cooldown after a losing trade (default 5 min)
         """
         self.initial_bankroll = initial_bankroll
         self.min_edge_pct = min_edge_pct
@@ -137,6 +142,10 @@ class PositionManager:
         self.default_stop_loss_pct = default_stop_loss_pct
         self.exit_check_interval = exit_check_interval
         self.sport_stop_loss = sport_stop_loss or SPORT_STOP_LOSS_DEFAULTS.copy()
+
+        # Cooldown settings (prevent rapid re-entry on same game)
+        self.win_cooldown_seconds = win_cooldown_seconds
+        self.loss_cooldown_seconds = loss_cooldown_seconds
 
         # Connections
         self.db: Optional[DatabaseClient] = None
@@ -160,6 +169,10 @@ class PositionManager:
         self._prob_rejected_count = 0
         self._duplicate_rejected_count = 0
         self._no_market_rejected_count = 0
+        self._cooldown_rejected_count = 0
+
+        # Game cooldown tracking: game_id -> (last_trade_time, was_win)
+        self._game_cooldowns: dict[str, tuple[datetime, bool]] = {}
 
     def _teams_match(self, team1: str, team2: str) -> bool:
         """Check if two team names refer to the same team.
@@ -191,6 +204,42 @@ class PositionManager:
                 return True
 
         return False
+
+    def _is_game_in_cooldown(self, game_id: str) -> tuple[bool, Optional[str]]:
+        """Check if a game is in cooldown period after a recent trade.
+
+        Returns:
+            (is_in_cooldown, reason) - reason is human-readable if in cooldown
+        """
+        if game_id not in self._game_cooldowns:
+            return False, None
+
+        last_trade_time, was_win = self._game_cooldowns[game_id]
+        now = datetime.utcnow()
+        elapsed = (now - last_trade_time).total_seconds()
+
+        if was_win:
+            cooldown = self.win_cooldown_seconds
+            if elapsed < cooldown:
+                remaining = cooldown - elapsed
+                return True, f"win cooldown ({remaining:.0f}s remaining of {cooldown:.0f}s)"
+        else:
+            cooldown = self.loss_cooldown_seconds
+            if elapsed < cooldown:
+                remaining = cooldown - elapsed
+                return True, f"loss cooldown ({remaining:.0f}s remaining of {cooldown:.0f}s)"
+
+        # Cooldown expired - remove from tracking
+        del self._game_cooldowns[game_id]
+        return False, None
+
+    def _record_trade_close_for_cooldown(self, game_id: str, was_win: bool) -> None:
+        """Record a trade closure to start the cooldown timer for that game."""
+        self._game_cooldowns[game_id] = (datetime.utcnow(), was_win)
+        cooldown = self.win_cooldown_seconds if was_win else self.loss_cooldown_seconds
+        logger.debug(
+            f"Started {cooldown:.0f}s cooldown on game {game_id} after {'win' if was_win else 'loss'}"
+        )
 
     async def start(self) -> None:
         """Start the position manager and connect to services."""
@@ -299,18 +348,25 @@ class PositionManager:
 
         if row:
             from arbees_shared.models.trade import Bankroll
+            # Handle missing piggybank_balance column for backwards compatibility
+            piggybank = float(row.get("piggybank_balance") or 0.0)
             self.paper_engine._bankroll = Bankroll(
                 initial_balance=float(row["initial_balance"]),
                 current_balance=float(row["current_balance"]),
+                piggybank_balance=piggybank,
                 peak_balance=float(row["peak_balance"]),
                 trough_balance=float(row["trough_balance"]),
             )
-            logger.info(f"Loaded bankroll: ${self.paper_engine._bankroll.current_balance:.2f}")
+            logger.info(
+                f"Loaded bankroll: trading=${self.paper_engine._bankroll.current_balance:.2f}, "
+                f"piggybank=${piggybank:.2f}, "
+                f"total=${self.paper_engine._bankroll.total_balance:.2f}"
+            )
         else:
             # Create initial bankroll record
             await pool.execute("""
-                INSERT INTO bankroll (account_name, initial_balance, current_balance, peak_balance, trough_balance)
-                VALUES ('default', $1, $1, $1, $1)
+                INSERT INTO bankroll (account_name, initial_balance, current_balance, piggybank_balance, peak_balance, trough_balance)
+                VALUES ('default', $1, $1, 0.0, $1, $1)
                 ON CONFLICT (account_name) DO NOTHING
             """, self.initial_bankroll)
             logger.info(f"Created initial bankroll: ${self.initial_bankroll:.2f}")
@@ -324,9 +380,9 @@ class PositionManager:
         bankroll = self.paper_engine._bankroll
         await pool.execute("""
             UPDATE bankroll
-            SET current_balance = $1, peak_balance = $2, trough_balance = $3, updated_at = NOW()
+            SET current_balance = $1, piggybank_balance = $2, peak_balance = $3, trough_balance = $4, updated_at = NOW()
             WHERE account_name = 'default'
-        """, bankroll.current_balance, bankroll.peak_balance, bankroll.trough_balance)
+        """, bankroll.current_balance, bankroll.piggybank_balance, bankroll.peak_balance, bankroll.trough_balance)
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic status updates."""
@@ -336,24 +392,29 @@ class PositionManager:
                 if self.risk_controller:
                     risk_metrics = await self.risk_controller.get_metrics()
 
+                bankroll = self.paper_engine._bankroll if self.paper_engine else None
                 status = {
                     "type": "position_manager",
                     "signals_received": self._signal_count,
                     "trades_executed": self._trade_count,
                     "risk_rejected": self._risk_rejected_count,
                     "arb_opportunities": self._arb_count,
-                    "bankroll": self.paper_engine._bankroll.current_balance if self.paper_engine else 0,
+                    "bankroll_trading": bankroll.current_balance if bankroll else 0,
+                    "bankroll_piggybank": bankroll.piggybank_balance if bankroll else 0,
+                    "bankroll_total": bankroll.total_balance if bankroll else 0,
                     "open_positions": len(self.paper_engine.get_open_trades()) if self.paper_engine else 0,
                     "daily_pnl": risk_metrics.daily_pnl if risk_metrics else 0,
                     "circuit_breaker": risk_metrics.circuit_breaker_open if risk_metrics else False,
+                    "games_in_cooldown": len(self._game_cooldowns),
                     "timestamp": datetime.utcnow().isoformat(),
                 }
                 logger.info(
                     f"Position Manager status: {status['trades_executed']} trades, "
                     f"Rejected(Risk: {self._risk_rejected_count}, Edge: {self._edge_rejected_count}, "
                     f"Prob: {self._prob_rejected_count}, Dup: {self._duplicate_rejected_count}, "
-                    f"NoMkt: {self._no_market_rejected_count}), "
-                    f"${status['bankroll']:.2f} bankroll, "
+                    f"NoMkt: {self._no_market_rejected_count}, Cooldown: {self._cooldown_rejected_count}), "
+                    f"trading=${status['bankroll_trading']:.2f}, piggybank=${status['bankroll_piggybank']:.2f}, "
+                    f"total=${status['bankroll_total']:.2f}, "
                     f"daily P&L ${status['daily_pnl']:.2f}"
                 )
 
@@ -425,6 +486,13 @@ class PositionManager:
                     logger.info(f"Closing existing {_side_display(existing_side)} position on game {signal.game_id} (opposite signal received)")
                     await self._close_position(existing_position, signal)
                     return
+
+            # Check cooldown - prevents rapid re-entry after closing a position
+            in_cooldown, cooldown_reason = self._is_game_in_cooldown(signal.game_id)
+            if in_cooldown:
+                self._cooldown_rejected_count += 1
+                logger.info(f"Signal rejected: game {signal.game_id} in {cooldown_reason}")
+                return
 
             # No existing position - open new one
             # Get market price for execution - REQUIRE real prices
@@ -584,12 +652,22 @@ class PositionManager:
             """, outcome, exit_price, pnl, (pnl / (size * entry_price)) * 100 if entry_price > 0 else 0, position["trade_id"])
 
             logger.info(f"Closed position {position['trade_id']}: {_side_display(position['side'])} -> PnL ${pnl:.2f} ({outcome})")
+
+            # Record cooldown for this game
+            self._record_trade_close_for_cooldown(position["game_id"], outcome == "win")
             return
 
         # Close using paper engine
         exit_price = signal.model_prob
         closed_trade = await self.paper_engine.close_trade(trade_to_close, exit_price)
         logger.info(f"Closed position {closed_trade.trade_id}: PnL ${closed_trade.pnl:.2f} ({closed_trade.outcome.value})")
+
+        # Record cooldown for this game
+        from arbees_shared.models.trade import TradeOutcome
+        self._record_trade_close_for_cooldown(
+            closed_trade.game_id,
+            closed_trade.outcome == TradeOutcome.WIN
+        )
 
     async def _get_market_price(self, signal: TradingSignal) -> Optional[MarketPrice]:
         """Get current market price for a signal.
@@ -864,7 +942,13 @@ class PositionManager:
                     f"Settling trade {trade.trade_id}: {trade.side.value} on '{bet_team}' "
                     f"(team_won={team_won}, exit_price={exit_price:.2f})"
                 )
-                await self.paper_engine.close_trade(trade, exit_price)
+                # is_game_settlement=True: skip slippage since game ended at known price
+                closed_trade = await self.paper_engine.close_trade(trade, exit_price, is_game_settlement=True)
+
+                # Record cooldown (game ended, but be consistent)
+                from arbees_shared.models.trade import TradeOutcome
+                was_win = closed_trade.outcome == TradeOutcome.WIN
+                self._record_trade_close_for_cooldown(game_id, was_win)
 
         except Exception as e:
             logger.error(f"Error closing trades for game {game_id}: {e}")
@@ -1102,7 +1186,7 @@ class PositionManager:
         return False, ""
 
     async def _get_current_price(self, trade: PaperTrade) -> Optional[float]:
-        """Get current market mid-price (0-1) for an open trade.
+        """Get current *executable* market price (0-1) for an open trade.
 
         Important: For Polymarket we may be behind geo restrictions in this container,
         so we rely on the `market_prices` table (fed by shard + polymarket_monitor) rather
@@ -1143,23 +1227,36 @@ class PositionManager:
             )
 
         if not row:
-            # Fallback: last known row for this market_id (may be wrong team; debug log will tell us)
+            # Fallback: last known row for this market_id with team safety check
+            # Add contract_team filter to prevent picking wrong team's price
             row = await pool.fetchrow(
                 """
-                SELECT yes_bid, yes_ask, market_title, time
+                SELECT yes_bid, yes_ask, market_title, contract_team, time
                 FROM market_prices
                 WHERE platform = $1 AND market_id = $2
+                  AND (contract_team IS NULL OR contract_team ILIKE $3 OR $3 IS NULL)
                 ORDER BY time DESC
                 LIMIT 1
                 """,
                 trade.platform.value,
                 trade.market_id,
+                f"%{team_hint}%" if team_hint else None,
             )
         if not row:
             return None
         bid = float(row["yes_bid"])
         ask = float(row["yes_ask"])
         mid = (bid + ask) / 2.0
+
+        # Use executable price (this avoids "undeserved positive PnL" from exiting at mid).
+        # - BUY (long YES): you can exit by SELLING YES at the bid
+        # - SELL (we model as long NO via YES-space): you exit by BUYING YES at the ask
+        if trade.side == TradeSide.BUY:
+            chosen = bid
+            chosen_kind = "yes_bid"
+        else:
+            chosen = ask
+            chosen_kind = "yes_ask"
 
         # region agent log
         _agent_dbg(
@@ -1180,11 +1277,13 @@ class PositionManager:
                 "row_yes_bid": bid,
                 "row_yes_ask": ask,
                 "row_mid": mid,
+                "chosen_exit": chosen,
+                "chosen_kind": chosen_kind,
             },
         )
         # endregion
 
-        return mid
+        return chosen
 
     async def _execute_exit(
         self,
@@ -1199,11 +1298,22 @@ class PositionManager:
             f"({reason})"
         )
 
-        closed_trade = await self.paper_engine.close_trade(trade, current_price)
+        # current_price is already executable (bid for BUY, ask for SELL) per _get_current_price()
+        closed_trade = await self.paper_engine.close_trade(trade, current_price, already_executable=True)
 
+        # Structured closure logging for verification
         logger.info(
-            f"Closed trade {closed_trade.trade_id}: "
-            f"PnL ${closed_trade.pnl:.2f} ({closed_trade.outcome.value})"
+            f"TRADE_CLOSED | trade_id={closed_trade.trade_id} | "
+            f"game_id={closed_trade.game_id} | side={closed_trade.side.value} | "
+            f"entry={closed_trade.entry_price:.3f} | exit={current_price:.3f} | "
+            f"reason={reason} | pnl=${closed_trade.pnl:.2f} | outcome={closed_trade.outcome.value}"
+        )
+
+        # Record cooldown for this game
+        from arbees_shared.models.trade import TradeOutcome
+        self._record_trade_close_for_cooldown(
+            closed_trade.game_id,
+            closed_trade.outcome == TradeOutcome.WIN
         )
 
     async def _handle_game_state_update(self, channel: str, data: dict) -> None:
@@ -1237,8 +1347,8 @@ async def main():
         min_edge_pct=float(os.environ.get("MIN_EDGE_PCT", "2.0")),
         kelly_fraction=float(os.environ.get("KELLY_FRACTION", "0.25")),
         max_position_pct=float(os.environ.get("MAX_POSITION_PCT", "10.0")),
-        max_buy_prob=float(os.environ.get("MAX_BUY_PROB", "0.85")),  # Don't buy above 85%
-        min_sell_prob=float(os.environ.get("MIN_SELL_PROB", "0.15")),  # Don't sell below 15%
+        max_buy_prob=float(os.environ.get("MAX_BUY_PROB", "0.95")),  # Don't buy above 95%
+        min_sell_prob=float(os.environ.get("MIN_SELL_PROB", "0.05")),  # Don't sell below 5%
         # Risk management parameters
         max_daily_loss=float(os.environ.get("MAX_DAILY_LOSS", "100.0")),  # $100 max daily loss
         max_game_exposure=float(os.environ.get("MAX_GAME_EXPOSURE", "50.0")),  # $50 max per game
@@ -1249,6 +1359,9 @@ async def main():
         default_stop_loss_pct=float(os.environ.get("DEFAULT_STOP_LOSS_PCT", "5.0")),  # Fallback stop-loss
         exit_check_interval=float(os.environ.get("EXIT_CHECK_INTERVAL", "1.0")),  # Check every 1 second
         sport_stop_loss=sport_stop_loss,
+        # Cooldown parameters (prevent rapid re-entry on same game)
+        win_cooldown_seconds=float(os.environ.get("WIN_COOLDOWN_SECONDS", "180.0")),  # 3 min after win
+        loss_cooldown_seconds=float(os.environ.get("LOSS_COOLDOWN_SECONDS", "300.0")),  # 5 min after loss
     )
 
     await manager.start()

@@ -242,6 +242,11 @@ function GameCard({ game, onSubscribe, isTracked, isPinned, onTogglePin }: { gam
               ) : (
                 <span className="text-xs text-red-400 font-semibold animate-pulse">● LIVE</span>
               )}
+              {game.cooldown_until && new Date(game.cooldown_until) > new Date() && (
+                <span className="text-[10px] bg-blue-900/50 text-blue-300 border border-blue-700/50 px-1.5 py-0.5 rounded flex items-center gap-1">
+                  ❄️ {Math.ceil((new Date(game.cooldown_until).getTime() - Date.now()) / 60000)}m
+                </span>
+              )}
             </div>
             {state?.timestamp && (
               <span className="text-[10px] text-gray-500 mt-1 ml-1" title={`Updated: ${new Date(state.timestamp).toLocaleTimeString()}`}>
@@ -338,6 +343,7 @@ function GameCard({ game, onSubscribe, isTracked, isPinned, onTogglePin }: { gam
               awayTeam={game.away_team}
               title="Win Probability"
               trades={trades || []}
+              cooldownUntil={game.cooldown_until}
             />
           </div>
         </div>

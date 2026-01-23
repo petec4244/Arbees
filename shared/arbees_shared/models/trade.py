@@ -260,12 +260,20 @@ class PerformanceStats(BaseModel):
 
 
 class Bankroll(BaseModel):
-    """Track bankroll state."""
+    """Track bankroll state.
+
+    The piggybank system:
+    - When a trade wins, 50% of profit goes to piggybank (protected savings)
+    - The other 50% goes back into current_balance for future trading
+    - Piggybank funds are NOT used for position sizing
+    - This prevents runaway compounding while still allowing some growth
+    """
     model_config = ConfigDict(frozen=True)
 
     initial_balance: float = Field(gt=0)
     current_balance: float = Field(ge=0)
     reserved_balance: float = Field(ge=0, default=0.0)  # Funds in open positions
+    piggybank_balance: float = Field(ge=0, default=0.0)  # Protected savings (50% of profits)
     peak_balance: float = Field(ge=0)
     trough_balance: float = Field(ge=0)
     last_updated: datetime = Field(default_factory=datetime.utcnow)
@@ -273,19 +281,25 @@ class Bankroll(BaseModel):
     @computed_field
     @property
     def available_balance(self) -> float:
-        """Balance available for new trades."""
+        """Balance available for new trades (excludes piggybank)."""
         return self.current_balance - self.reserved_balance
 
     @computed_field
     @property
+    def total_balance(self) -> float:
+        """Total balance including piggybank."""
+        return self.current_balance + self.piggybank_balance
+
+    @computed_field
+    @property
     def total_pnl(self) -> float:
-        """Total profit/loss from initial."""
-        return self.current_balance - self.initial_balance
+        """Total profit/loss from initial (includes piggybank)."""
+        return self.total_balance - self.initial_balance
 
     @computed_field
     @property
     def total_pnl_pct(self) -> float:
-        """Total PnL as percentage."""
+        """Total PnL as percentage (includes piggybank)."""
         return (self.total_pnl / self.initial_balance) * 100
 
     @computed_field

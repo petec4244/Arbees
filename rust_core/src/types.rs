@@ -25,13 +25,14 @@ impl Sport {
     #[getter]
     pub fn total_seconds(&self) -> u32 {
         match self {
-            Sport::NFL | Sport::NCAAF => 3600,      // 60 min
-            Sport::NBA | Sport::NCAAB => 2880,      // 48 min (NBA) / 40 min (NCAAB)
-            Sport::NHL => 3600,                      // 60 min
-            Sport::MLB => 10800,                     // ~3 hours avg
-            Sport::MLS | Sport::Soccer => 5400,     // 90 min
+            Sport::NFL | Sport::NCAAF => 3600,      // 60 min (4 x 15 min quarters)
+            Sport::NBA => 2880,                      // 48 min (4 x 12 min quarters)
+            Sport::NCAAB => 2400,                    // 40 min (2 x 20 min halves)
+            Sport::NHL => 3600,                      // 60 min (3 x 20 min periods)
+            Sport::MLB => 10800,                     // ~3 hours avg (9 innings)
+            Sport::MLS | Sport::Soccer => 5400,     // 90 min (2 x 45 min halves)
             Sport::Tennis => 7200,                   // ~2 hours avg
-            Sport::MMA => 1500,                      // 25 min (5 rounds)
+            Sport::MMA => 1500,                      // 25 min (5 x 5 min rounds)
         }
     }
 
@@ -39,12 +40,14 @@ impl Sport {
     #[getter]
     pub fn periods(&self) -> u8 {
         match self {
-            Sport::NFL | Sport::NCAAF | Sport::NBA | Sport::NCAAB => 4,
-            Sport::NHL => 3,
-            Sport::MLB => 9,
-            Sport::MLS | Sport::Soccer => 2,
-            Sport::Tennis => 3,  // Best of 3 or 5
-            Sport::MMA => 5,     // Max rounds
+            Sport::NFL | Sport::NCAAF => 4,          // 4 quarters
+            Sport::NBA => 4,                          // 4 quarters
+            Sport::NCAAB => 2,                        // 2 halves
+            Sport::NHL => 3,                          // 3 periods
+            Sport::MLB => 9,                          // 9 innings
+            Sport::MLS | Sport::Soccer => 2,         // 2 halves
+            Sport::Tennis => 3,                       // Best of 3 or 5 sets
+            Sport::MMA => 5,                          // Max 5 rounds
         }
     }
 }
@@ -125,17 +128,11 @@ impl GameState {
 
     /// Get total seconds remaining in regulation
     pub fn total_time_remaining(&self) -> u32 {
-        let periods_remaining = match self.sport {
-            Sport::NFL | Sport::NCAAF | Sport::NBA | Sport::NCAAB => {
-                4u32.saturating_sub(self.period as u32)
-            }
-            Sport::NHL => 3u32.saturating_sub(self.period as u32),
-            Sport::MLB => 9u32.saturating_sub(self.period as u32),
-            Sport::MLS | Sport::Soccer => 2u32.saturating_sub(self.period as u32),
-            Sport::Tennis | Sport::MMA => 0,
-        };
+        // Use the sport's periods() method for correct period count per sport
+        let total_periods = self.sport.periods() as u32;
+        let periods_remaining = total_periods.saturating_sub(self.period as u32);
 
-        let period_length = self.sport.total_seconds() / self.sport.periods() as u32;
+        let period_length = self.sport.total_seconds() / total_periods;
         self.time_remaining_seconds + (periods_remaining * period_length)
     }
 

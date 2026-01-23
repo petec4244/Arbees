@@ -282,6 +282,29 @@ class PaperTradingEngine(BaseMarketClient):
             logger.info(f"Signal rejected: position size too small (${size:.2f}) - model_prob={signal.model_prob:.3f}, edge={signal.edge_pct:.1f}%")
             return None
 
+        # region agent log
+        _agent_dbg(
+            "H7",
+            "markets/paper/engine.py:execute_signal",
+            "depth_and_fee_snapshot",
+            {
+                "signal_id": signal.signal_id,
+                "game_id": signal.game_id,
+                "market_id": market_price.market_id,
+                "platform": market_price.platform.value,
+                "side": side.value,
+                "size": float(size),
+                "exec_price": float(exec_price),
+                "yes_bid": float(market_price.yes_bid),
+                "yes_ask": float(market_price.yes_ask),
+                "yes_bid_size": float(getattr(market_price, "yes_bid_size", 0.0) or 0.0),
+                "yes_ask_size": float(getattr(market_price, "yes_ask_size", 0.0) or 0.0),
+                "entry_fees": 0.0,
+                "exit_fees": 0.0,
+            },
+        )
+        # endregion
+
         # Check available balance
         cost = size * exec_price if side == TradeSide.BUY else size * (1.0 - exec_price)
         if cost > self.available_balance:
@@ -349,6 +372,8 @@ class PaperTradingEngine(BaseMarketClient):
         trade: PaperTrade,
         exit_price: float,
         outcome: Optional[TradeOutcome] = None,
+        is_game_settlement: bool = False,
+        already_executable: bool = False,
     ) -> PaperTrade:
         """
         Close an open trade.
@@ -357,13 +382,20 @@ class PaperTradingEngine(BaseMarketClient):
             trade: Trade to close
             exit_price: Exit price
             outcome: Trade outcome (win/loss/push)
+            is_game_settlement: If True, skip slippage (game ended at known price)
+            already_executable: If True, caller provided an executable price (bid/ask as appropriate),
+                               so do not apply additional slippage here.
 
         Returns:
             Updated trade with PnL
         """
-        # Apply slippage to exit
-        side = TradeSide.SELL if trade.side == TradeSide.BUY else TradeSide.BUY
-        exec_price = self.apply_slippage(exit_price, side)
+        # Apply slippage only for early exits, NOT for game-end settlements.
+        # If the caller already provided an executable price (bid/ask), don't apply extra slippage.
+        if is_game_settlement or already_executable:
+            exec_price = exit_price
+        else:
+            side = TradeSide.SELL if trade.side == TradeSide.BUY else TradeSide.BUY
+            exec_price = self.apply_slippage(exit_price, side)
 
         # Determine outcome if not provided
         if outcome is None:
@@ -407,6 +439,26 @@ class PaperTradingEngine(BaseMarketClient):
         # Update bankroll
         self._update_bankroll_for_exit(closed_trade)
 
+        # region agent log
+        _agent_dbg(
+            "H7",
+            "markets/paper/engine.py:close_trade",
+            "close_trade_fees_and_pnl",
+            {
+                "trade_id": closed_trade.trade_id,
+                "game_id": closed_trade.game_id,
+                "side": closed_trade.side.value,
+                "entry_price": float(closed_trade.entry_price),
+                "exit_price": float(exec_price),
+                "pnl": float(closed_trade.pnl or 0.0),
+                "entry_fees": float(closed_trade.entry_fees or 0.0),
+                "exit_fees": float(closed_trade.exit_fees or 0.0),
+                "is_game_settlement": is_game_settlement,
+                "already_executable": already_executable,
+            },
+        )
+        # endregion
+
         # Update trade in list
         for i, t in enumerate(self._trades):
             if t.trade_id == trade.trade_id:
@@ -441,25 +493,55 @@ class PaperTradingEngine(BaseMarketClient):
             initial_balance=self._bankroll.initial_balance,
             current_balance=self._bankroll.current_balance,
             reserved_balance=self._bankroll.reserved_balance + cost,
+            piggybank_balance=self._bankroll.piggybank_balance,  # Preserve piggybank
             peak_balance=self._bankroll.peak_balance,
             trough_balance=self._bankroll.trough_balance,
         )
         self._bankroll = new_bankroll
 
     def _update_bankroll_for_exit(self, trade: PaperTrade) -> None:
-        """Update bankroll when closing a trade."""
+        """Update bankroll when closing a trade.
+
+        Profit split (piggybank system):
+        - On WINNING trades: 50% of profit goes to piggybank (protected)
+        - The other 50% goes back to current_balance for trading
+        - On LOSING trades: Full loss comes from current_balance
+        - Piggybank is never touched for losses
+
+        This prevents runaway compounding while still allowing growth.
+        """
         if trade.pnl is None:
             return
 
         cost = trade.size * trade.entry_price if trade.side == TradeSide.BUY else trade.size * (1.0 - trade.entry_price)
-        new_balance = self._bankroll.current_balance + trade.pnl
+        pnl = trade.pnl
+
+        # Calculate new balances with piggybank split
+        if pnl > 0:
+            # WINNING trade: split profit 50/50
+            profit_to_piggybank = pnl * 0.5
+            profit_to_trading = pnl * 0.5
+            new_current = self._bankroll.current_balance + profit_to_trading
+            new_piggybank = self._bankroll.piggybank_balance + profit_to_piggybank
+            logger.info(
+                f"Profit split: ${pnl:.2f} -> ${profit_to_trading:.2f} to trading, "
+                f"${profit_to_piggybank:.2f} to piggybank"
+            )
+        else:
+            # LOSING trade: full loss from current_balance
+            new_current = self._bankroll.current_balance + pnl  # pnl is negative
+            new_piggybank = self._bankroll.piggybank_balance
+
+        # Calculate total for peak/trough tracking (includes piggybank)
+        total_balance = new_current + new_piggybank
 
         new_bankroll = Bankroll(
             initial_balance=self._bankroll.initial_balance,
-            current_balance=new_balance,
+            current_balance=new_current,
             reserved_balance=max(0, self._bankroll.reserved_balance - cost),
-            peak_balance=max(self._bankroll.peak_balance, new_balance),
-            trough_balance=min(self._bankroll.trough_balance, new_balance),
+            piggybank_balance=new_piggybank,
+            peak_balance=max(self._bankroll.peak_balance, total_balance),
+            trough_balance=min(self._bankroll.trough_balance, total_balance),
         )
         self._bankroll = new_bankroll
 

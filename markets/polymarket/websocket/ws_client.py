@@ -404,6 +404,19 @@ class PolymarketWebSocketClient:
             yes_bid = max((p for p, _ in bid_levels), default=0.0)
             yes_ask = min((p for p, _ in ask_levels), default=1.0)
 
+            # Get depth (size at best price)
+            yes_bid_size = 0.0
+            for p, s in bid_levels:
+                if p == yes_bid:
+                    yes_bid_size += s
+                    # Don't break; CLOB might have multiple orders at same price? 
+                    # Usually returned as aggregated levels, but safer to sum
+            
+            yes_ask_size = 0.0
+            for p, s in ask_levels:
+                if p == yes_ask:
+                    yes_ask_size += s
+
             # Calculate liquidity (sum of bid sizes)
             liquidity = sum((s for _, s in bid_levels), 0.0)
             
@@ -418,6 +431,8 @@ class PolymarketWebSocketClient:
                 market_title=title,
                 yes_bid=yes_bid,
                 yes_ask=yes_ask,
+                yes_bid_size=yes_bid_size,
+                yes_ask_size=yes_ask_size,
                 volume=0.0,  # Not in orderbook updates
                 liquidity=liquidity,
                 game_id=game_id,

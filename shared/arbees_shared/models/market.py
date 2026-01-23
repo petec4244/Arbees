@@ -114,6 +114,10 @@ class MarketPrice(BaseModel):
     # Prices (0.0 to 1.0)
     yes_bid: float = Field(ge=0.0, le=1.0)
     yes_ask: float = Field(ge=0.0, le=1.0)
+    
+    # Depth (size at top of book)
+    yes_bid_size: float = Field(ge=0.0, default=0.0)
+    yes_ask_size: float = Field(ge=0.0, default=0.0)
 
     # Market metrics
     volume: float = Field(ge=0.0, default=0.0)

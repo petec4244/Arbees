@@ -466,7 +466,10 @@ class Orchestrator:
                 "away_team": away_team,
             }
             await self.redis.publish("games:ended", game_ended_event)
-            logger.info(f"Published game ended event for {game_id}: {home_team} {home_score} - {away_score} {away_team}")
+            logger.info(
+                f"GAME_ENDED | game_id={game_id} | "
+                f"{home_team} {home_score} - {away_score} {away_team}"
+            )
 
         # Update tracking
         if shard:

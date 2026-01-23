@@ -171,6 +171,7 @@ class GameStateResponse(BaseModel):
     time_remaining: str
     status: str
     home_win_prob: Optional[float]
+    cooldown_until: Optional[datetime] = None
 
 
 class GameHistoryPoint(BaseModel):
@@ -270,6 +271,7 @@ class RiskMetricsResponse(BaseModel):
     avg_latency_ms: float
     p95_latency_ms: float
     latency_status: str
+    piggybank_balance: float = 0.0
 
 
 # =============================================================================
@@ -355,7 +357,7 @@ async def get_live_games(
         SELECT DISTINCT ON (gs.game_id)
             gs.game_id, gs.sport, gs.home_score, gs.away_score, gs.period,
             gs.time_remaining, gs.status, gs.possession, gs.home_win_prob,
-            gs.time as last_update,
+            gs.time as last_update, g.cooldown_until,
             COALESCE(NULLIF(g.home_team, ''), 'Home ' || gs.game_id) as home_team,
             COALESCE(NULLIF(g.away_team, ''), 'Away ' || gs.game_id) as away_team,
             g.home_team_abbrev, g.away_team_abbrev
@@ -716,9 +718,14 @@ async def get_paper_trading_status():
         else:
             reserved_balance += float(pos["size"]) * (1.0 - float(pos["entry_price"]))
 
-    bankroll_dict = dict(bankroll) if bankroll else {"initial_balance": 1000, "current_balance": 1000}
+    bankroll_dict = dict(bankroll) if bankroll else {"initial_balance": 1000, "current_balance": 1000, "piggybank_balance": 0}
     bankroll_dict["reserved_balance"] = reserved_balance
     bankroll_dict["available_balance"] = float(bankroll_dict.get("current_balance", 1000)) - reserved_balance
+    # Ensure piggybank_balance is included
+    if "piggybank_balance" not in bankroll_dict:
+        bankroll_dict["piggybank_balance"] = 0.0
+    # Calculate total balance (trading + piggybank)
+    bankroll_dict["total_balance"] = float(bankroll_dict.get("current_balance", 0)) + float(bankroll_dict.get("piggybank_balance", 0))
 
     return {
         "stats": stats,
@@ -953,9 +960,13 @@ async def get_risk_metrics():
         SELECT COALESCE(SUM(pnl), 0) as daily_pnl
         FROM paper_trades
         WHERE status = 'closed'
-          AND DATE(exit_time) = CURRENT_DATE
+        AND DATE(exit_time) = CURRENT_DATE
     """)
     daily_pnl = float(today_pnl_row["daily_pnl"]) if today_pnl_row else 0.0
+
+    # Get bankroll info (piggybank)
+    bankroll_row = await pool.fetchrow("SELECT piggybank_balance FROM bankroll WHERE account_name = 'default'")
+    piggybank_balance = float(bankroll_row["piggybank_balance"]) if bankroll_row and bankroll_row["piggybank_balance"] else 0.0
 
     # Risk limits (configurable, using defaults for now)
     daily_limit = 100.0  # $100 daily loss limit
@@ -1047,6 +1058,7 @@ async def get_risk_metrics():
         avg_latency_ms=avg_latency,
         p95_latency_ms=p95_latency,
         latency_status=latency_status,
+        piggybank_balance=piggybank_balance,
     )
 
 
@@ -1193,6 +1205,853 @@ async def get_latency_metrics(
 
     rows = await pool.fetch(query, *params)
     return [dict(row) for row in rows]
+
+
+# =============================================================================
+# Historical Games Endpoints
+# =============================================================================
+
+class ArchivedGameResponse(BaseModel):
+    """Response model for archived games."""
+    archive_id: int
+    game_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    final_home_score: int
+    final_away_score: int
+    ended_at: datetime
+    archived_at: datetime
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    total_pnl: float
+    win_rate: float
+    capture_rate: float
+
+
+class ArchivedTradeResponse(BaseModel):
+    """Response model for archived trades."""
+    trade_id: str
+    signal_type: Optional[str]
+    platform: str
+    market_type: Optional[str]
+    side: str
+    entry_price: float
+    exit_price: Optional[float]
+    size: float
+    opened_at: datetime
+    closed_at: Optional[datetime]
+    outcome: Optional[str]
+    pnl: Optional[float]
+    edge_at_entry: Optional[float]
+
+
+class ArchivedSignalResponse(BaseModel):
+    """Response model for archived signals."""
+    signal_id: str
+    signal_type: str
+    direction: str
+    team: Optional[str]
+    model_prob: Optional[float]
+    market_prob: Optional[float]
+    edge_pct: float
+    generated_at: datetime
+    was_executed: bool
+
+
+class ArchivedGameDetailResponse(ArchivedGameResponse):
+    """Detailed response including trades and signals."""
+    trades: list[ArchivedTradeResponse]
+    signals: list[ArchivedSignalResponse]
+
+
+class HistoricalSummaryResponse(BaseModel):
+    """Summary statistics for historical games."""
+    total_games: int
+    total_trades: int
+    total_pnl: float
+    overall_win_rate: float
+    total_wins: int
+    total_losses: int
+
+
+class HistoricalGamesListResponse(BaseModel):
+    """Paginated list of historical games."""
+    games: list[ArchivedGameResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+@app.get("/api/historical/games", response_model=HistoricalGamesListResponse)
+async def get_historical_games(
+    sport: Optional[str] = Query(None, description="Filter by sport"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    outcome: Optional[str] = Query(None, description="Filter: profitable, loss, breakeven"),
+    sort_by: str = Query("ended_at", description="Sort by: ended_at, total_pnl, win_rate"),
+    sort_order: str = Query("desc", description="Sort order: asc, desc"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+):
+    """Get archived games with filters and pagination."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    # Build query
+    base_query = """
+        SELECT
+            archive_id, game_id, sport, home_team, away_team,
+            final_home_score, final_away_score, ended_at, archived_at,
+            total_trades, winning_trades, losing_trades, total_pnl,
+            total_signals_generated, total_signals_executed,
+            CASE WHEN total_trades > 0 THEN winning_trades::float / total_trades ELSE 0 END as win_rate,
+            CASE WHEN total_signals_generated > 0 THEN total_signals_executed::float / total_signals_generated ELSE 0 END as capture_rate
+        FROM archived_games
+        WHERE 1=1
+    """
+    params = []
+    param_idx = 1
+
+    if sport:
+        base_query += f" AND LOWER(sport) = ${param_idx}"
+        params.append(sport.lower())
+        param_idx += 1
+
+    if from_date:
+        base_query += f" AND ended_at >= ${param_idx}::date"
+        params.append(from_date)
+        param_idx += 1
+
+    if to_date:
+        base_query += f" AND ended_at <= ${param_idx}::date + INTERVAL '1 day'"
+        params.append(to_date)
+        param_idx += 1
+
+    if outcome == "profitable":
+        base_query += " AND total_pnl > 0"
+    elif outcome == "loss":
+        base_query += " AND total_pnl < 0"
+    elif outcome == "breakeven":
+        base_query += " AND total_pnl = 0"
+
+    # Count total
+    count_query = f"SELECT COUNT(*) FROM ({base_query}) sq"
+    total = await pool.fetchval(count_query, *params)
+
+    # Validate sort column
+    valid_sort_columns = {"ended_at", "total_pnl", "win_rate", "total_trades"}
+    if sort_by not in valid_sort_columns:
+        sort_by = "ended_at"
+    sort_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+
+    # Add sorting and pagination
+    base_query += f" ORDER BY {sort_by} {sort_dir}"
+    base_query += f" LIMIT ${param_idx} OFFSET ${param_idx + 1}"
+    params.extend([page_size, (page - 1) * page_size])
+
+    rows = await pool.fetch(base_query, *params)
+
+    games = [
+        ArchivedGameResponse(
+            archive_id=row["archive_id"],
+            game_id=row["game_id"],
+            sport=row["sport"],
+            home_team=row["home_team"],
+            away_team=row["away_team"],
+            final_home_score=row["final_home_score"],
+            final_away_score=row["final_away_score"],
+            ended_at=row["ended_at"],
+            archived_at=row["archived_at"],
+            total_trades=row["total_trades"],
+            winning_trades=row["winning_trades"],
+            losing_trades=row["losing_trades"],
+            total_pnl=float(row["total_pnl"] or 0),
+            win_rate=float(row["win_rate"] or 0),
+            capture_rate=float(row["capture_rate"] or 0),
+        )
+        for row in rows
+    ]
+
+    return HistoricalGamesListResponse(
+        games=games,
+        total=total or 0,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/historical/games/{game_id}", response_model=ArchivedGameDetailResponse)
+async def get_historical_game_detail(game_id: str):
+    """Get detailed view of an archived game including trades and signals."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    # Get game
+    game_row = await pool.fetchrow("""
+        SELECT
+            archive_id, game_id, sport, home_team, away_team,
+            final_home_score, final_away_score, ended_at, archived_at,
+            total_trades, winning_trades, losing_trades, total_pnl,
+            total_signals_generated, total_signals_executed,
+            CASE WHEN total_trades > 0 THEN winning_trades::float / total_trades ELSE 0 END as win_rate,
+            CASE WHEN total_signals_generated > 0 THEN total_signals_executed::float / total_signals_generated ELSE 0 END as capture_rate
+        FROM archived_games
+        WHERE game_id = $1
+    """, game_id)
+
+    if not game_row:
+        raise HTTPException(status_code=404, detail="Game not found in archives")
+
+    # Get trades
+    trade_rows = await pool.fetch("""
+        SELECT
+            trade_id, signal_type, platform, market_type, side,
+            entry_price, exit_price, size, opened_at, closed_at,
+            outcome, pnl, edge_at_entry
+        FROM archived_trades
+        WHERE game_id = $1
+        ORDER BY opened_at ASC
+    """, game_id)
+
+    trades = [
+        ArchivedTradeResponse(
+            trade_id=row["trade_id"],
+            signal_type=row["signal_type"],
+            platform=row["platform"],
+            market_type=row["market_type"],
+            side=row["side"],
+            entry_price=float(row["entry_price"]),
+            exit_price=float(row["exit_price"]) if row["exit_price"] else None,
+            size=float(row["size"]),
+            opened_at=row["opened_at"],
+            closed_at=row["closed_at"],
+            outcome=row["outcome"],
+            pnl=float(row["pnl"]) if row["pnl"] else None,
+            edge_at_entry=float(row["edge_at_entry"]) if row["edge_at_entry"] else None,
+        )
+        for row in trade_rows
+    ]
+
+    # Get signals
+    signal_rows = await pool.fetch("""
+        SELECT
+            signal_id, signal_type, direction, team,
+            model_prob, market_prob, edge_pct, generated_at, was_executed
+        FROM archived_signals
+        WHERE game_id = $1
+        ORDER BY generated_at ASC
+    """, game_id)
+
+    signals = [
+        ArchivedSignalResponse(
+            signal_id=row["signal_id"],
+            signal_type=row["signal_type"],
+            direction=row["direction"],
+            team=row["team"],
+            model_prob=float(row["model_prob"]) if row["model_prob"] else None,
+            market_prob=float(row["market_prob"]) if row["market_prob"] else None,
+            edge_pct=float(row["edge_pct"]),
+            generated_at=row["generated_at"],
+            was_executed=row["was_executed"],
+        )
+        for row in signal_rows
+    ]
+
+    return ArchivedGameDetailResponse(
+        archive_id=game_row["archive_id"],
+        game_id=game_row["game_id"],
+        sport=game_row["sport"],
+        home_team=game_row["home_team"],
+        away_team=game_row["away_team"],
+        final_home_score=game_row["final_home_score"],
+        final_away_score=game_row["final_away_score"],
+        ended_at=game_row["ended_at"],
+        archived_at=game_row["archived_at"],
+        total_trades=game_row["total_trades"],
+        winning_trades=game_row["winning_trades"],
+        losing_trades=game_row["losing_trades"],
+        total_pnl=float(game_row["total_pnl"] or 0),
+        win_rate=float(game_row["win_rate"] or 0),
+        capture_rate=float(game_row["capture_rate"] or 0),
+        trades=trades,
+        signals=signals,
+    )
+
+
+@app.get("/api/historical/summary", response_model=HistoricalSummaryResponse)
+async def get_historical_summary(
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+):
+    """Get aggregate statistics for historical games."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    query = """
+        SELECT
+            COUNT(*) as total_games,
+            COALESCE(SUM(total_trades), 0) as total_trades,
+            COALESCE(SUM(total_pnl), 0) as total_pnl,
+            COALESCE(SUM(winning_trades), 0) as total_wins,
+            COALESCE(SUM(losing_trades), 0) as total_losses
+        FROM archived_games
+        WHERE 1=1
+    """
+    params = []
+    param_idx = 1
+
+    if from_date:
+        query += f" AND ended_at >= ${param_idx}::date"
+        params.append(from_date)
+        param_idx += 1
+
+    if to_date:
+        query += f" AND ended_at <= ${param_idx}::date + INTERVAL '1 day'"
+        params.append(to_date)
+        param_idx += 1
+
+    row = await pool.fetchrow(query, *params)
+
+    total_trades = int(row["total_trades"] or 0)
+    total_wins = int(row["total_wins"] or 0)
+
+    return HistoricalSummaryResponse(
+        total_games=int(row["total_games"] or 0),
+        total_trades=total_trades,
+        total_pnl=float(row["total_pnl"] or 0),
+        overall_win_rate=(total_wins / total_trades) if total_trades > 0 else 0,
+        total_wins=total_wins,
+        total_losses=int(row["total_losses"] or 0),
+    )
+
+
+@app.get("/api/historical/by-sport")
+async def get_historical_by_sport(
+    days: int = Query(30, ge=1, le=365, description="Days to look back"),
+):
+    """Get historical performance breakdown by sport."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    rows = await pool.fetch("""
+        SELECT
+            sport,
+            COUNT(*) as games,
+            SUM(total_trades) as trades,
+            SUM(winning_trades) as wins,
+            SUM(losing_trades) as losses,
+            SUM(total_pnl) as pnl,
+            AVG(CASE WHEN total_trades > 0 THEN winning_trades::float / total_trades ELSE 0 END) as avg_win_rate
+        FROM archived_games
+        WHERE ended_at > NOW() - INTERVAL '%s days'
+        GROUP BY sport
+        ORDER BY pnl DESC
+    """ % days)
+
+    return [
+        {
+            "sport": row["sport"],
+            "games": row["games"],
+            "trades": int(row["trades"] or 0),
+            "wins": int(row["wins"] or 0),
+            "losses": int(row["losses"] or 0),
+            "pnl": float(row["pnl"] or 0),
+            "win_rate": float(row["avg_win_rate"] or 0),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/historical/daily-summary")
+async def get_historical_daily_summary(
+    days: int = Query(30, ge=1, le=365, description="Days to look back"),
+):
+    """Get daily P&L summary for trend charts."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    rows = await pool.fetch("""
+        SELECT
+            DATE(ended_at) as game_date,
+            COUNT(*) as games,
+            SUM(total_trades) as trades,
+            SUM(winning_trades) as wins,
+            SUM(total_pnl) as pnl
+        FROM archived_games
+        WHERE ended_at > NOW() - INTERVAL '%s days'
+        GROUP BY DATE(ended_at)
+        ORDER BY game_date ASC
+    """ % days)
+
+    return [
+        {
+            "date": row["game_date"].isoformat(),
+            "games": row["games"],
+            "trades": int(row["trades"] or 0),
+            "wins": int(row["wins"] or 0),
+            "pnl": float(row["pnl"] or 0),
+            "win_rate": (int(row["wins"] or 0) / int(row["trades"])) if row["trades"] else 0,
+        }
+        for row in rows
+    ]
+
+
+# =============================================================================
+# ML Insights Endpoints
+# =============================================================================
+
+class MLReportSummaryResponse(BaseModel):
+    """Summary of an ML analysis report."""
+    report_date: str
+    generated_at: datetime
+    total_trades: int
+    total_pnl: float
+    win_rate: float
+    best_sport: Optional[str]
+    worst_sport: Optional[str]
+    model_accuracy: Optional[float]
+    recommendations_count: int
+
+
+class MLReportDetailResponse(BaseModel):
+    """Detailed ML analysis report."""
+    report_date: str
+    generated_at: datetime
+    total_games: int
+    total_trades: int
+    total_pnl: float
+    win_rate: float
+    best_sport: Optional[str]
+    best_sport_win_rate: Optional[float]
+    worst_sport: Optional[str]
+    worst_sport_win_rate: Optional[float]
+    signals_generated: int
+    signals_executed: int
+    missed_opportunity_reasons: dict
+    recommendations: list[dict]
+    model_accuracy: Optional[float]
+    feature_importance: dict
+    report_markdown: Optional[str]
+
+
+class MLModelInfoResponse(BaseModel):
+    """Information about the ML model."""
+    model_exists: bool
+    trained_at: Optional[datetime]
+    training_samples: int
+    accuracy: Optional[float]
+    top_features: list[tuple[str, float]]
+    last_retrain_days_ago: Optional[int]
+    next_retrain_days: Optional[int]
+
+
+class MLHistoricalInsightsResponse(BaseModel):
+    """Historical ML insights over a period."""
+    period_days: int
+    total_trades: int
+    total_wins: int
+    total_pnl: float
+    win_rate: float
+    by_sport: dict
+    by_signal_type: dict
+    by_edge_range: dict
+
+
+@app.get("/api/ml/reports", response_model=list[MLReportSummaryResponse])
+async def get_ml_reports(
+    limit: int = Query(30, ge=1, le=365, description="Number of reports to return"),
+):
+    """Get list of ML analysis reports."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    rows = await pool.fetch("""
+        SELECT
+            report_date,
+            generated_at,
+            total_trades,
+            total_pnl,
+            win_rate,
+            best_sport,
+            worst_sport,
+            model_accuracy,
+            jsonb_array_length(COALESCE(recommendations, '[]'::jsonb)) as recommendations_count
+        FROM ml_analysis_reports
+        ORDER BY report_date DESC
+        LIMIT $1
+    """, limit)
+
+    return [
+        MLReportSummaryResponse(
+            report_date=row["report_date"].isoformat(),
+            generated_at=row["generated_at"],
+            total_trades=row["total_trades"] or 0,
+            total_pnl=float(row["total_pnl"] or 0),
+            win_rate=float(row["win_rate"] or 0),
+            best_sport=row["best_sport"],
+            worst_sport=row["worst_sport"],
+            model_accuracy=float(row["model_accuracy"]) if row["model_accuracy"] else None,
+            recommendations_count=row["recommendations_count"] or 0,
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/ml/reports/{report_date}", response_model=MLReportDetailResponse)
+async def get_ml_report_detail(report_date: str):
+    """Get detailed ML analysis report for a specific date."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    row = await pool.fetchrow("""
+        SELECT *
+        FROM ml_analysis_reports
+        WHERE report_date = $1::date
+    """, report_date)
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No report found for {report_date}")
+
+    return MLReportDetailResponse(
+        report_date=row["report_date"].isoformat(),
+        generated_at=row["generated_at"],
+        total_games=row["total_games"] or 0,
+        total_trades=row["total_trades"] or 0,
+        total_pnl=float(row["total_pnl"] or 0),
+        win_rate=float(row["win_rate"] or 0),
+        best_sport=row["best_sport"],
+        best_sport_win_rate=float(row["best_sport_win_rate"]) if row["best_sport_win_rate"] else None,
+        worst_sport=row["worst_sport"],
+        worst_sport_win_rate=float(row["worst_sport_win_rate"]) if row["worst_sport_win_rate"] else None,
+        signals_generated=row["signals_generated"] or 0,
+        signals_executed=row["signals_executed"] or 0,
+        missed_opportunity_reasons=row["missed_opportunity_reasons"] or {},
+        recommendations=row["recommendations"] or [],
+        model_accuracy=float(row["model_accuracy"]) if row["model_accuracy"] else None,
+        feature_importance=row["feature_importance"] or {},
+        report_markdown=row["report_markdown"],
+    )
+
+
+@app.get("/api/ml/reports/latest", response_model=MLReportDetailResponse)
+async def get_latest_ml_report():
+    """Get the most recent ML analysis report."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    row = await pool.fetchrow("""
+        SELECT *
+        FROM ml_analysis_reports
+        ORDER BY report_date DESC
+        LIMIT 1
+    """)
+
+    if not row:
+        raise HTTPException(status_code=404, detail="No ML reports found")
+
+    return MLReportDetailResponse(
+        report_date=row["report_date"].isoformat(),
+        generated_at=row["generated_at"],
+        total_games=row["total_games"] or 0,
+        total_trades=row["total_trades"] or 0,
+        total_pnl=float(row["total_pnl"] or 0),
+        win_rate=float(row["win_rate"] or 0),
+        best_sport=row["best_sport"],
+        best_sport_win_rate=float(row["best_sport_win_rate"]) if row["best_sport_win_rate"] else None,
+        worst_sport=row["worst_sport"],
+        worst_sport_win_rate=float(row["worst_sport_win_rate"]) if row["worst_sport_win_rate"] else None,
+        signals_generated=row["signals_generated"] or 0,
+        signals_executed=row["signals_executed"] or 0,
+        missed_opportunity_reasons=row["missed_opportunity_reasons"] or {},
+        recommendations=row["recommendations"] or [],
+        model_accuracy=float(row["model_accuracy"]) if row["model_accuracy"] else None,
+        feature_importance=row["feature_importance"] or {},
+        report_markdown=row["report_markdown"],
+    )
+
+
+@app.get("/api/ml/insights", response_model=MLHistoricalInsightsResponse)
+async def get_ml_insights(
+    days: int = Query(30, ge=1, le=365, description="Days to analyze"),
+):
+    """Get aggregated ML insights over a time period."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    # Get performance by sport from paper_trades
+    sport_rows = await pool.fetch("""
+        SELECT
+            sport,
+            COUNT(*) as trades,
+            COUNT(*) FILTER (WHERE outcome = 'win') as wins,
+            SUM(COALESCE(pnl, 0)) as pnl
+        FROM paper_trades
+        WHERE status = 'closed'
+          AND exit_time >= NOW() - INTERVAL '%s days'
+        GROUP BY sport
+    """ % days)
+
+    by_sport = {}
+    for row in sport_rows:
+        sport = row["sport"] or "unknown"
+        trades = int(row["trades"])
+        wins = int(row["wins"])
+        by_sport[sport] = {
+            "trades": trades,
+            "wins": wins,
+            "pnl": float(row["pnl"] or 0),
+            "win_rate": (wins / trades) if trades > 0 else 0,
+        }
+
+    # Get performance by signal type
+    signal_rows = await pool.fetch("""
+        SELECT
+            signal_type,
+            COUNT(*) as trades,
+            COUNT(*) FILTER (WHERE outcome = 'win') as wins,
+            SUM(COALESCE(pnl, 0)) as pnl
+        FROM paper_trades
+        WHERE status = 'closed'
+          AND exit_time >= NOW() - INTERVAL '%s days'
+        GROUP BY signal_type
+    """ % days)
+
+    by_signal_type = {}
+    for row in signal_rows:
+        sig_type = row["signal_type"] or "unknown"
+        trades = int(row["trades"])
+        wins = int(row["wins"])
+        by_signal_type[sig_type] = {
+            "trades": trades,
+            "wins": wins,
+            "pnl": float(row["pnl"] or 0),
+            "win_rate": (wins / trades) if trades > 0 else 0,
+        }
+
+    # Get performance by edge range
+    edge_rows = await pool.fetch("""
+        SELECT
+            CASE
+                WHEN edge_at_entry < 1 THEN '0-1%%'
+                WHEN edge_at_entry < 2 THEN '1-2%%'
+                WHEN edge_at_entry < 3 THEN '2-3%%'
+                WHEN edge_at_entry < 5 THEN '3-5%%'
+                ELSE '5%%+'
+            END as edge_range,
+            COUNT(*) as trades,
+            COUNT(*) FILTER (WHERE outcome = 'win') as wins,
+            SUM(COALESCE(pnl, 0)) as pnl
+        FROM paper_trades
+        WHERE status = 'closed'
+          AND exit_time >= NOW() - INTERVAL '%s days'
+        GROUP BY edge_range
+    """ % days)
+
+    by_edge_range = {}
+    for row in edge_rows:
+        edge_range = row["edge_range"]
+        trades = int(row["trades"])
+        wins = int(row["wins"])
+        by_edge_range[edge_range] = {
+            "trades": trades,
+            "wins": wins,
+            "pnl": float(row["pnl"] or 0),
+            "win_rate": (wins / trades) if trades > 0 else 0,
+        }
+
+    # Calculate totals
+    total_trades = sum(s["trades"] for s in by_sport.values())
+    total_wins = sum(s["wins"] for s in by_sport.values())
+    total_pnl = sum(s["pnl"] for s in by_sport.values())
+
+    return MLHistoricalInsightsResponse(
+        period_days=days,
+        total_trades=total_trades,
+        total_wins=total_wins,
+        total_pnl=total_pnl,
+        win_rate=(total_wins / total_trades) if total_trades > 0 else 0,
+        by_sport=by_sport,
+        by_signal_type=by_signal_type,
+        by_edge_range=by_edge_range,
+    )
+
+
+@app.get("/api/ml/recommendations")
+async def get_ml_recommendations(
+    days: int = Query(7, ge=1, le=30, description="Days to look back for recommendations"),
+):
+    """Get recent parameter optimization recommendations."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    rows = await pool.fetch("""
+        SELECT
+            report_date,
+            recommendations
+        FROM ml_analysis_reports
+        WHERE recommendations IS NOT NULL
+          AND jsonb_array_length(recommendations) > 0
+          AND report_date >= CURRENT_DATE - INTERVAL '%s days'
+        ORDER BY report_date DESC
+    """ % days)
+
+    all_recommendations = []
+    for row in rows:
+        report_date = row["report_date"].isoformat()
+        for rec in (row["recommendations"] or []):
+            all_recommendations.append({
+                "report_date": report_date,
+                **rec,
+            })
+
+    return all_recommendations
+
+
+@app.get("/api/ml/parameter-history")
+async def get_parameter_history(
+    parameter: Optional[str] = Query(None, description="Filter by parameter name"),
+    limit: int = Query(50, ge=1, le=200, description="Number of records to return"),
+):
+    """Get history of parameter changes."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    query = """
+        SELECT
+            parameter_name,
+            old_value,
+            new_value,
+            changed_at,
+            change_reason,
+            triggered_by
+        FROM parameter_history
+    """
+    params = []
+    param_idx = 1
+
+    if parameter:
+        query += f" WHERE parameter_name = ${param_idx}"
+        params.append(parameter)
+        param_idx += 1
+
+    query += f" ORDER BY changed_at DESC LIMIT ${param_idx}"
+    params.append(limit)
+
+    rows = await pool.fetch(query, *params)
+
+    return [
+        {
+            "parameter_name": row["parameter_name"],
+            "old_value": row["old_value"],
+            "new_value": row["new_value"],
+            "changed_at": row["changed_at"].isoformat() if row["changed_at"] else None,
+            "change_reason": row["change_reason"],
+            "triggered_by": row["triggered_by"],
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/ml/feature-importance")
+async def get_feature_importance():
+    """Get current feature importance from the trained model."""
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    # Get most recent report with feature importance
+    row = await pool.fetchrow("""
+        SELECT feature_importance, model_accuracy, generated_at
+        FROM ml_analysis_reports
+        WHERE feature_importance IS NOT NULL
+          AND feature_importance != '{}'::jsonb
+        ORDER BY report_date DESC
+        LIMIT 1
+    """)
+
+    if not row or not row["feature_importance"]:
+        return {
+            "has_model": False,
+            "features": [],
+            "model_accuracy": None,
+            "last_updated": None,
+        }
+
+    # Sort features by importance
+    features = sorted(
+        row["feature_importance"].items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    return {
+        "has_model": True,
+        "features": [{"name": k, "importance": v} for k, v in features],
+        "model_accuracy": float(row["model_accuracy"]) if row["model_accuracy"] else None,
+        "last_updated": row["generated_at"].isoformat() if row["generated_at"] else None,
+    }
+
+
+@app.post("/api/ml/trigger-analysis")
+async def trigger_ml_analysis(
+    for_date: Optional[str] = Query(None, description="Date to analyze (YYYY-MM-DD), defaults to yesterday"),
+):
+    """Trigger an on-demand ML analysis (admin endpoint).
+
+    Note: This is a lightweight trigger. The actual analysis runs asynchronously
+    in the ML Analyzer service. Returns immediately after queuing the request.
+    """
+    if not redis:
+        raise HTTPException(status_code=503, detail="Redis not available")
+
+    from datetime import date as date_type, timedelta
+
+    # Parse date or use yesterday
+    if for_date:
+        try:
+            analysis_date = datetime.strptime(for_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    else:
+        analysis_date = date_type.today() - timedelta(days=1)
+
+    # Publish request to Redis for ML Analyzer to pick up
+    await redis.publish("ml:analysis:request", {
+        "date": analysis_date.isoformat(),
+        "requested_at": datetime.utcnow().isoformat(),
+        "requested_by": "api",
+    })
+
+    return {
+        "status": "queued",
+        "analysis_date": analysis_date.isoformat(),
+        "message": "Analysis request queued. Check /api/ml/reports for results.",
+    }
 
 
 # =============================================================================

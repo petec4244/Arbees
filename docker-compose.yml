@@ -160,8 +160,79 @@ services:
       STOP_LOSS_NHL: "7.0"
       STOP_LOSS_MLB: "6.0"
       STOP_LOSS_SOCCER: "7.0"
+      # Cooldown timers (prevent rapid re-entry on same game)
+      WIN_COOLDOWN_SECONDS: "180"   # 3 minutes after a win
+      LOSS_COOLDOWN_SECONDS: "300"  # 5 minutes after a loss
     volumes:
       - ./:/app
+    profiles:
+      - full
+
+  archiver:
+    build:
+      context: .
+      dockerfile: services/archiver/Dockerfile
+    container_name: arbees-archiver
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      # Archiver configuration
+      ARCHIVER_GRACE_PERIOD_MINUTES: "60"
+      ARCHIVER_BATCH_SIZE: "10"
+      ARCHIVER_POLL_INTERVAL: "300"
+      ARCHIVER_CLEANUP_LIVE_DATA: "false"
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
+  ml_analyzer:
+    build:
+      context: .
+      dockerfile: services/ml_analyzer/Dockerfile
+    container_name: arbees-ml-analyzer
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      # ML Analyzer configuration
+      ML_ANALYZER_RUN_TIME: "23:00"
+      ML_MIN_TRADES: "100"
+      ML_LOOKBACK_DAYS: "30"
+      ML_RETRAIN_INTERVAL: "7"
+      ML_REPORT_DIR: "/app/reports"
+      # File delivery (always enabled)
+      ML_ENABLE_FILE_DELIVERY: "true"
+      # Slack delivery (optional)
+      ML_SLACK_ENABLED: "${ML_SLACK_ENABLED:-false}"
+      ML_SLACK_WEBHOOK: "${ML_SLACK_WEBHOOK:-}"
+      ML_SLACK_CHANNEL: "${ML_SLACK_CHANNEL:-}"
+      # Email delivery (optional)
+      ML_EMAIL_ENABLED: "${ML_EMAIL_ENABLED:-false}"
+      ML_SMTP_HOST: "${ML_SMTP_HOST:-smtp.gmail.com}"
+      ML_SMTP_PORT: "${ML_SMTP_PORT:-587}"
+      ML_SMTP_USER: "${ML_SMTP_USER:-}"
+      ML_SMTP_PASSWORD: "${ML_SMTP_PASSWORD:-}"
+      ML_EMAIL_FROM: "${ML_EMAIL_FROM:-}"
+      ML_EMAIL_TO: "${ML_EMAIL_TO:-}"
+    volumes:
+      - ./:/app
+      - ./reports:/app/reports
     profiles:
       - full
 
@@ -197,7 +268,8 @@ services:
       - FIREWALL_OUTBOUND_SUBNETS=172.16.0.0/12,10.0.0.0/8,192.168.0.0/16
       - HEALTH_VPN_DURATION_INITIAL=30s
     healthcheck:
-      test: [ "CMD", "wget", "-q", "--spider", "https://ipinfo.io" ]
+      # Use HTTP (not HTTPS) to avoid CA/cert issues inside minimal images causing false "unhealthy".
+      test: [ "CMD", "wget", "-q", "--spider", "http://ipinfo.io/json" ]
       interval: 60s
       timeout: 10s
       retries: 3

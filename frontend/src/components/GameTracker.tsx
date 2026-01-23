@@ -10,6 +10,7 @@ interface GameTrackerProps {
     awayTeam: string
     history: Array<{ timestamp: number; homeValue: number; awayValue: number }> // Raw tick data
     trades?: Trade[]
+    cooldownUntil?: string // ISO string
 }
 
 const TIME_INTERVALS = [
@@ -24,7 +25,8 @@ export default function GameTracker({
     homeTeam,
     awayTeam,
     history = [],
-    trades = []
+    trades = [],
+    cooldownUntil
 }: GameTrackerProps) {
     const [chartType, setChartType] = useState<'line' | 'candle'>('line')
     const [interval, setInterval] = useState(TIME_INTERVALS[0].value)
@@ -114,6 +116,11 @@ export default function GameTracker({
                         <span className="bg-gray-700 px-1.5 py-0.5 rounded">{homeTeam} vs {awayTeam}</span>
                         <span>•</span>
                         <span>{history.length} updates</span>
+                        {cooldownUntil && new Date(cooldownUntil) > new Date() && (
+                            <span className="bg-blue-900/50 text-blue-300 border border-blue-700/50 px-2 py-0.5 rounded flex items-center gap-1 animate-pulse">
+                                ❄️ Cooldown until {new Date(cooldownUntil).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </span>
+                        )}
                     </div>
                 </div>
 

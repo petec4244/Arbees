@@ -62,6 +62,8 @@ class GameContext:
     # Track active signals per market type for hysteresis
     active_signal: Optional[TradingSignal] = None  # Legacy
     active_signals_by_type: dict[MarketType, TradingSignal] = field(default_factory=dict)
+    # NEW: Trading cooldown timestamp
+    cooldown_until: Optional[datetime] = None
 
 
 class GameShard:
@@ -558,10 +560,10 @@ class GameShard:
         home_team = ctx.last_state.home_team
         away_team = ctx.last_state.away_team
 
-        # Calculate final probabilities (winner ~1.0, loser ~0.0)
-        # In a finished game, the winner's probability is essentially 1.0
-        winning_exit_price = 0.99  # Slightly less than 1.0 to account for model uncertainty
-        losing_exit_price = 0.01  # Slightly more than 0.0
+        # Game-end settlement: contracts settle at exactly 1.0 or 0.0
+        # No uncertainty - winner pays $1 per contract, loser pays $0
+        winning_exit_price = 1.0
+        losing_exit_price = 0.0
 
         total_pnl = 0.0
         exit_time = datetime.utcnow().isoformat()
@@ -576,24 +578,46 @@ class GameShard:
             # Determine if this position is on the winning or losing team
             # Market titles are like "Boston Celtics to win" or "Detroit Pistons to win"
             market_title_lower = market_title.lower()
-            is_home_team_market = (
-                home_team.lower() in market_title_lower or
-                (ctx.last_state.home_team_abbrev and ctx.last_state.home_team_abbrev.lower() in market_title_lower)
-            )
-            is_away_team_market = (
-                away_team.lower() in market_title_lower or
-                (ctx.last_state.away_team_abbrev and ctx.last_state.away_team_abbrev.lower() in market_title_lower)
-            )
 
-            # Determine exit price based on whether this market's team won
-            if is_home_team_market:
+            # Score matches by specificity (prefer exact nickname match over partial)
+            def score_match(team: str, abbrev: str | None, title: str) -> int:
+                """Return match score: 0=no match, 1=partial, 2=full team, 3=nickname exact"""
+                if not team:
+                    return 0
+                team_lower = team.lower()
+                # Check for team nickname (last word) as exact word match
+                nickname = team_lower.split()[-1] if team_lower.split() else ""
+                if nickname and f" {nickname}" in title or title.startswith(nickname):
+                    return 3
+                # Full team name match
+                if team_lower in title:
+                    return 2
+                # Abbreviation match
+                if abbrev and abbrev.lower() in title:
+                    return 1
+                return 0
+
+            home_score = score_match(home_team, ctx.last_state.home_team_abbrev, market_title_lower)
+            away_score = score_match(away_team, ctx.last_state.away_team_abbrev, market_title_lower)
+
+            # Use score to determine which team, preferring higher confidence matches
+            if home_score > away_score and home_score > 0:
                 exit_price = winning_exit_price if home_won else losing_exit_price
                 team_won = home_won
-            elif is_away_team_market:
+            elif away_score > home_score and away_score > 0:
                 exit_price = losing_exit_price if home_won else winning_exit_price
                 team_won = not home_won
+            elif home_score == away_score and home_score > 0:
+                # Both teams match equally (ambiguous) - log warning and settle as push
+                logger.warning(
+                    f"Ambiguous team match for market '{market_title}' "
+                    f"(home='{home_team}' score={home_score}, away='{away_team}' score={away_score}), "
+                    f"settling as push"
+                )
+                exit_price = entry_price
+                team_won = None
             else:
-                # Can't determine team from market title, use 0.5 (push)
+                # Can't determine team from market title, use entry price (push)
                 logger.warning(f"Cannot determine team for market '{market_title}', settling as push")
                 exit_price = entry_price
                 team_won = None
@@ -621,19 +645,47 @@ class GameShard:
                 exit_time=exit_time,
                 outcome=outcome,
             )
-
+            
             logger.info(
                 f"Settled position {trade_id}: {side.upper()} {market_title} "
                 f"entry=${entry_price:.4f} exit=${exit_price:.4f} "
                 f"P&L=${pnl:.2f} ({outcome.upper()})"
             )
 
-        # Update bankroll with total P&L
-        if total_pnl != 0:
-            await self.db.update_bankroll(total_pnl)
-            logger.info(f"Updated bankroll: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
+        # ---------------------------------------------------------
+        # Piggybank & Bankroll Update
+        # ---------------------------------------------------------
+        piggybank_amount = 0.0
+        if total_pnl > 0:
+            # "50% of all positive trades are kept for a safety buffer"
+            # We assume this means 50% of the NET profit from the game
+            piggybank_amount = total_pnl * 0.50
 
-        logger.info(f"Finished settling {len(open_positions)} positions for game {ctx.game_id}, total P&L: ${total_pnl:.2f}")
+        # Update bankroll via DatabaseClient
+        if self.db:
+            await self.db.update_bankroll(
+                pnl_change=total_pnl,
+                piggybank_change=piggybank_amount,
+                account_name="default"
+            )
+
+        # ---------------------------------------------------------
+        # Trading Cooldown
+        # ---------------------------------------------------------
+        # "3 mins for positive trades and 5 minutes for negative"
+        cooldown_minutes = 3 if total_pnl > 0 else 5
+        cooldown_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
+        
+        ctx.cooldown_until = cooldown_until
+        
+        if self.db:
+            await self.db.set_game_cooldown(ctx.game_id, cooldown_until)
+            
+        logger.info(
+            f"Settled game {ctx.game_id}: PnL=${total_pnl:.2f}, "
+            f"Piggybank=${piggybank_amount:.2f}, "
+            f"Cooldown until {cooldown_until.isoformat()} ({cooldown_minutes}m)"
+        )
 
     def _get_poll_interval(self, ctx: GameContext) -> float:
         """Get poll interval based on game state."""
@@ -1050,6 +1102,8 @@ class GameShard:
                 platform=platform.value,
                 yes_bid=price.yes_bid,
                 yes_ask=price.yes_ask,
+                yes_bid_size=price.yes_bid_size,
+                yes_ask_size=price.yes_ask_size,
                 volume=price.volume,
                 liquidity=price.liquidity,
                 game_id=game_id,
@@ -1134,6 +1188,10 @@ class GameShard:
         if ctx.last_home_win_prob is None or not ctx.last_state:
             return
 
+        # Check trading cooldown
+        if ctx.cooldown_until and datetime.utcnow() < ctx.cooldown_until:
+             return
+
         # Determine which team this price is for
         contract_team = price.contract_team
         if not contract_team:
@@ -1166,8 +1224,8 @@ class GameShard:
             f"model_prob={model_prob:.3f}, market_prob={market_prob:.3f}, edge={edge:.1f}%"
         )
 
-        # Only signal on significant edge (> 3%)
-        if abs(edge) < 3.0:
+        # Only signal on significant edge (> 5%) - increased for uncalibrated model
+        if abs(edge) < 5.0:
             return
 
         # Additional friction check
@@ -1240,6 +1298,10 @@ class GameShard:
         """
         # Check circuit breaker first
         if not self.circuit_breaker.is_trading_allowed():
+            return
+            
+        # Check trading cooldown
+        if ctx.cooldown_until and datetime.utcnow() < ctx.cooldown_until:
             return
 
         for market_type, platforms in ctx.market_ids_by_type.items():
@@ -1443,6 +1505,8 @@ class GameShard:
                                     platform="kalshi",
                                     yes_bid=price.yes_bid,
                                     yes_ask=price.yes_ask,
+                                    yes_bid_size=price.yes_bid_size,
+                                    yes_ask_size=price.yes_ask_size,
                                     volume=price.volume,
                                     liquidity=price.liquidity,
                                     game_id=ctx.game_id,
@@ -1468,6 +1532,8 @@ class GameShard:
                                     platform="polymarket",
                                     yes_bid=price.yes_bid,
                                     yes_ask=price.yes_ask,
+                                    yes_bid_size=price.yes_bid_size,
+                                    yes_ask_size=price.yes_ask_size,
                                     volume=price.volume,
                                     liquidity=price.liquidity,
                                     game_id=ctx.game_id,
@@ -1513,6 +1579,8 @@ class GameShard:
                                 platform="kalshi",
                                 yes_bid=price.yes_bid,
                                 yes_ask=price.yes_ask,
+                                yes_bid_size=price.yes_bid_size,
+                                yes_ask_size=price.yes_ask_size,
                                 volume=price.volume,
                                 liquidity=price.liquidity,
                                 game_id=ctx.game_id,
@@ -1539,6 +1607,8 @@ class GameShard:
                                 platform="polymarket",
                                 yes_bid=price.yes_bid,
                                 yes_ask=price.yes_ask,
+                                yes_bid_size=price.yes_bid_size,
+                                yes_ask_size=price.yes_ask_size,
                                 volume=price.volume,
                                 liquidity=price.liquidity,
                                 game_id=ctx.game_id,
@@ -1608,9 +1678,9 @@ class GameShard:
         if abs(prob_change) < 0.02:
             return
 
-        # 1. Clamp probabilities to avoid overconfidence
-        # Capping at 85% prevents "sure thing" bets that lose 100% of the time in our analysis
-        capped_new_prob = max(0.15, min(0.85, new_prob))
+        # 1. Clamp probabilities to avoid extreme confidence
+        # Capping at 95% prevents div-by-zero edges while allowing model to express strong favorites
+        capped_new_prob = max(0.05, min(0.95, new_prob))
         
         # 2. Estimate Fees/Friction (2% round trip estimate)
         estimated_fees = 2.0 
@@ -1845,15 +1915,15 @@ class GameShard:
             # Calculate probability (for home team)
             raw_prob = arbees_core.calculate_win_probability(rust_state, True)
             
-            # Clamp probability to [0.15, 0.85] to avoid extreme confidence
-            return max(0.15, min(0.85, raw_prob))
+            # Clamp probability to [0.05, 0.95] to avoid extreme confidence / div-by-zero
+            return max(0.05, min(0.95, raw_prob))
 
         except Exception as e:
             logger.error(f"Error calculating win prob with Rust core: {e}")
             # Fallback to simple heuristic
             score_diff = state.home_score - state.away_score
             prob = 0.5 + (score_diff * 0.05)
-            return max(0.15, min(0.85, prob))
+            return max(0.05, min(0.95, prob))
 
     # ==========================================================================
     # Status and Metrics

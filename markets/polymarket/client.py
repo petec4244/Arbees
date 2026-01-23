@@ -443,6 +443,23 @@ class PolymarketClient(BaseMarketClient):
         elif market.get("resolved"):
             status = MarketStatus.SETTLED
 
+        # Get top-of-book sizes if orderbook is available
+        yes_bid_size = 0.0
+        yes_ask_size = 0.0
+        
+        if orderbook:
+            if orderbook.yes_bids:
+                # Assuming bids are sorted descending by price
+                best_bid = orderbook.yes_bids[0]
+                if best_bid.price == yes_bid:
+                    yes_bid_size = best_bid.quantity
+            
+            if orderbook.yes_asks:
+                # Assuming asks are sorted ascending by price
+                best_ask = orderbook.yes_asks[0]
+                if best_ask.price == yes_ask:
+                    yes_ask_size = best_ask.quantity
+
         return MarketPrice(
             market_id=market_id,
             platform=Platform.POLYMARKET,
@@ -450,6 +467,8 @@ class PolymarketClient(BaseMarketClient):
             market_title=market.get("question", market.get("title", "")),
             yes_bid=yes_bid,
             yes_ask=yes_ask,
+            yes_bid_size=yes_bid_size,
+            yes_ask_size=yes_ask_size,
             volume=float(market.get("volume", 0) or 0),
             liquidity=liquidity,
             status=status,

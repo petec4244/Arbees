@@ -131,6 +131,18 @@ class DatabaseClient:
             game_id, status
         )
 
+    async def set_game_cooldown(self, game_id: str, cooldown_until: datetime) -> None:
+        """Set a trading cooldown for a game."""
+        pool = await self._get_pool()
+        await pool.execute(
+            """
+            UPDATE games
+            SET cooldown_until = $2
+            WHERE game_id = $1
+            """,
+            game_id, cooldown_until
+        )
+
     async def get_live_games(self, sport: Optional[str] = None) -> list[dict]:
         """Get all live games, optionally filtered by sport."""
         pool = await self._get_pool()
@@ -295,21 +307,26 @@ class DatabaseClient:
         """
         pool = await self._get_pool()
 
+        yes_bid_size = kwargs.get('yes_bid_size', 0)
+        yes_ask_size = kwargs.get('yes_ask_size', 0)
+
         await pool.execute(
             """
             INSERT INTO market_prices (
                 time, market_id, platform, game_id, market_title,
                 yes_bid, yes_ask, volume, open_interest, liquidity,
-                status, last_trade_price, market_type, contract_team
+                status, last_trade_price, market_type, contract_team,
+                yes_bid_size, yes_ask_size
             ) VALUES (
-                NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
             )
             """,
             market_id, platform, game_id, market_title,
             yes_bid, yes_ask, volume,
             kwargs.get('open_interest', 0), liquidity,
             kwargs.get('status', 'open'), kwargs.get('last_trade_price'),
-            market_type, contract_team
+            market_type, contract_team,
+            yes_bid_size, yes_ask_size
         )
 
     async def get_latest_market_price(
@@ -515,21 +532,29 @@ class DatabaseClient:
     async def update_bankroll(
         self,
         pnl_change: float,
+        piggybank_change: float = 0.0,
         account_name: str = "default"
     ) -> None:
-        """Update bankroll balance after a trade settlement."""
+        """
+        Update bankroll balance after a trade settlement.
+        
+        Args:
+            pnl_change: Net change to current balance (profit - loss)
+            piggybank_change: Amount to move into piggybank (protected savings)
+        """
         pool = await self._get_pool()
         await pool.execute(
             """
             UPDATE bankroll
             SET
                 current_balance = current_balance + $1,
+                piggybank_balance = COALESCE(piggybank_balance, 0) + $2,
                 peak_balance = GREATEST(peak_balance, current_balance + $1),
                 trough_balance = LEAST(trough_balance, current_balance + $1),
                 updated_at = NOW()
-            WHERE account_name = $2
+            WHERE account_name = $3
             """,
-            pnl_change, account_name
+            pnl_change, piggybank_change, account_name
         )
 
     async def get_performance_stats(

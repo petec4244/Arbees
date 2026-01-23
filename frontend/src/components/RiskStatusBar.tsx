@@ -138,6 +138,22 @@ export default function RiskStatusBar({ compact = true }: RiskStatusBarProps) {
           </div>
         </div>
 
+        {/* Piggybank */}
+        <div className="bg-gray-900/50 rounded p-3 relative overflow-hidden group">
+          <div className="absolute top-0 right-0 p-3 opacity-10 group-hover:opacity-20 transition-opacity">
+            <span className="text-4xl">🐷</span>
+          </div>
+          <div className="flex items-center gap-2 text-gray-400 text-xs mb-1">
+            <span>Piggybank</span>
+          </div>
+          <div className="text-lg font-mono text-pink-400">
+            ${(riskMetrics.piggybank_balance || 0).toFixed(2)}
+          </div>
+          <div className="text-xs text-gray-500 mt-2">
+            Safety Buffer (50%)
+          </div>
+        </div>
+
         {/* Exposure */}
         <div className="bg-gray-900/50 rounded p-3">
           <div className="text-gray-400 text-xs mb-1">Total Exposure</div>
