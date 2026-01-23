@@ -407,8 +407,13 @@ class PolymarketWebSocketClient:
             # Calculate liquidity (sum of bid sizes)
             liquidity = sum((s for _, s in bid_levels), 0.0)
             
+            # IMPORTANT:
+            # This websocket stream is subscribed by *token_id* ("asset_id") and must emit MarketPrice.market_id
+            # as that token_id so downstream components (e.g. polymarket_monitor) can map token_id -> condition_id
+            # and attach contract_team correctly. Using condition_id here breaks that mapping and causes trades to
+            # execute/exit against the wrong team.
             return MarketPrice(
-                market_id=condition_id,  # Use condition_id as market_id
+                market_id=str(token_id),  # Emit token_id here; monitor will normalize to condition_id
                 platform=Platform.POLYMARKET,
                 market_title=title,
                 yes_bid=yes_bid,

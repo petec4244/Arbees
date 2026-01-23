@@ -31,6 +31,11 @@ async function fetchUpcomingGames() {
   return res.json()
 }
 
+async function fetchPaperStatus() {
+  const res = await fetch('/api/paper-trading/status')
+  return res.json()
+}
+
 export default function Dashboard() {
   const {
     showLiveGames,
@@ -71,6 +76,12 @@ export default function Dashboard() {
     queryKey: ['upcomingGamesDashboard'],
     queryFn: fetchUpcomingGames,
     refetchInterval: 60000, // Refresh every minute
+  })
+
+  const { data: paperStatus } = useQuery({
+    queryKey: ['paperStatusDashboard'],
+    queryFn: fetchPaperStatus,
+    refetchInterval: 5000,
   })
 
   // Calculate daily P&L (from risk metrics)
@@ -143,7 +154,7 @@ export default function Dashboard() {
             badge={`${games?.length || 0} active`}
             sectionId="dashboard-live-games"
           >
-            <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+            <div className="space-y-3 pr-2">
               {games?.map((game: any) => (
                 <div
                   key={game.game_id}
@@ -207,9 +218,50 @@ export default function Dashboard() {
             badge="Last 10"
             sectionId="dashboard-recent-trades"
           >
-            <RecentTradesList limit={10} compact={false} />
+            <RecentTradesList limit={5} compact={false} />
           </CollapsibleSection>
         )}
+
+        {/* Open Positions Summary */}
+        <CollapsibleSection
+          title="Open Positions"
+          badge={`${paperStatus?.open_positions_count || 0} active`}
+          sectionId="dashboard-open-positions"
+        >
+          {paperStatus?.open_positions && paperStatus.open_positions.length > 0 ? (
+            <div className="space-y-3">
+              {paperStatus.open_positions.slice(0, 5).map((pos: any, idx: number) => (
+                <div key={idx} className="flex justify-between items-center p-3 bg-gray-700/50 rounded hover:bg-gray-700 transition-colors">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs bg-gray-600 px-1.5 py-0.5 rounded text-gray-300">{pos.sport}</span>
+                      <span className={`text-xs font-bold ${pos.side === 'buy' ? 'text-blue-400' : 'text-orange-400'}`}>
+                        {pos.side === 'buy' ? 'YES' : 'NO'}
+                      </span>
+                    </div>
+                    <div className="text-sm font-medium mt-1">
+                      {pos.home_team && pos.away_team ? `${pos.away_team} @ ${pos.home_team}` : `Game ${pos.game_id}`}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-yellow-400 font-mono">${(pos.size * (pos.side === 'buy' ? pos.entry_price : 1 - pos.entry_price)).toFixed(2)}</div>
+                    <div className="text-xs text-gray-500">Entry: {(pos.entry_price * 100).toFixed(1)}%</div>
+                  </div>
+                </div>
+              ))}
+              {paperStatus.open_positions_count > 5 && (
+                <Link to="/paper-trading" className="block text-center text-sm text-blue-400 hover:text-blue-300 mt-2">
+                  View all {paperStatus.open_positions_count} positions
+                </Link>
+              )}
+            </div>
+          ) : (
+            <div className="text-center py-8 text-gray-500">
+              <Clock className="w-8 h-8 mx-auto mb-2 opacity-50" />
+              <p>No open positions</p>
+            </div>
+          )}
+        </CollapsibleSection>
       </div>
 
       {/* Upcoming Games */}
@@ -339,11 +391,10 @@ function ViewToggle() {
         <button
           key={toggle.label}
           onClick={() => toggle.set(!toggle.value)}
-          className={`p-2 rounded text-xs transition-colors ${
-            toggle.value
+          className={`p-2 rounded text-xs transition-colors ${toggle.value
               ? 'bg-gray-700 text-white'
               : 'text-gray-500 hover:text-gray-300'
-          }`}
+            }`}
           title={`${toggle.value ? 'Hide' : 'Show'} ${toggle.label}`}
         >
           {toggle.value ? (

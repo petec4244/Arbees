@@ -255,7 +255,7 @@ class ExecutionEngine:
                 if platform == Platform.KALSHI:
                     result = await self.kalshi.place_order(
                         market_id=market_id,
-                        side="buy",  # We're always buying (yes or no)
+                        side=side,  # "yes" or "no"
                         price=price,
                         quantity=quantity,
                     )
@@ -358,7 +358,7 @@ class ExecutionEngine:
                 # Sell the position
                 await self.kalshi.place_order(
                     market_id=order.market_id,
-                    side="sell",
+                    side=order.side,  # "yes" or "no"
                     price=order.price * 0.98,  # Market sell (slightly below entry)
                     quantity=order.quantity,
                 )

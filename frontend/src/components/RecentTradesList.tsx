@@ -86,11 +86,11 @@ export default function RecentTradesList({
         >
           <div className="flex items-center gap-3">
             {trade.side === 'buy' ? (
-              <div className="w-8 h-8 rounded-full bg-blue-900/50 flex items-center justify-center" title="HOME">
+              <div className="w-8 h-8 rounded-full bg-blue-900/50 flex items-center justify-center" title="YES">
                 <ArrowUpRight className="w-4 h-4 text-blue-400" />
               </div>
             ) : (
-              <div className="w-8 h-8 rounded-full bg-orange-900/50 flex items-center justify-center" title="AWAY">
+              <div className="w-8 h-8 rounded-full bg-orange-900/50 flex items-center justify-center" title="NO">
                 <ArrowDownRight className="w-4 h-4 text-orange-400" />
               </div>
             )}

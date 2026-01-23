@@ -284,25 +284,32 @@ class DatabaseClient:
         game_id: Optional[str] = None,
         market_title: Optional[str] = None,
         market_type: str = "moneyline",
+        contract_team: Optional[str] = None,
         **kwargs
     ) -> None:
-        """Insert a market price snapshot."""
+        """Insert a market price snapshot.
+        
+        Args:
+            contract_team: Which team this YES contract is for (e.g., "Boston Celtics").
+                          For Polymarket moneyline, each team has its own token.
+        """
         pool = await self._get_pool()
+
         await pool.execute(
             """
             INSERT INTO market_prices (
                 time, market_id, platform, game_id, market_title,
                 yes_bid, yes_ask, volume, open_interest, liquidity,
-                status, last_trade_price, market_type
+                status, last_trade_price, market_type, contract_team
             ) VALUES (
-                NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
             )
             """,
             market_id, platform, game_id, market_title,
             yes_bid, yes_ask, volume,
             kwargs.get('open_interest', 0), liquidity,
             kwargs.get('status', 'open'), kwargs.get('last_trade_price'),
-            market_type
+            market_type, contract_team
         )
 
     async def get_latest_market_price(
@@ -320,6 +327,29 @@ class DatabaseClient:
             LIMIT 1
             """,
             market_id, platform
+        )
+        return dict(row) if row else None
+
+    async def get_latest_market_price_for_team(
+        self,
+        market_id: str,
+        platform: str,
+        contract_team: str
+    ) -> Optional[dict]:
+        """Get the most recent price for a specific team's contract.
+
+        For Polymarket moneyline markets, each team has its own token.
+        This method returns the price for a specific team's YES contract.
+        """
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            """
+            SELECT * FROM market_prices
+            WHERE market_id = $1 AND platform = $2 AND contract_team = $3
+            ORDER BY time DESC
+            LIMIT 1
+            """,
+            market_id, platform, contract_team
         )
         return dict(row) if row else None
 

@@ -238,6 +238,60 @@ async fn request_listener(
     Ok(())
 }
 
+/// Check if a market question indicates a non-moneyline market (totals, spreads, props).
+/// We only want to match moneyline (winner) markets.
+fn is_non_moneyline_market(question: &str) -> bool {
+    let q = question.to_lowercase();
+
+    // Totals indicators
+    if q.contains("o/u")
+        || q.contains("over/under")
+        || q.contains("total points")
+        || q.contains("total goals")
+        || q.contains("total runs")
+        || q.contains("combined score")
+        || q.contains("combined points")
+    {
+        return true;
+    }
+
+    // Spread indicators (look for +/- followed by numbers)
+    // e.g., "+5.5", "-3", "spread"
+    if q.contains("spread") || q.contains("handicap") {
+        return true;
+    }
+
+    // Check for spread patterns like "+5.5" or "-3.5"
+    // Simple heuristic: if there's a +/- followed by digits after team names
+    let spread_patterns = [" +", " -"];
+    for pattern in spread_patterns {
+        if let Some(pos) = q.find(pattern) {
+            // Check if followed by a digit
+            let rest = &q[pos + pattern.len()..];
+            if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+
+    // Props/special markets
+    if q.contains("first to")
+        || q.contains("most")
+        || q.contains("mvp")
+        || q.contains("player")
+        || q.contains("quarter")
+        || q.contains("half")
+        || q.contains("period")
+        || q.contains("inning")
+        || q.contains("how many")
+        || q.contains("exact score")
+    {
+        return true;
+    }
+
+    false
+}
+
 async fn discover_for_game(
     poly_client: &PolymarketClient,
     _kalshi_client: &KalshiClient,
@@ -298,6 +352,7 @@ async fn discover_for_game(
     let _ = kalshi_cache; // keep cache wiring for future use
 
     // Polymarket scan: return Gamma market id (numeric string)
+    // IMPORTANT: Only match MONEYLINE markets, skip totals (O/U), spreads, props, etc.
     let mut poly_market_id: Option<String> = None;
     for market in &poly_markets {
         // Fast prefilter: require at least one of the abbreviations or a city token to appear.
@@ -310,11 +365,17 @@ async fn discover_for_game(
             continue;
         }
 
+        // Skip non-moneyline markets (totals, spreads, props)
+        // These contain patterns like "O/U", "Over/Under", "Total", spread numbers (+/-), etc.
+        if is_non_moneyline_market(&q) {
+            continue;
+        }
+
         let h_match = names_match(home_team, &market.question, sport) || names_match(home_abbr, &market.question, sport);
         let a_match = names_match(away_team, &market.question, sport) || names_match(away_abbr, &market.question, sport);
         if h_match && a_match {
             poly_market_id = Some(market.id.clone());
-            info!("[DISCOVERY] Polymarket match game={} {} vs {} -> market_id={}", game_id, away_team, home_team, market.id);
+            info!("[DISCOVERY] Polymarket MONEYLINE match game={} {} vs {} -> market_id={}", game_id, away_team, home_team, market.id);
             break;
         }
     }

@@ -14,6 +14,10 @@ import uuid
 from datetime import datetime
 from typing import AsyncIterator, Optional
 
+import json
+import os
+import time
+
 from arbees_shared.db.connection import DatabaseClient
 from arbees_shared.messaging.redis_bus import RedisBus
 from arbees_shared.models.game import Sport
@@ -31,6 +35,25 @@ from arbees_shared.models.trade import (
 from markets.base import BaseMarketClient
 
 logger = logging.getLogger(__name__)
+
+# region agent log (helper)
+def _agent_dbg(hypothesisId: str, location: str, message: str, data: dict) -> None:
+    """Write a single NDJSON debug line to the host-mounted .cursor/debug.log (DEBUG MODE ONLY)."""
+    try:
+        payload = {
+            "sessionId": "debug-session",
+            "runId": os.environ.get("DEBUG_RUN_ID", "pre-fix"),
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open("/app/.cursor/debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+# endregion
 
 
 def _side_display(side: str) -> str:
@@ -198,6 +221,56 @@ class PaperTradingEngine(BaseMarketClient):
         # Determine side and price
         side = TradeSide.BUY if signal.direction == SignalDirection.BUY else TradeSide.SELL
         entry_price = market_price.yes_ask if side == TradeSide.BUY else market_price.yes_bid
+
+        # Guardrail: if orderbook is effectively empty/unknown (defaults 0/1), do not trade.
+        # This prevents pathological entries like BUY @ 1.000 (100%) due to missing asks.
+        if market_price.yes_bid <= 0.0 and market_price.yes_ask >= 1.0:
+            logger.info(
+                f"Signal rejected: invalid market book (bid={market_price.yes_bid:.3f}, ask={market_price.yes_ask:.3f}) "
+                f"for {signal.game_id} {signal.team}"
+            )
+            # region agent log
+            _agent_dbg(
+                "H1",
+                "markets/paper/engine.py:execute_signal",
+                "rejected_empty_book",
+                {
+                    "signal_id": signal.signal_id,
+                    "game_id": signal.game_id,
+                    "signal_team": signal.team,
+                    "direction": signal.direction.value,
+                    "market_id": market_price.market_id,
+                    "platform": market_price.platform.value,
+                    "contract_team": getattr(market_price, "contract_team", None),
+                    "yes_bid": float(market_price.yes_bid),
+                    "yes_ask": float(market_price.yes_ask),
+                    "mid": float(market_price.mid_price),
+                },
+            )
+            # endregion
+            return None
+
+        # region agent log
+        _agent_dbg(
+            "H1",
+            "markets/paper/engine.py:execute_signal",
+            "paper_entry_price_selected",
+            {
+                "signal_id": signal.signal_id,
+                "game_id": signal.game_id,
+                "signal_team": signal.team,
+                "direction": signal.direction.value,
+                "side": side.value,
+                "market_id": market_price.market_id,
+                "platform": market_price.platform.value,
+                "contract_team": getattr(market_price, "contract_team", None),
+                "yes_bid": float(market_price.yes_bid),
+                "yes_ask": float(market_price.yes_ask),
+                "mid": float(market_price.mid_price),
+                "entry_price_pre_slip": float(entry_price),
+            },
+        )
+        # endregion
 
         # Apply slippage
         exec_price = self.apply_slippage(entry_price, side)

@@ -179,13 +179,17 @@ class Orchestrator:
 
         # Subscribe to Rust market discovery results (JSON pubsub, lowest-latency)
         # Must start after self._running is True, otherwise the loop exits immediately.
+        logger.info(f"Market discovery mode: {self._market_discovery_mode}")
         if self._market_discovery_mode == "rust":
             self._discovery_client = redis.from_url(
                 os.environ.get("REDIS_URL", "redis://redis:6379"),
                 decode_responses=False,
             )
             await self._discovery_client.ping()
+            logger.info("Connected to Redis for Rust market discovery")
             self._discovery_pubsub_task = asyncio.create_task(self._listen_discovery_results())
+        else:
+            logger.info("Using legacy Python market discovery")
 
         # Start background tasks
         self._discovery_task = asyncio.create_task(self._discovery_loop())
@@ -414,7 +418,7 @@ class Orchestrator:
         return True
 
     async def _unassign_game(self, game_id: str) -> None:
-        """Remove a game assignment."""
+        """Remove a game assignment and notify position manager."""
         if game_id not in self._assignments:
             return
 
@@ -429,6 +433,40 @@ class Orchestrator:
             }
             channel = f"shard:{assignment.shard_id}:command"
             await self.redis.publish(channel, command)
+
+            # Publish game ended event for position manager to close trades
+            # Try to get final score from database
+            home_score = 0
+            away_score = 0
+            home_team = None
+            away_team = None
+            try:
+                if self.db:
+                    pool = await self.db._get_pool()
+                    row = await pool.fetchrow("""
+                        SELECT home_score, away_score, home_team, away_team
+                        FROM game_states
+                        WHERE game_id = $1
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                    """, game_id)
+                    if row:
+                        home_score = row["home_score"] or 0
+                        away_score = row["away_score"] or 0
+                        home_team = row["home_team"]
+                        away_team = row["away_team"]
+            except Exception as e:
+                logger.warning(f"Could not fetch final score for {game_id}: {e}")
+
+            game_ended_event = {
+                "game_id": game_id,
+                "home_score": home_score,
+                "away_score": away_score,
+                "home_team": home_team,
+                "away_team": away_team,
+            }
+            await self.redis.publish("games:ended", game_ended_event)
+            logger.info(f"Published game ended event for {game_id}: {home_team} {home_score} - {away_score} {away_team}")
 
         # Update tracking
         if shard:
@@ -565,6 +603,7 @@ class Orchestrator:
                     continue
 
                 if game.game_id in self._pending_discovery:
+                    logger.debug(f"Game {game.game_id} already pending discovery")
                     continue
 
                 # Ask Rust discovery service for markets for this game.
@@ -579,10 +618,13 @@ class Orchestrator:
                 }
                 # Publish JSON so Rust can deserialize without msgpack dependencies.
                 if self._discovery_client:
+                    logger.info(f"Sending discovery request for game {game.game_id}: {game.away_team} @ {game.home_team}")
                     await self._discovery_client.publish(
                         Channel.DISCOVERY_REQUESTS.value,
                         json.dumps(request).encode("utf-8"),
                     )
+                else:
+                    logger.warning(f"No discovery client available for game {game.game_id}")
                 self._pending_discovery[game.game_id] = game
                 continue
 

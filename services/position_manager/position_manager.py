@@ -16,6 +16,9 @@ import os
 from datetime import datetime
 from typing import Optional
 
+import json
+import time
+
 from arbees_shared.db.connection import DatabaseClient, get_pool
 from arbees_shared.messaging.redis_bus import RedisBus
 from arbees_shared.models.game import Sport
@@ -28,6 +31,25 @@ from markets.polymarket.client import PolymarketClient
 from markets.paper.engine import PaperTradingEngine
 
 logger = logging.getLogger(__name__)
+
+# region agent log (helper)
+def _agent_dbg(hypothesisId: str, location: str, message: str, data: dict) -> None:
+    """Write a single NDJSON debug line to the host-mounted .cursor/debug.log (DEBUG MODE ONLY)."""
+    try:
+        payload = {
+            "sessionId": "debug-session",
+            "runId": os.environ.get("DEBUG_RUN_ID", "pre-fix"),
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open("/app/.cursor/debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+# endregion
 
 
 def _side_display(side: str) -> str:
@@ -138,6 +160,37 @@ class PositionManager:
         self._prob_rejected_count = 0
         self._duplicate_rejected_count = 0
         self._no_market_rejected_count = 0
+
+    def _teams_match(self, team1: str, team2: str) -> bool:
+        """Check if two team names refer to the same team.
+
+        Handles variations like:
+        - "Boston Celtics" vs "Celtics"
+        - "BOS" vs "Boston Celtics"
+        - Case insensitive
+        """
+        if not team1 or not team2:
+            return False
+
+        t1 = team1.lower().strip()
+        t2 = team2.lower().strip()
+
+        # Exact match
+        if t1 == t2:
+            return True
+
+        # One contains the other
+        if t1 in t2 or t2 in t1:
+            return True
+
+        # Check last word (team nickname)
+        t1_words = t1.split()
+        t2_words = t2.split()
+        if t1_words and t2_words:
+            if t1_words[-1] == t2_words[-1]:
+                return True
+
+        return False
 
     async def start(self) -> None:
         """Start the position manager and connect to services."""
@@ -418,11 +471,42 @@ class PositionManager:
 
             # Execute through paper engine
             if self.paper_engine:
-                logger.info(f"Opening new position with price: bid={market_price.yes_bid:.3f}, ask={market_price.yes_ask:.3f}")
+                # region agent log
+                _agent_dbg(
+                    "H1_H3",
+                    "services/position_manager/position_manager.py:_handle_signal",
+                    "about_to_execute_trade",
+                    {
+                        "signal_id": signal.signal_id,
+                        "game_id": signal.game_id,
+                        "direction": signal.direction.value,
+                        "signal_team": signal.team,
+                        "signal_model_prob": float(signal.model_prob),
+                        "signal_market_prob": float(signal.market_prob) if signal.market_prob is not None else None,
+                        "signal_edge_pct": float(signal.edge_pct),
+                        "price_market_id": market_price.market_id,
+                        "price_platform": market_price.platform.value,
+                        "price_contract_team": market_price.contract_team,
+                        "price_market_title": market_price.market_title,
+                        "price_yes_bid": float(market_price.yes_bid),
+                        "price_yes_ask": float(market_price.yes_ask),
+                        "price_mid": float(market_price.mid_price),
+                    },
+                )
+                # endregion
+                logger.info(
+                    f"Opening new position: {signal.direction.value} {signal.team} "
+                    f"using contract_team='{market_price.contract_team}' "
+                    f"(bid={market_price.yes_bid:.3f}, ask={market_price.yes_ask:.3f}, "
+                    f"mid={market_price.mid_price:.3f})"
+                )
                 trade = await self.paper_engine.execute_signal(signal, market_price)
                 if trade:
                     self._trade_count += 1
-                    logger.info(f"Opened trade: {trade.trade_id}")
+                    logger.info(
+                        f"Opened trade {trade.trade_id}: {signal.direction.value} {signal.team} "
+                        f"@ {trade.entry_price:.3f} x ${trade.size:.2f}"
+                    )
                 else:
                     logger.info(f"Trade not executed for signal {signal.signal_id} - rejected by paper engine")
 
@@ -508,7 +592,15 @@ class PositionManager:
         logger.info(f"Closed position {closed_trade.trade_id}: PnL ${closed_trade.pnl:.2f} ({closed_trade.outcome.value})")
 
     async def _get_market_price(self, signal: TradingSignal) -> Optional[MarketPrice]:
-        """Get current market price for a signal."""
+        """Get current market price for a signal.
+
+        IMPORTANT: For Polymarket moneyline markets, we need to get the price
+        for the CORRECT team's contract (signal.team). If we get the wrong team's
+        price, we must invert it.
+        """
+        target_team = signal.team
+        price = None
+
         # Try Kalshi first
         if signal.platform_buy == Platform.KALSHI or signal.platform_sell == Platform.KALSHI:
             market_id = signal.buy_price if signal.platform_buy == Platform.KALSHI else signal.sell_price
@@ -524,27 +616,171 @@ class PositionManager:
                     if row:
                         price = await self.kalshi.get_market_price(row["market_id"])
                         if price:
-                            return price
+                            # Kalshi typically has single home-team contract, validate
+                            return self._validate_and_maybe_invert_price(price, target_team)
                 except Exception as e:
                     logger.warning(f"Error getting Kalshi price: {e}")
 
-        # Try Polymarket
+        # Try Polymarket - look for the correct team's contract
         if self.polymarket:
             try:
                 pool = await get_pool()
+
+                # First, try to find a price for the specific team using contract_team column
+                if target_team:
+                    # Look for market with matching contract_team
+                    row = await pool.fetchrow("""
+                        SELECT market_id, market_title, contract_team, yes_bid, yes_ask, volume, liquidity, time
+                        FROM market_prices
+                        WHERE game_id = $1 AND platform = 'polymarket'
+                          AND contract_team IS NOT NULL
+                          AND (contract_team ILIKE $2 OR contract_team ILIKE $3)
+                        ORDER BY time DESC LIMIT 1
+                    """, signal.game_id, f"%{target_team}%", f"{target_team}%")
+
+                    if row:
+                        logger.info(f"Found Polymarket price for team '{target_team}' via contract_team: {row['contract_team']}")
+                        # Use DB row data directly to preserve contract_team
+                        price = MarketPrice(
+                            market_id=row["market_id"],
+                            platform=Platform.POLYMARKET,
+                            market_title=row["market_title"],
+                            contract_team=row["contract_team"],
+                            yes_bid=float(row["yes_bid"]),
+                            yes_ask=float(row["yes_ask"]),
+                            volume=float(row["volume"] or 0),
+                            liquidity=float(row.get("liquidity") or 0),
+                        )
+                        return self._validate_and_maybe_invert_price(price, target_team)
+
+                    # Fallback: look for market_title containing the team name
+                    row = await pool.fetchrow("""
+                        SELECT market_id, market_title, contract_team, yes_bid, yes_ask, volume, liquidity, time
+                        FROM market_prices
+                        WHERE game_id = $1 AND platform = 'polymarket'
+                          AND (market_title ILIKE $2 OR market_title ILIKE $3)
+                        ORDER BY time DESC LIMIT 1
+                    """, signal.game_id, f"%{target_team}%", f"%[{target_team}]%")
+
+                    if row:
+                        logger.info(f"Found Polymarket price for team '{target_team}' via title: {row['market_title']}")
+                        # Use DB row data directly to preserve contract_team
+                        price = MarketPrice(
+                            market_id=row["market_id"],
+                            platform=Platform.POLYMARKET,
+                            market_title=row["market_title"],
+                            contract_team=row.get("contract_team"),
+                            yes_bid=float(row["yes_bid"]),
+                            yes_ask=float(row["yes_ask"]),
+                            volume=float(row["volume"] or 0),
+                            liquidity=float(row.get("liquidity") or 0),
+                        )
+                        return self._validate_and_maybe_invert_price(price, target_team)
+
+                # Fallback: get any recent price for this game
                 row = await pool.fetchrow("""
-                    SELECT market_id FROM market_prices
+                    SELECT market_id, market_title, contract_team, yes_bid, yes_ask, volume, liquidity
+                    FROM market_prices
                     WHERE game_id = $1 AND platform = 'polymarket'
                     ORDER BY time DESC LIMIT 1
                 """, signal.game_id)
                 if row:
-                    price = await self.polymarket.get_market_price(row["market_id"])
-                    if price:
-                        return price
+                    logger.warning(f"Using generic Polymarket price (team '{target_team}' not found): {row['market_title']} (contract_team={row.get('contract_team')})")
+                    # Use DB row data directly
+                    price = MarketPrice(
+                        market_id=row["market_id"],
+                        platform=Platform.POLYMARKET,
+                        market_title=row["market_title"],
+                        contract_team=row.get("contract_team"),
+                        yes_bid=float(row["yes_bid"]),
+                        yes_ask=float(row["yes_ask"]),
+                        volume=float(row["volume"] or 0),
+                        liquidity=float(row.get("liquidity") or 0),
+                    )
+                    return self._validate_and_maybe_invert_price(price, target_team)
             except Exception as e:
                 logger.warning(f"Error getting Polymarket price: {e}")
 
         return None
+
+    def _validate_and_maybe_invert_price(
+        self,
+        price: MarketPrice,
+        target_team: Optional[str],
+        home_team: Optional[str] = None
+    ) -> MarketPrice:
+        """Validate that price is for the correct team, invert if not.
+
+        This is a critical safety check to prevent comparing probabilities
+        from different teams (the home/away mismatch bug).
+
+        If contract_team is None and home_team is provided, assumes the price
+        is for the home team (common pattern for REST-fetched legacy prices).
+        """
+        if not price or not target_team:
+            return price
+
+        contract_team = price.contract_team
+
+        # If contract_team is None but home_team is provided, assume home team
+        if not contract_team and home_team:
+            contract_team = home_team
+            logger.debug(f"Legacy price has no contract_team, assuming HOME team: {home_team}")
+
+        if not contract_team:
+            # Still can't determine team - return as-is with warning
+            logger.warning(
+                f"Cannot validate price team matching: contract_team is None "
+                f"(target_team='{target_team}')"
+            )
+            return price
+
+        if self._teams_match(contract_team, target_team):
+            # Teams match - no inversion needed
+            logger.debug(
+                f"Price team validated: contract='{contract_team}' matches target='{target_team}'"
+            )
+            return price
+
+        # Teams DON'T match - INVERT the price
+        logger.info(
+            f"Inverting price: contract_team='{contract_team}' doesn't match "
+            f"target_team='{target_team}' - inverting bid/ask"
+        )
+
+        inverted_price = MarketPrice(
+            market_id=price.market_id,
+            platform=price.platform,
+            market_title=f"{target_team} (inverted from {contract_team}) [{target_team}]",
+            contract_team=target_team,
+            yes_bid=1.0 - price.yes_ask,  # Invert bid/ask
+            yes_ask=1.0 - price.yes_bid,
+            volume=price.volume,
+            liquidity=price.liquidity,
+            timestamp=price.timestamp if hasattr(price, 'timestamp') else None,
+        )
+
+        # region agent log
+        _agent_dbg(
+            "H3",
+            "services/position_manager/position_manager.py:_validate_and_maybe_invert_price",
+            "inverted_price",
+            {
+                "orig_contract_team": contract_team,
+                "target_team": target_team,
+                "orig_yes_bid": float(price.yes_bid),
+                "orig_yes_ask": float(price.yes_ask),
+                "inv_yes_bid": float(inverted_price.yes_bid),
+                "inv_yes_ask": float(inverted_price.yes_ask),
+                "orig_mid": float(price.mid_price),
+                "inv_mid": float(inverted_price.mid_price),
+                "market_id": price.market_id,
+                "platform": price.platform.value,
+            },
+        )
+        # endregion
+
+        return inverted_price
 
     def _create_price_from_signal(self, signal: TradingSignal) -> MarketPrice:
         """Create market price from signal's captured market data.
@@ -552,6 +788,9 @@ class PositionManager:
         Uses the actual market_prob from the signal (captured at signal generation time)
         rather than the model's probability estimate. This ensures we execute at
         realistic market prices.
+        
+        IMPORTANT: Sets contract_team to signal.team so downstream knows which
+        team's YES contract this price represents.
         """
         # Use the actual market probability from signal, NOT model_prob
         # market_prob is the real market mid-price when signal was generated
@@ -564,6 +803,7 @@ class PositionManager:
             market_id=f"signal_{signal.game_id}",
             platform=Platform.PAPER,
             market_title=f"{signal.team} to win",
+            contract_team=signal.team,  # Which team's YES contract
             yes_bid=max(0.01, market_prob - spread),
             yes_ask=min(0.99, market_prob + spread),
             volume=0,
@@ -571,7 +811,7 @@ class PositionManager:
         )
 
     async def _handle_game_ended(self, data: dict) -> None:
-        """Handle game ending - close any open positions."""
+        """Handle game ending - close any open positions based on final result."""
         game_id = data.get("game_id")
         if not game_id or not self.paper_engine:
             return
@@ -580,19 +820,51 @@ class PositionManager:
             # Get final score info
             home_score = data.get("home_score", 0)
             away_score = data.get("away_score", 0)
+            home_team = data.get("home_team", "")
+            away_team = data.get("away_team", "")
             home_won = home_score > away_score
+
+            logger.info(
+                f"Game {game_id} ended: {home_team} {home_score} - {away_score} {away_team} "
+                f"({'HOME' if home_won else 'AWAY'} won)"
+            )
 
             # Find open trades for this game
             open_trades = self.paper_engine.get_open_trades()
             game_trades = [t for t in open_trades if t.game_id == game_id]
 
             for trade in game_trades:
-                # Determine if trade won (simplified: assumes YES on home team)
-                # TODO: Properly track which team the trade was on
-                exit_price = 1.0 if home_won else 0.0
+                # Determine which team this trade was on from market_title
+                # Market titles are like "Sacred Heart Pioneers to win" or "Team A vs Team B"
+                title = trade.market_title.lower()
 
+                # Check if trade was on home or away team
+                trade_on_home = self._teams_match(home_team, title) if home_team else False
+                trade_on_away = self._teams_match(away_team, title) if away_team else False
+
+                # Determine if the team we bet on won
+                if trade_on_home:
+                    team_won = home_won
+                    bet_team = home_team
+                elif trade_on_away:
+                    team_won = not home_won
+                    bet_team = away_team
+                else:
+                    # Couldn't determine team - use home as fallback
+                    logger.warning(f"Could not determine team for trade {trade.trade_id}, assuming home")
+                    team_won = home_won
+                    bet_team = home_team
+
+                # Exit price depends on whether the team we bet on won
+                # BUY YES: pays 1.0 if team wins, 0.0 if loses
+                # SELL YES: receives entry, pays 1.0 if team wins, keeps entry if loses
+                exit_price = 1.0 if team_won else 0.0
+
+                logger.info(
+                    f"Settling trade {trade.trade_id}: {trade.side.value} on '{bet_team}' "
+                    f"(team_won={team_won}, exit_price={exit_price:.2f})"
+                )
                 await self.paper_engine.close_trade(trade, exit_price)
-                logger.info(f"Closed trade {trade.trade_id} for game {game_id}")
 
         except Exception as e:
             logger.error(f"Error closing trades for game {game_id}: {e}")
@@ -605,7 +877,7 @@ class PositionManager:
             except Exception as e:
                 logger.error(f"Error in arbitrage scan: {e}")
 
-            await asyncio.sleep(10)  # Scan every 10 seconds
+            await asyncio.sleep(2)  # Scan every 2 seconds for faster arb detection
 
     async def _scan_for_arbitrage(self) -> None:
         """Scan market prices for arbitrage opportunities."""
@@ -837,22 +1109,82 @@ class PositionManager:
         than calling Polymarket directly.
         """
         pool = await get_pool()
-        row = await pool.fetchrow(
-            """
-            SELECT yes_bid, yes_ask
-            FROM market_prices
-            WHERE platform = $1 AND market_id = $2
-            ORDER BY time DESC
-            LIMIT 1
-            """,
-            trade.platform.value,
-            trade.market_id,
-        )
+
+        # Try to keep exits team-consistent.
+        # Polymarket moneyline has one condition_id shared by BOTH teams; we store both rows under the same market_id.
+        # If we select only by (platform, market_id), we can accidentally pick the OTHER team's row and instantly stop out.
+        team_hint: Optional[str] = None
+        title = (trade.market_title or "").strip()
+        if "[" in title and "]" in title:
+            # Prefer bracket form: "Game Title [Team Name]"
+            try:
+                team_hint = title.rsplit("[", 1)[-1].split("]", 1)[0].strip()
+            except Exception:
+                team_hint = None
+        if not team_hint and " (inverted from " in title:
+            # "Team (inverted from Other Team)"
+            team_hint = title.split(" (inverted from ", 1)[0].strip()
+
+        row = None
+        if team_hint:
+            row = await pool.fetchrow(
+                """
+                SELECT yes_bid, yes_ask, market_title, time
+                FROM market_prices
+                WHERE platform = $1 AND market_id = $2
+                  AND (market_title ILIKE $3 OR market_title ILIKE $4)
+                ORDER BY time DESC
+                LIMIT 1
+                """,
+                trade.platform.value,
+                trade.market_id,
+                f"%[{team_hint}]%",
+                f"%{team_hint}%",
+            )
+
+        if not row:
+            # Fallback: last known row for this market_id (may be wrong team; debug log will tell us)
+            row = await pool.fetchrow(
+                """
+                SELECT yes_bid, yes_ask, market_title, time
+                FROM market_prices
+                WHERE platform = $1 AND market_id = $2
+                ORDER BY time DESC
+                LIMIT 1
+                """,
+                trade.platform.value,
+                trade.market_id,
+            )
         if not row:
             return None
         bid = float(row["yes_bid"])
         ask = float(row["yes_ask"])
-        return (bid + ask) / 2.0
+        mid = (bid + ask) / 2.0
+
+        # region agent log
+        _agent_dbg(
+            "H5",
+            "services/position_manager/position_manager.py:_get_current_price",
+            "exit_price_lookup",
+            {
+                "trade_id": trade.trade_id,
+                "trade_game_id": trade.game_id,
+                "trade_platform": trade.platform.value,
+                "trade_market_id": trade.market_id,
+                "trade_market_title": trade.market_title,
+                "trade_side": trade.side.value,
+                "team_hint": team_hint,
+                "team_filtered": bool(team_hint),
+                "row_market_title": row.get("market_title"),
+                "row_time": str(row.get("time")),
+                "row_yes_bid": bid,
+                "row_yes_ask": ask,
+                "row_mid": mid,
+            },
+        )
+        # endregion
+
+        return mid
 
     async def _execute_exit(
         self,

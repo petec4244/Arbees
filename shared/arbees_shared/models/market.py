@@ -104,6 +104,12 @@ class MarketPrice(BaseModel):
     platform: Platform
     game_id: Optional[str] = None
     market_title: str = ""
+    
+    # Contract team: which team this YES contract is for
+    # For Polymarket moneyline: "Boston Celtics" means YES = Celtics win
+    # For Kalshi: typically the home team for KXMLB-* tickers
+    # None means unknown/not applicable (e.g., O/U markets)
+    contract_team: Optional[str] = None
 
     # Prices (0.0 to 1.0)
     yes_bid: float = Field(ge=0.0, le=1.0)

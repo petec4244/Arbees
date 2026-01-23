@@ -15,11 +15,10 @@ import {
   ChevronUp,
 } from 'lucide-react'
 import { ExposureBySport, ExposureByGame } from '../components/ExposureGauge'
-import LatencyChart from '../components/LatencyChart'
 import { useUIPreferences } from '../hooks/useUIPreferences'
 
 export default function PaperTrading() {
-  const { riskDisplayMode, setRiskDisplayMode, showLatencyChart, setShowLatencyChart } = useUIPreferences()
+  const { riskDisplayMode, setRiskDisplayMode } = useUIPreferences()
   const [showRiskSection, setShowRiskSection] = useState(true)
 
   const { data: status, isLoading: statusLoading } = useQuery({
@@ -143,9 +142,8 @@ export default function PaperTrading() {
                   e.stopPropagation()
                   setRiskDisplayMode('compact')
                 }}
-                className={`px-3 py-1 rounded text-xs transition-colors ${
-                  riskDisplayMode === 'compact' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'
-                }`}
+                className={`px-3 py-1 rounded text-xs transition-colors ${riskDisplayMode === 'compact' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'
+                  }`}
               >
                 Compact
               </button>
@@ -154,9 +152,8 @@ export default function PaperTrading() {
                   e.stopPropagation()
                   setRiskDisplayMode('detailed')
                 }}
-                className={`px-3 py-1 rounded text-xs transition-colors ${
-                  riskDisplayMode === 'detailed' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'
-                }`}
+                className={`px-3 py-1 rounded text-xs transition-colors ${riskDisplayMode === 'detailed' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'
+                  }`}
               >
                 Detailed
               </button>
@@ -198,7 +195,7 @@ export default function PaperTrading() {
                 subtitle={`P95: ${(riskMetrics?.p95_latency_ms || 0).toFixed(0)}ms`}
                 status={
                   riskMetrics?.latency_status === 'critical' ? 'danger' :
-                  riskMetrics?.latency_status === 'warning' ? 'warning' : 'success'
+                    riskMetrics?.latency_status === 'warning' ? 'warning' : 'success'
                 }
               />
             </div>
@@ -216,23 +213,7 @@ export default function PaperTrading() {
               </div>
             )}
 
-            {/* Latency Chart Toggle */}
-            <div className="flex items-center justify-between bg-gray-900/50 rounded p-3">
-              <span className="text-sm text-gray-400">Show Latency Chart</span>
-              <button
-                onClick={() => setShowLatencyChart(!showLatencyChart)}
-                className={`w-12 h-6 rounded-full transition-colors ${
-                  showLatencyChart ? 'bg-green-600' : 'bg-gray-600'
-                }`}
-              >
-                <div className={`w-5 h-5 bg-white rounded-full transition-transform transform ${
-                  showLatencyChart ? 'translate-x-6' : 'translate-x-0.5'
-                }`} />
-              </button>
-            </div>
-
-            {/* Latency Chart */}
-            {showLatencyChart && <LatencyChart height={180} showThresholds />}
+            {/* Latency Chart removed */}
 
             {/* Risk Events Log */}
             {riskDisplayMode === 'detailed' && riskEvents && riskEvents.length > 0 && (
@@ -247,11 +228,10 @@ export default function PaperTrading() {
                       <span className="text-gray-500 font-mono w-20">
                         {event.time ? new Date(event.time).toLocaleTimeString() : '--'}
                       </span>
-                      <span className={`px-1.5 py-0.5 rounded ${
-                        event.event_type === 'APPROVED'
-                          ? 'bg-green-900/50 text-green-300'
-                          : 'bg-red-900/50 text-red-300'
-                      }`}>
+                      <span className={`px-1.5 py-0.5 rounded ${event.event_type === 'APPROVED'
+                        ? 'bg-green-900/50 text-green-300'
+                        : 'bg-red-900/50 text-red-300'
+                        }`}>
                         {event.event_type}
                       </span>
                       <span className="text-gray-400">{event.reason}</span>
@@ -312,19 +292,17 @@ export default function PaperTrading() {
                         <div className="font-medium">
                           {trade.away_team && trade.home_team ? (
                             <>
-                              <span className={`${
-                                trade.entry_price < 0.5
-                                  ? 'text-orange-300 font-semibold'
-                                  : 'text-orange-400/70'
-                              }`}>
+                              <span className={`${trade.entry_price < 0.5
+                                ? 'text-orange-300 font-semibold'
+                                : 'text-orange-400/70'
+                                }`}>
                                 {trade.away_team}
                               </span>
                               <span className="text-gray-500"> @ </span>
-                              <span className={`${
-                                trade.entry_price >= 0.5
-                                  ? 'text-blue-300 font-semibold'
-                                  : 'text-blue-400/70'
-                              }`}>
+                              <span className={`${trade.entry_price >= 0.5
+                                ? 'text-blue-300 font-semibold'
+                                : 'text-blue-400/70'
+                                }`}>
                                 {trade.home_team}
                               </span>
                             </>
@@ -341,12 +319,11 @@ export default function PaperTrading() {
                     </div>
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
-                    <span className={`px-2 py-1 rounded text-xs font-medium ${
-                      trade.side === 'buy'
-                        ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
-                        : 'bg-orange-900/50 text-orange-300 border border-orange-700'
-                    }`}>
-                      {trade.side === 'buy' ? 'HOME' : 'AWAY'}
+                    <span className={`px-2 py-1 rounded text-xs font-medium ${trade.side === 'buy'
+                      ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
+                      : 'bg-orange-900/50 text-orange-300 border border-orange-700'
+                      }`}>
+                      {trade.side === 'buy' ? 'YES' : 'NO'}
                     </span>
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
@@ -368,13 +345,12 @@ export default function PaperTrading() {
                     )}
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
-                    <span className={`px-2 py-1 rounded text-xs font-medium ${
-                      trade.status === 'closed'
-                        ? (trade.outcome === 'win'
-                            ? 'bg-green-900/50 text-green-300'
-                            : 'bg-red-900/50 text-red-300')
-                        : 'bg-yellow-900/50 text-yellow-300'
-                    }`}>
+                    <span className={`px-2 py-1 rounded text-xs font-medium ${trade.status === 'closed'
+                      ? (trade.outcome === 'win'
+                        ? 'bg-green-900/50 text-green-300'
+                        : 'bg-red-900/50 text-red-300')
+                      : 'bg-yellow-900/50 text-yellow-300'
+                      }`}>
                       {trade.status === 'closed' ? trade.outcome.toUpperCase() : 'OPEN'}
                     </span>
                   </td>
@@ -488,12 +464,11 @@ function PositionCard({ position }: { position: any }) {
           <span className="px-1.5 py-0.5 rounded text-xs bg-gray-700 text-gray-300 uppercase font-medium">
             {position.sport}
           </span>
-          <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-            position.side === 'buy'
-              ? 'bg-blue-900/50 text-blue-300'
-              : 'bg-orange-900/50 text-orange-300'
-          }`}>
-            {position.side === 'buy' ? 'HOME' : 'AWAY'}
+          <span className={`px-2 py-0.5 rounded text-xs font-medium ${position.side === 'buy'
+            ? 'bg-blue-900/50 text-blue-300'
+            : 'bg-orange-900/50 text-orange-300'
+            }`}>
+            {position.side === 'buy' ? 'YES' : 'NO'}
           </span>
         </div>
         <span className="text-xs text-gray-500">
@@ -503,19 +478,17 @@ function PositionCard({ position }: { position: any }) {
       <div className="font-medium mb-1">
         {position.away_team && position.home_team ? (
           <>
-            <span className={`${
-              position.entry_price < 0.5
-                ? 'text-orange-300 font-semibold'
-                : 'text-orange-400/70'
-            }`}>
+            <span className={`${position.entry_price < 0.5
+              ? 'text-orange-300 font-semibold'
+              : 'text-orange-400/70'
+              }`}>
               {position.away_team}
             </span>
             <span className="text-gray-500"> @ </span>
-            <span className={`${
-              position.entry_price >= 0.5
-                ? 'text-blue-300 font-semibold'
-                : 'text-blue-400/70'
-            }`}>
+            <span className={`${position.entry_price >= 0.5
+              ? 'text-blue-300 font-semibold'
+              : 'text-blue-400/70'
+              }`}>
               {position.home_team}
             </span>
           </>

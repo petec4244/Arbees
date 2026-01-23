@@ -401,16 +401,29 @@ class KalshiClient(BaseMarketClient):
         price: float,
         quantity: float,
     ) -> dict:
-        """Place an order on Kalshi."""
-        # Convert to Kalshi format
-        data = {
+        """Place an order on Kalshi.
+
+        Note: This client expects `side` to be the contract side: "yes" or "no".
+        (This matches the Kalshi UI and our ExecutionEngine semantics.)
+        """
+        contract_side = side.lower()
+        if contract_side not in ("yes", "no"):
+            raise ValueError(f"Kalshi place_order side must be 'yes' or 'no', got: {side}")
+
+        # Convert to Kalshi format (limit order)
+        data: dict = {
             "ticker": market_id,
-            "action": "buy" if side == "buy" else "sell",
-            "side": "yes",  # We handle no side by inverting price
+            "action": "buy",
+            "side": contract_side,
             "type": "limit",
-            "yes_price": int(price * 100),  # Convert to cents
             "count": int(quantity),
         }
+
+        cents = int(price * 100)
+        if contract_side == "yes":
+            data["yes_price"] = cents
+        else:
+            data["no_price"] = cents
 
         response = await self.post("/portfolio/orders", json=data)
         return response.get("order", {})

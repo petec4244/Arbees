@@ -2,13 +2,14 @@ import { useState, useMemo, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ChevronUp, Activity, Filter, ArrowUpDown, CheckCircle } from 'lucide-react'
 import { useWebSocket } from '../hooks/useWebSocket'
-import WinProbChart from '../components/WinProbChart'
+import GameTracker from '../components/GameTracker'
 
 export default function LiveGames() {
   const { subscribe, lastMessage } = useWebSocket()
   const queryClient = useQueryClient()
   const [selectedSport, setSelectedSport] = useState<string>('ALL')
   const [sortBy, setSortBy] = useState<'time' | 'score'>('time')
+  const [pinnedGames, setPinnedGames] = useState<Set<string>>(new Set())
   const [trackedGames, setTrackedGames] = useState<Set<string>>(new Set())
 
   // Handle incoming WebSocket messages
@@ -34,6 +35,15 @@ export default function LiveGames() {
     setTrackedGames(prev => new Set(prev).add(gameId))
   }
 
+  const togglePin = (gameId: string) => {
+    setPinnedGames(prev => {
+      const next = new Set(prev)
+      if (next.has(gameId)) next.delete(gameId)
+      else next.add(gameId)
+      return next
+    })
+  }
+
   const sports = useMemo(() => {
     if (!games) return []
     const distinct = new Set(games.map((g: any) => g.sport))
@@ -48,14 +58,38 @@ export default function LiveGames() {
       result = result.filter(g => g.sport === selectedSport)
     }
 
-    if (sortBy === 'time') {
-      // Sort by status priority then time
-      // This is a simplified sort logic
-      result.sort((a, b) => b.game_id.localeCompare(a.game_id))
-    }
+    // Filter out finalized games older than 1 hour
+    result = result.filter(g => {
+      if (g.status === 'FINAL' || g.status === 'COMPLETED') {
+        // If we have a timestamp, check if it's > 1 hour ago.
+        // If no timestamp, default to keeping it (or maybe removing it if we can't tell).
+        // Let's assume 'last_update' or 'timestamp' exists.
+        // Based on code, `state.timestamp` exists. `game` usually has one too.
+        const time = g.last_update || g.timestamp;
+        if (time) {
+          const age = Date.now() - new Date(time).getTime();
+          return age < 3600000; // 1 hour
+        }
+        return true;
+      }
+      return true;
+    })
+
+    // Sort by pinned then by selected sort
+    result.sort((a, b) => {
+      const aPinned = pinnedGames.has(a.game_id)
+      const bPinned = pinnedGames.has(b.game_id)
+      if (aPinned && !bPinned) return -1
+      if (!aPinned && bPinned) return 1
+
+      if (sortBy === 'time') {
+        return b.game_id.localeCompare(a.game_id)
+      }
+      return 0
+    })
 
     return result
-  }, [games, selectedSport, sortBy])
+  }, [games, selectedSport, sortBy, pinnedGames])
 
   return (
     <div className="space-y-6 h-full flex flex-col">
@@ -98,6 +132,8 @@ export default function LiveGames() {
               game={game}
               onSubscribe={() => handleSubscribe(game.game_id)}
               isTracked={trackedGames.has(game.game_id)}
+              isPinned={pinnedGames.has(game.game_id)}
+              onTogglePin={() => togglePin(game.game_id)}
             />
           ))}
           {(!isLoading && filteredGames.length === 0) && (
@@ -122,7 +158,7 @@ function formatDataAge(timestamp?: string) {
   return `${Math.floor(age / 60000)}m ago`
 }
 
-function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: () => void; isTracked: boolean }) {
+function GameCard({ game, onSubscribe, isTracked, isPinned, onTogglePin }: { game: any; onSubscribe: () => void; isTracked: boolean; isPinned: boolean; onTogglePin: () => void }) {
   const [expanded, setExpanded] = useState(false)
   const [prevHomeScore, setPrevHomeScore] = useState(game.home_score)
   const [prevAwayScore, setPrevAwayScore] = useState(game.away_score)
@@ -130,6 +166,8 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
   // Detect score changes for animation
   const homeScoreChanged = game.home_score !== prevHomeScore
   const awayScoreChanged = game.away_score !== prevAwayScore
+
+  const isFinal = game.status === 'FINAL' || game.status === 'COMPLETED'
 
   if (homeScoreChanged) setTimeout(() => setPrevHomeScore(game.home_score), 2000)
   if (awayScoreChanged) setTimeout(() => setPrevAwayScore(game.away_score), 2000)
@@ -151,18 +189,43 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
       const res = await fetch(`/api/live-games/${game.game_id}/history`)
       if (!res.ok) return []
       const data = await res.json()
-      // Format for chart
+      // Format for chart (raw values for GameTracker)
       return data.map((d: any) => ({
-        time: new Date(d.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        prob: d.home_win_prob * 100
+        timestamp: new Date(d.time).getTime(),
+        homeValue: d.home_win_prob * 100,
+        awayValue: (1 - d.home_win_prob) * 100
       }))
     },
     enabled: expanded && !!game.game_id,
     staleTime: 60000, // Cache for 1 minute
   })
 
+  // Fetch trades for this game
+  const { data: trades } = useQuery({
+    queryKey: ['gameTrades', game.game_id],
+    queryFn: async () => {
+      const res = await fetch('/api/paper-trading/trades')
+      if (!res.ok) return []
+      const allTrades = await res.json()
+      // Filter for this game and map to chart format
+      return allTrades
+        .filter((t: any) => t.game_id === game.game_id)
+        .map((t: any) => ({
+          id: t.trade_id,
+          entryTime: t.entry_time,
+          entryPrice: t.entry_price,
+          side: t.side,
+          pnl: t.pnl,
+          // Heuristic: If buying Home Win Prob, you bet Home. If selling (shorting), you bet Away.
+          team: t.side === 'buy' ? 'home' : 'away'
+        }))
+    },
+    enabled: expanded,
+    staleTime: 30000
+  })
+
   return (
-    <div className={`bg-gray-800 rounded-lg overflow-hidden transition-all duration-300 ${expanded ? 'col-span-1 md:col-span-2 row-span-2 ring-2 ring-green-500/50' : 'hover:bg-gray-750'}`}>
+    <div className={`bg-gray-800 rounded-lg overflow-hidden transition-all duration-300 ${isFinal ? 'opacity-60 grayscale' : ''} ${expanded ? 'col-span-1 md:col-span-2 row-span-2 ring-2 ring-green-500/50' : 'hover:bg-gray-750'}`}>
       <div className="p-4">
         {/* Header */}
         <div className="flex justify-between items-start mb-4">
@@ -171,7 +234,14 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
               <span className="text-xs font-bold bg-gray-900 border border-gray-700 px-2 py-0.5 rounded text-gray-300 uppercase">
                 {game.sport}
               </span>
-              <span className="text-xs text-red-400 font-semibold animate-pulse">● LIVE</span>
+              <button onClick={(e) => { e.stopPropagation(); onTogglePin(); }} className={`text-xs px-2 py-0.5 rounded border transition-colors ${isPinned ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500/50' : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'}`}>
+                {isPinned ? '★ PINNED' : '☆ PIN'}
+              </button>
+              {isFinal ? (
+                <span className="text-xs text-gray-400 font-bold border border-gray-600 px-2 py-0.5 rounded">FINAL</span>
+              ) : (
+                <span className="text-xs text-red-400 font-semibold animate-pulse">● LIVE</span>
+              )}
             </div>
             {state?.timestamp && (
               <span className="text-[10px] text-gray-500 mt-1 ml-1" title={`Updated: ${new Date(state.timestamp).toLocaleTimeString()}`}>
@@ -190,13 +260,13 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
         {/* Scores */}
         <div className="space-y-3 mb-4">
           <div className="flex justify-between items-center group">
-            <span className="text-gray-300 font-medium truncate max-w-[70%]">{game.away_team || 'Away'}</span>
+            <span className="text-blue-400 font-medium truncate max-w-[70%]">{game.away_team || 'Away'}</span>
             <span className={`text-3xl font-mono font-bold transition-all duration-500 ${awayScoreChanged ? 'text-green-400 scale-125' : 'text-white'}`}>
               {game.away_score}
             </span>
           </div>
           <div className="flex justify-between items-center group">
-            <span className="text-white font-medium truncate max-w-[70%]">{game.home_team || 'Home'}</span>
+            <span className="text-green-400 font-medium truncate max-w-[70%]">{game.home_team || 'Home'}</span>
             <span className={`text-3xl font-mono font-bold transition-all duration-500 ${homeScoreChanged ? 'text-green-400 scale-125' : 'text-white'}`}>
               {game.home_score}
             </span>
@@ -205,35 +275,51 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
 
         {/* Game State Footer */}
         <div className="border-t border-gray-700 pt-3 flex justify-between items-end">
-          <div className="text-sm text-gray-400">
+          <div className="text-sm text-gray-400 w-full">
             {state ? (
               <>
-                <div className="font-mono text-white">Q{state.period} - {state.time_remaining}</div>
-                {state.home_win_prob && (
-                  <div className="mt-1 flex items-center space-x-2">
-                    <span>Win Prob:</span>
-                    <span className={`${state.home_win_prob > 0.5 ? 'text-green-400' : 'text-red-400'} font-bold`}>
+                <div className="font-mono text-white mb-2">Q{state.period} - {state.time_remaining}</div>
+                <div className="flex justify-between items-center">
+                  {/* Home Win Prob + Active Bets */}
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs text-gray-500">Home Prob:</span>
+                    <span className="text-green-400 font-bold font-mono">
                       {(state.home_win_prob * 100).toFixed(1)}%
                     </span>
+                    {/* Fake active bets circles for demo - in real app, derive from 'trades' */}
+                    <div className="flex space-x-1">
+                      {/* Example: 2 positive bets */}
+                      {trades && trades.filter((t: any) => t.team === 'home' && (t.pnl || 0) >= 0).map((t: any) => (
+                        <div key={t.id} className="w-2 h-2 rounded-full bg-green-500" title="Winning Home Bet" />
+                      ))}
+                      {trades && trades.filter((t: any) => t.team === 'home' && (t.pnl || 0) < 0).map((t: any) => (
+                        <div key={t.id} className="w-2 h-2 rounded-full bg-green-900 border border-green-700" title="Losing Home Bet" />
+                      ))}
+                    </div>
                   </div>
-                )}
+
+                  {/* Away "Prob" (1-Home) + Active Bets */}
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs text-gray-500">Away Prob:</span>
+                    <span className="text-blue-400 font-bold font-mono">
+                      {((1 - state.home_win_prob) * 100).toFixed(1)}%
+                    </span>
+                    <div className="flex space-x-1">
+                      {/* Example: Away bets */}
+                      {trades && trades.filter((t: any) => t.team === 'away' && (t.pnl || 0) >= 0).map((t: any) => (
+                        <div key={t.id} className="w-2 h-2 rounded-full bg-green-500" title="Winning Away Bet" />
+                      ))}
+                      {trades && trades.filter((t: any) => t.team === 'away' && (t.pnl || 0) < 0).map((t: any) => (
+                        <div key={t.id} className="w-2 h-2 rounded-full bg-green-900 border border-green-700" title="Losing Away Bet" />
+                      ))}
+                    </div>
+                  </div>
+                </div>
               </>
             ) : (
               <span className="italic">Waiting for updates...</span>
             )}
           </div>
-
-          <button
-            onClick={(e) => { e.stopPropagation(); if (!isTracked) onSubscribe(); }}
-            disabled={isTracked}
-            className={`px-3 py-1.5 text-xs font-medium rounded transition-all flex items-center space-x-1 ${isTracked
-              ? 'bg-green-500/20 text-green-400 cursor-default'
-              : 'bg-blue-600 hover:bg-blue-500 text-white'
-              }`}
-          >
-            {isTracked && <CheckCircle className="w-3 h-3" />}
-            <span>{isTracked ? 'Tracking' : 'Track'}</span>
-          </button>
         </div>
       </div>
 
@@ -246,10 +332,12 @@ function GameCard({ game, onSubscribe, isTracked }: { game: any; onSubscribe: ()
               <span className="text-xs font-bold text-gray-300 uppercase">Win Probability Momentum</span>
             </div>
 
-            <WinProbChart
-              data={history || []}
+            <GameTracker
+              history={history || []}
               homeTeam={game.home_team}
               awayTeam={game.away_team}
+              title="Win Probability"
+              trades={trades || []}
             />
           </div>
         </div>

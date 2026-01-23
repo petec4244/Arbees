@@ -140,6 +140,10 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: INFO
+      # Risk management limits
+      MAX_DAILY_LOSS: "500.0"
+      MAX_GAME_EXPOSURE: "100.0"
+      MAX_SPORT_EXPOSURE: "800.0"
       # Trading parameters
       INITIAL_BANKROLL: "1000"
       MIN_EDGE_PCT: "2.0"
@@ -217,6 +221,9 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - LOG_LEVEL=INFO
+    volumes:
+      # DEBUG MODE: write NDJSON instrumentation to the host workspace file
+      - ./.cursor:/app/.cursor
     restart: unless-stopped
     profiles:
       - full

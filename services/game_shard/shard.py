@@ -45,6 +45,10 @@ class GameContext:
     # Multi-market type support: prices indexed by (MarketType, Platform)
     market_prices: dict[Platform, MarketPrice] = field(default_factory=dict)
     market_prices_by_type: dict[tuple[MarketType, Platform], MarketPrice] = field(default_factory=dict)
+    # NEW: Team-specific prices for Polymarket moneyline (home team + away team)
+    # Key: (Platform, team_name) -> MarketPrice
+    # This allows matching signal.team to the correct contract
+    market_prices_by_team: dict[tuple[Platform, str], MarketPrice] = field(default_factory=dict)
     # Legacy single market IDs (for backwards compatibility)
     market_ids: dict[Platform, str] = field(default_factory=dict)
     # NEW: Multiple market types per game (3-8x more arbitrage opportunities)
@@ -875,11 +879,17 @@ class GameShard:
 
         The polymarket_monitor publishes MarketPrice objects to game:{game_id}:price.
         We filter for platform=polymarket and update the game context accordingly.
+        
+        IMPORTANT: For moneyline markets, we receive TWO prices (one per team).
+        The contract_team field indicates which team this YES contract is for.
         """
         # Check if this is a Polymarket price
         platform_str = data.get("platform")
         if platform_str != Platform.POLYMARKET.value:
             return  # Ignore non-Polymarket prices (e.g., Kalshi publishes here too)
+
+        # Extract contract_team (which team this YES contract is for)
+        contract_team = data.get("contract_team")
 
         # Reconstruct MarketPrice from dict
         try:
@@ -888,6 +898,7 @@ class GameShard:
                 platform=Platform.POLYMARKET,
                 game_id=data.get("game_id"),
                 market_title=data.get("market_title", ""),
+                contract_team=contract_team,
                 yes_bid=float(data.get("yes_bid", 0)),
                 yes_ask=float(data.get("yes_ask", 1)),
                 volume=float(data.get("volume", 0)),
@@ -898,8 +909,20 @@ class GameShard:
             logger.warning(f"Failed to parse Polymarket price from Redis: {e}")
             return
 
-        # Update context with new price (legacy)
-        ctx.market_prices[Platform.POLYMARKET] = price
+        # Store by team if contract_team is specified
+        if contract_team:
+            ctx.market_prices_by_team[(Platform.POLYMARKET, contract_team)] = price
+            logger.debug(f"Stored Polymarket price for team '{contract_team}': bid={price.yes_bid:.3f} ask={price.yes_ask:.3f}")
+            
+            # Also determine if this is the HOME team's contract for legacy compatibility
+            # If so, use this as the "main" Polymarket price
+            if ctx.last_state:
+                home_team = ctx.last_state.home_team or ""
+                if self._teams_match(contract_team, home_team):
+                    ctx.market_prices[Platform.POLYMARKET] = price
+        else:
+            # No contract_team specified - use as generic price (legacy)
+            ctx.market_prices[Platform.POLYMARKET] = price
 
         # Determine market type and update by-type mapping
         market_type = self._determine_market_type(ctx, price.market_id, Platform.POLYMARKET)
@@ -922,6 +945,7 @@ class GameShard:
                 game_id=ctx.game_id,
                 market_title=price.market_title,
                 market_type=data.get("market_type", "moneyline"),
+                contract_team=contract_team,  # Which team's YES contract
             )
 
         # Check for signal generation based on market price change
@@ -1001,6 +1025,15 @@ class GameShard:
         # Update context with new price (legacy)
         ctx.market_prices[platform] = price
 
+        # NEW: Store by team if contract_team is available
+        # This enables proper team matching in signal generation
+        if price.contract_team:
+            ctx.market_prices_by_team[(platform, price.contract_team)] = price
+            logger.debug(
+                f"[WS] Stored {platform.value} price for team '{price.contract_team}': "
+                f"mid={price.mid_price:.3f}"
+            )
+
         # NEW: Store by market type if we can determine it
         market_type = self._determine_market_type(ctx, price.market_id, platform)
         if market_type:
@@ -1010,7 +1043,7 @@ class GameShard:
         if price.market_title:
             ctx.market_titles[price.market_id] = price.market_title
 
-        # Persist to database
+        # Persist to database (include contract_team for team-aware queries)
         if self.db:
             await self.db.insert_market_price(
                 market_id=price.market_id,
@@ -1021,6 +1054,7 @@ class GameShard:
                 liquidity=price.liquidity,
                 game_id=game_id,
                 market_title=price.market_title,
+                contract_team=price.contract_team,  # Track which team's contract
             )
 
         # Publish to Redis
@@ -1051,6 +1085,37 @@ class GameShard:
 
         return None
 
+    def _teams_match(self, team1: str, team2: str) -> bool:
+        """Check if two team names refer to the same team.
+        
+        Handles variations like:
+        - "Boston Celtics" vs "Celtics"
+        - "BOS" vs "Boston Celtics"
+        - Case insensitive
+        """
+        if not team1 or not team2:
+            return False
+            
+        t1 = team1.lower().strip()
+        t2 = team2.lower().strip()
+        
+        # Exact match
+        if t1 == t2:
+            return True
+            
+        # One contains the other
+        if t1 in t2 or t2 in t1:
+            return True
+            
+        # Check last word (team nickname)
+        t1_words = t1.split()
+        t2_words = t2.split()
+        if t1_words and t2_words:
+            if t1_words[-1] == t2_words[-1]:
+                return True
+                
+        return False
+
     async def _check_market_signals(
         self,
         ctx: GameContext,
@@ -1061,16 +1126,45 @@ class GameShard:
 
         This enables faster signal generation based on market price changes
         detected via WebSocket, complementing game-state-based signals.
+
+        IMPORTANT: Must properly match team probabilities to avoid false edges.
+        The price.contract_team tells us which team's YES contract this is.
+        ctx.last_home_win_prob is always for the HOME team.
         """
-        if ctx.last_home_win_prob is None:
+        if ctx.last_home_win_prob is None or not ctx.last_state:
             return
 
-        # Compare model probability vs market price
-        model_prob = ctx.last_home_win_prob
+        # Determine which team this price is for
+        contract_team = price.contract_team
+        if not contract_team:
+            # Can't determine team - skip to avoid mismatched comparison
+            logger.debug(f"Skipping market signal check: unknown contract_team for {price.market_id}")
+            return
+
+        # Determine if this is home or away team's contract
+        home_team = ctx.last_state.home_team
+        is_home_contract = self._teams_match(contract_team, home_team)
+
+        # Get the correct model probability for this team
+        # last_home_win_prob is HOME team's probability
+        if is_home_contract:
+            model_prob = ctx.last_home_win_prob
+            target_team = home_team
+        else:
+            model_prob = 1.0 - ctx.last_home_win_prob  # Away team prob
+            target_team = ctx.last_state.away_team
+
         market_prob = price.mid_price
 
-        # Calculate edge
+        # Calculate edge using MATCHED probabilities
         edge = (model_prob - market_prob) * 100.0
+
+        # Log for debugging
+        logger.debug(
+            f"[{ctx.game_id}] Market signal check: "
+            f"contract_team='{contract_team}' ({'HOME' if is_home_contract else 'AWAY'}), "
+            f"model_prob={model_prob:.3f}, market_prob={market_prob:.3f}, edge={edge:.1f}%"
+        )
 
         # Only signal on significant edge (> 3%)
         if abs(edge) < 3.0:
@@ -1089,19 +1183,19 @@ class GameShard:
             if abs(edge) < (required_edge * 2.0):
                 return
 
-        # Generate signal
+        # Generate signal - use target_team (the team we're betting on)
         signal = TradingSignal(
             signal_id=str(uuid.uuid4()),
             signal_type=SignalType.MARKET_MISPRICING,
             game_id=ctx.game_id,
             sport=ctx.sport,
-            team=ctx.last_state.home_team if edge > 0 else ctx.last_state.away_team if ctx.last_state else None,
+            team=target_team,  # Team this price/probability is for
             direction=direction,
-            model_prob=model_prob,
+            model_prob=model_prob,  # Probability for the TARGET team
             market_prob=market_prob,
             edge_pct=abs(edge),
             confidence=min(1.0, abs(edge) / 10.0),
-            reason=f"Market mispricing detected via WebSocket (model: {model_prob*100:.1f}%, market: {market_prob*100:.1f}%)",
+            reason=f"Market mispricing detected via WebSocket (model: {model_prob*100:.1f}%, market: {market_prob*100:.1f}%, team: {target_team})",
         )
 
         ctx.signals_generated += 1
@@ -1378,6 +1472,7 @@ class GameShard:
                                     liquidity=price.liquidity,
                                     game_id=ctx.game_id,
                                     market_title=price.market_title,
+                                    contract_team=price.contract_team,
                                 )
 
                             if self.redis:
@@ -1448,6 +1543,7 @@ class GameShard:
                                 liquidity=price.liquidity,
                                 game_id=ctx.game_id,
                                 market_title=price.market_title,
+                                contract_team=price.contract_team,
                             )
 
                         if self.redis:
@@ -1519,8 +1615,60 @@ class GameShard:
         # 2. Estimate Fees/Friction (2% round trip estimate)
         estimated_fees = 2.0 
 
-        # Get market price for comparison (optional)
-        market_price = ctx.market_prices.get(Platform.KALSHI) or ctx.market_prices.get(Platform.POLYMARKET)
+        # Determine which team we're betting on based on probability change
+        # prob_change > 0 means HOME team's probability increased → bet on HOME
+        # prob_change < 0 means HOME team's probability decreased → bet on AWAY
+        target_team = new_state.home_team if prob_change > 0 else new_state.away_team
+        is_home_team_bet = prob_change > 0
+
+        # Get market price for the TARGET TEAM's contract
+        # For Polymarket: look up by team name
+        # For Kalshi: typically home team contract, so we may need to invert
+        market_price = None
+        
+        # Try Polymarket team-specific price first
+        if target_team:
+            for (platform, team_name), price in ctx.market_prices_by_team.items():
+                if platform == Platform.POLYMARKET and self._teams_match(team_name, target_team):
+                    market_price = price
+                    logger.debug(f"Using Polymarket price for team '{team_name}': bid={price.yes_bid:.3f}")
+                    break
+        
+        # Fallback to legacy prices
+        if not market_price:
+            market_price = ctx.market_prices.get(Platform.KALSHI) or ctx.market_prices.get(Platform.POLYMARKET)
+            # If we have a Polymarket price, check if it needs inversion
+            # Legacy prices (from REST fallback) may not have contract_team set
+            # In that case, assume it's the HOME team's price (Polymarket default)
+            if market_price and market_price.platform == Platform.POLYMARKET:
+                contract_team = market_price.contract_team
+
+                # If contract_team is None, assume HOME team (common pattern for legacy prices)
+                if not contract_team and ctx.last_state:
+                    contract_team = ctx.last_state.home_team
+                    logger.debug(f"[{ctx.game_id}] Legacy price has no contract_team, assuming HOME team: {contract_team}")
+
+                if contract_team and target_team and not self._teams_match(contract_team, target_team):
+                    # This price is for the OTHER team - INVERT IT
+                    # If Team A has 70% YES, Team B has ~30% YES
+                    inverted_mid = 1.0 - market_price.mid_price
+                    logger.info(
+                        f"[{ctx.game_id}] Inverting Polymarket price: "
+                        f"contract='{contract_team}' (mid={market_price.mid_price:.3f}), "
+                        f"target='{target_team}' -> inverted_mid={inverted_mid:.3f}"
+                    )
+                    # Create a modified price with inverted values
+                    market_price = MarketPrice(
+                        market_id=market_price.market_id,
+                        platform=market_price.platform,
+                        market_title=f"{target_team} (inverted from {contract_team})",
+                        contract_team=target_team,
+                        yes_bid=1.0 - market_price.yes_ask,  # Invert bid/ask
+                        yes_ask=1.0 - market_price.yes_bid,
+                        volume=market_price.volume,
+                        liquidity=market_price.liquidity,
+                        timestamp=market_price.timestamp,
+                    )
 
         if market_price is not None:
             # Check data freshness synchronization
@@ -1546,9 +1694,26 @@ class GameShard:
                  logger.info(f"Signal sync warning for {ctx.game_id}: Game/Market delta {sync_delta:.1f}s > {self.sync_delta_tolerance}s")
             
             # With market data: calculate edge vs market
+            # IMPORTANT: market_prob should be for the SAME team as our model probability
+            # capped_new_prob is HOME team probability
+            # If we're betting on AWAY team, we need to use (1 - capped_new_prob)
             market_prob = market_price.mid_price
-            edge = (capped_new_prob - market_prob) * 100.0
-            
+
+            # Adjust model probability to match target team
+            # capped_new_prob is always HOME win probability
+            model_prob_for_target = capped_new_prob if is_home_team_bet else (1.0 - capped_new_prob)
+
+            edge = (model_prob_for_target - market_prob) * 100.0
+
+            # Log the team-aware calculation
+            logger.info(
+                f"[{ctx.game_id}] Signal calculation: "
+                f"target_team='{target_team}' ({'HOME' if is_home_team_bet else 'AWAY'}), "
+                f"model_prob={model_prob_for_target:.3f}, "
+                f"market_prob={market_prob:.3f} (contract_team='{market_price.contract_team}'), "
+                f"raw_edge={edge:.1f}%"
+            )
+
             # Fee-adjusted edge
             spread = (market_price.yes_ask - market_price.yes_bid) * 100.0
             required_edge = estimated_fees + (spread / 2.0) + 1.0 # 1% extra margin
@@ -1562,8 +1727,10 @@ class GameShard:
             logger.debug(f"Skipping signal for {ctx.game_id}: no market price available")
             return
 
-        # Determine direction based on probability change
-        direction = SignalDirection.BUY if prob_change > 0 else SignalDirection.SELL
+        # Determine direction based on EDGE (market mispricing), not probability change
+        # BUY if edge > 0 (model thinks higher than market = underpriced)
+        # SELL if edge < 0 (model thinks lower than market = overpriced)
+        direction = SignalDirection.BUY if edge > 0 else SignalDirection.SELL
 
         # 3. Hysteresis (Flip-Flop Protection)
         # If we have an active signal in the OPPOSITE direction, we need much stronger evidence to flip
@@ -1574,14 +1741,16 @@ class GameShard:
                  return
 
         # Create signal
+        # IMPORTANT: model_prob should be the probability for the TARGET TEAM (signal.team),
+        # not always home team probability. This ensures edge calculation is consistent.
         signal = TradingSignal(
             signal_id=str(uuid.uuid4()),
             signal_type=SignalType.WIN_PROB_SHIFT,
             game_id=ctx.game_id,
             sport=ctx.sport,
-            team=new_state.home_team if prob_change > 0 else new_state.away_team,
+            team=target_team,  # Use target_team (home if prob_change > 0, away otherwise)
             direction=direction,
-            model_prob=capped_new_prob,
+            model_prob=model_prob_for_target,  # Probability for TARGET team, not always home
             market_prob=market_prob,
             edge_pct=abs(edge),
             confidence=min(1.0, abs(prob_change) * 10),
@@ -1614,8 +1783,9 @@ class GameShard:
             await self.redis.publish_signal(signal)
 
         logger.info(
-            f"Generated signal: {signal.direction.value} {signal.team} "
-            f"(edge: {signal.edge_pct:.1f}%, conf: {signal.confidence:.2f})"
+            f"[{ctx.game_id}] SIGNAL: {signal.direction.value} {signal.team} "
+            f"(model={model_prob_for_target:.1%}, market={market_prob:.1%}, edge={signal.edge_pct:.1f}%, "
+            f"contract_team='{market_price.contract_team}')"
         )
 
     def _calculate_win_prob(self, state: GameState) -> float:
