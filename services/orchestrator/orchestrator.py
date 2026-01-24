@@ -24,10 +24,13 @@ from arbees_shared.messaging.redis_bus import RedisBus, Channel
 from arbees_shared.models.game import GameInfo, Sport
 from arbees_shared.models.market import Platform
 from arbees_shared.models.market_types import MarketType
+from arbees_shared.health.heartbeat import HeartbeatPublisher
+from arbees_shared.models.health import ServiceStatus
 from data_providers.espn.client import ESPNClient
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
 from services.market_discovery.parser import parse_market
+from services.orchestrator.supervisor import Supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +129,23 @@ class Orchestrator:
         # Market discovery mode:
         # - "rust": Orchestrator requests markets from Rust service (fast, concurrent, heavy work offloaded)
         # - "python": Orchestrator performs its own market discovery (legacy / fallback)
+        # Phase 4: "rust" is the ONLY recommended mode in production.
+        # The "python" fallback should only be used for debugging.
         self._market_discovery_mode = os.environ.get("MARKET_DISCOVERY_MODE", "rust").lower()
+        if self._market_discovery_mode != "rust":
+            logger.warning(
+                f"MARKET_DISCOVERY_MODE={self._market_discovery_mode} is not recommended. "
+                "Use 'rust' for production (faster, more reliable)."
+            )
         self._pending_discovery: dict[str, GameInfo] = {}
         self._discovery_cache: dict[str, dict] = {}  # game_id -> discovery result payload
         self._discovery_client: Optional[redis.Redis] = None
         self._discovery_pubsub_task: Optional[asyncio.Task] = None
+        
+        # Discovery health tracking
+        self._discovery_last_response: Optional[datetime] = None
+        self._discovery_timeout_count: int = 0
+        self._discovery_success_count: int = 0
 
         # Pregame discovery (warm caches + subscribe monitor before start)
         self._pregame_discovery_window_hours = int(os.environ.get("PREGAME_DISCOVERY_WINDOW_HOURS", "6"))
@@ -141,6 +156,13 @@ class Orchestrator:
         self._health_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._scheduled_sync_task: Optional[asyncio.Task] = None
+
+        # Heartbeat publisher
+        self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
+
+        # Supervisor for container health monitoring and auto-restart
+        self._supervisor: Optional[Supervisor] = None
+        self._supervisor_enabled = os.environ.get("SUPERVISOR_ENABLED", "true").lower() == "true"
 
     async def start(self) -> None:
         """Start the orchestrator."""
@@ -158,6 +180,12 @@ class Orchestrator:
         await self.redis.psubscribe(
             "shard:*:heartbeat",
             self._handle_shard_heartbeat,
+        )
+
+        # Subscribe to futures handoff events from FuturesMonitor
+        await self.redis.subscribe(
+            "futures:game_starting",
+            self._handle_futures_handoff,
         )
 
         await self.redis.start_listening()
@@ -196,6 +224,27 @@ class Orchestrator:
         self._health_task = asyncio.create_task(self._health_check_loop())
         self._scheduled_sync_task = asyncio.create_task(self._scheduled_games_sync_loop())
 
+        # Start heartbeat publisher
+        self._heartbeat_publisher = HeartbeatPublisher(
+            service="orchestrator",
+            instance_id=os.environ.get("HOSTNAME", "orchestrator-1"),
+        )
+        await self._heartbeat_publisher.start()
+        self._heartbeat_publisher.set_status(ServiceStatus.HEALTHY)
+        self._heartbeat_publisher.update_checks({
+            "redis_ok": True,
+            "db_ok": True,
+            "discovery_rust_ok": self._market_discovery_mode == "rust",
+        })
+
+        # Start supervisor for container health monitoring
+        if self._supervisor_enabled:
+            self._supervisor = Supervisor()
+            await self._supervisor.start()
+            logger.info("Supervisor started (auto-restart enabled)")
+        else:
+            logger.info("Supervisor disabled (SUPERVISOR_ENABLED=false)")
+
         logger.info("Orchestrator started")
 
     async def _listen_discovery_results(self) -> None:
@@ -227,6 +276,10 @@ class Orchestrator:
         if not game_id:
             return
 
+        # Track discovery health
+        self._discovery_last_response = datetime.now(timezone.utc)
+        self._discovery_success_count += 1
+
         # Cache for later
         self._discovery_cache[str(game_id)] = data
 
@@ -235,67 +288,67 @@ class Orchestrator:
         if not game:
             return
 
-        logger.info(
-            f"Discovery result received for game={game_id}: polymarket_moneyline={data.get('polymarket_moneyline')}"
-        )
-
         poly_id = data.get("polymarket_moneyline")
-        if not poly_id:
-            # Nothing actionable yet; keep pending.
-            return
-
-        # Always publish Polymarket assignment so the VPN-backed monitor can start streaming,
-        # even if we can't (yet) resolve a Kalshi market / assign the shard.
-        await self.redis.publish(
-            Channel.MARKET_ASSIGNMENTS.value,
-            {
-                "type": "polymarket_assign",
-                "game_id": game.game_id,
-                "sport": game.sport.value,
-                "markets": [
-                    {"market_type": MarketType.MONEYLINE.value, "condition_id": str(poly_id)}
-                ],
-            },
+        logger.info(
+            f"Discovery result received for game={game_id}: polymarket_moneyline={poly_id}"
         )
+
+        # If we have a Polymarket ID, publish assignment so the VPN-backed monitor can start streaming.
+        if poly_id:
+            await self.redis.publish(
+                Channel.MARKET_ASSIGNMENTS.value,
+                {
+                    "type": "polymarket_assign",
+                    "game_id": game.game_id,
+                    "sport": game.sport.value,
+                    "markets": [
+                        {"market_type": MarketType.MONEYLINE.value, "condition_id": str(poly_id)}
+                    ],
+                },
+            )
 
         shard = self._get_best_shard()
         if not shard:
+            logger.warning(f"No available shards for game {game_id}")
             return
 
         # Kalshi discovery is handled locally (fast cache + authenticated client).
-        # Try to resolve a moneyline ticker quickly; if we can't, keep pending and retry later.
         kalshi_id = await self._find_kalshi_market_by_type(game, MarketType.MONEYLINE)
-        if not kalshi_id:
-            # Still assign the game with Polymarket-only so the shard can generate
-            # MARKET_MISPRICING signals (ESPN win prob vs Polymarket mid price).
-            await self._assign_game_to_shard(
-                game,
-                shard,
-                kalshi_market_id=None,
-                polymarket_market_id=str(poly_id),
-                market_ids_by_type={},
-            )
-            return
 
-        market_ids_by_type: dict[MarketType, dict[Platform, str]] = {
-            MarketType.MONEYLINE: {
-                Platform.KALSHI: str(kalshi_id),
-                Platform.POLYMARKET: str(poly_id),
-            }
-        }
+        # Build market_ids_by_type with whatever markets we found
+        market_ids_by_type: dict[MarketType, dict[Platform, str]] = {}
+        if kalshi_id or poly_id:
+            market_ids_by_type[MarketType.MONEYLINE] = {}
+            if kalshi_id:
+                market_ids_by_type[MarketType.MONEYLINE][Platform.KALSHI] = str(kalshi_id)
+            if poly_id:
+                market_ids_by_type[MarketType.MONEYLINE][Platform.POLYMARKET] = str(poly_id)
 
+        # Assign game even without markets - shard can still track game state from ESPN
+        # and we can discover markets later via periodic re-scan
         await self._assign_game_to_shard(
             game,
             shard,
-            kalshi_market_id=str(kalshi_id),
-            polymarket_market_id=str(poly_id),
+            kalshi_market_id=str(kalshi_id) if kalshi_id else None,
+            polymarket_market_id=str(poly_id) if poly_id else None,
             market_ids_by_type=market_ids_by_type,
         )
+
+        if not kalshi_id and not poly_id:
+            logger.info(f"Game {game_id} assigned without markets - will track ESPN state only")
 
     async def stop(self) -> None:
         """Stop the orchestrator gracefully."""
         logger.info("Stopping Orchestrator")
         self._running = False
+
+        # Stop supervisor
+        if self._supervisor:
+            await self._supervisor.stop()
+
+        # Stop heartbeat publisher
+        if self._heartbeat_publisher:
+            await self._heartbeat_publisher.stop()
 
         # Cancel tasks
         for task in [self._discovery_task, self._health_task, self._heartbeat_task, self._scheduled_sync_task, self._discovery_pubsub_task]:
@@ -342,9 +395,135 @@ class Orchestrator:
         shard = self._shards[shard_id]
         shard.game_count = data.get("game_count", 0)
         shard.max_games = data.get("max_games", 20)
-        shard.games = data.get("games", [])
+        reported_games = set(data.get("games", []))
+        shard.games = list(reported_games)
         shard.last_heartbeat = datetime.utcnow()
         shard.is_healthy = True
+
+        # Reconcile: if we think games are assigned to this shard but the shard
+        # doesn't have them (e.g., shard restarted), clear from _assignments so
+        # they can be re-discovered and re-assigned.
+        games_to_clear = []
+        for game_id, assignment in self._assignments.items():
+            if assignment.shard_id == shard_id and game_id not in reported_games:
+                games_to_clear.append(game_id)
+
+        for game_id in games_to_clear:
+            logger.warning(f"Game {game_id} lost from shard {shard_id}, clearing assignment for re-discovery")
+            del self._assignments[game_id]
+            # Also clear from discovery cache so it gets fresh market data
+            self._discovery_cache.pop(game_id, None)
+
+    async def _handle_futures_handoff(self, data: dict) -> None:
+        """Handle game handoff from FuturesMonitor.
+
+        When FuturesMonitor has been tracking a game pre-start and it's about
+        to begin, it publishes to 'futures:game_starting' with discovered
+        market IDs. We skip the discovery phase and assign directly.
+        """
+        game_id = data.get("game_id")
+        if not game_id:
+            logger.warning("Received futures handoff without game_id")
+            return
+
+        # Check if already assigned
+        if game_id in self._assignments:
+            logger.debug(f"Game {game_id} already assigned, ignoring handoff")
+            return
+
+        sport_str = data.get("sport", "").lower()
+        try:
+            sport = Sport(sport_str)
+        except ValueError:
+            logger.warning(f"Unknown sport in futures handoff: {sport_str}")
+            return
+
+        logger.info(
+            f"FUTURES_HANDOFF | {game_id} | {data.get('away_team')} @ {data.get('home_team')} "
+            f"| kalshi={data.get('kalshi_market_id')} | poly={data.get('polymarket_market_id')}"
+        )
+
+        # Get best available shard
+        shard = self._get_best_shard()
+        if not shard:
+            logger.warning(f"No available shard for futures handoff game {game_id}")
+            return
+
+        # Parse scheduled_time if present
+        scheduled_time = datetime.utcnow()
+        if data.get("scheduled_time"):
+            try:
+                scheduled_time = datetime.fromisoformat(data["scheduled_time"].replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                pass
+
+        # Create GameInfo from handoff data
+        game = GameInfo(
+            game_id=game_id,
+            sport=sport,
+            home_team=data.get("home_team", ""),
+            away_team=data.get("away_team", ""),
+            home_team_abbrev=data.get("home_team_abbrev", ""),
+            away_team_abbrev=data.get("away_team_abbrev", ""),
+            scheduled_time=scheduled_time,
+        )
+
+        # Extract market IDs from handoff
+        kalshi_id = data.get("kalshi_market_id")
+        poly_id = data.get("polymarket_market_id")
+        market_ids_by_type_raw = data.get("market_ids_by_type") or {}
+
+        # Convert market_ids_by_type from serialized format
+        market_ids_by_type: dict[MarketType, dict[Platform, str]] = {}
+        for market_type_str, platforms in market_ids_by_type_raw.items():
+            try:
+                market_type = MarketType(market_type_str)
+                platform_ids = {}
+                for platform_str, market_id in platforms.items():
+                    try:
+                        platform = Platform(platform_str)
+                        platform_ids[platform] = market_id
+                    except ValueError:
+                        pass
+                if platform_ids:
+                    market_ids_by_type[market_type] = platform_ids
+            except ValueError:
+                pass
+
+        # If we have moneyline IDs but no market_ids_by_type, populate it
+        if not market_ids_by_type and (kalshi_id or poly_id):
+            market_ids_by_type[MarketType.MONEYLINE] = {}
+            if kalshi_id:
+                market_ids_by_type[MarketType.MONEYLINE][Platform.KALSHI] = kalshi_id
+            if poly_id:
+                market_ids_by_type[MarketType.MONEYLINE][Platform.POLYMARKET] = poly_id
+
+        # Assign to shard with pre-discovered market IDs
+        await self._assign_game_to_shard(
+            game,
+            shard,
+            kalshi_market_id=kalshi_id,
+            polymarket_market_id=poly_id,
+            market_ids_by_type=market_ids_by_type,
+        )
+
+        # Update lifecycle status in database
+        try:
+            pool = await get_pool()
+            await pool.execute(
+                """
+                UPDATE games
+                SET lifecycle_status = 'live',
+                    status = 'in_progress',
+                    updated_at = NOW()
+                WHERE game_id = $1
+                """,
+                game_id,
+            )
+        except Exception as e:
+            logger.warning(f"Error updating lifecycle status for {game_id}: {e}")
+
+        logger.info(f"Successfully assigned futures handoff game {game_id} to shard {shard.shard_id}")
 
     def _get_best_shard(self) -> Optional[ShardInfo]:
         """Get the shard with most available capacity."""
@@ -602,6 +781,17 @@ class Orchestrator:
                                 kalshi_market_id=str(kalshi_id),
                                 polymarket_market_id=str(cached.get("polymarket_moneyline")),
                                 market_ids_by_type=market_ids_by_type,
+                            )
+                        else:
+                            # Polymarket-only assignment (no Kalshi market found)
+                            # Still assign so shard can generate MARKET_MISPRICING signals
+                            logger.info(f"Assigning game {game.game_id} with Polymarket-only (no Kalshi market)")
+                            await self._assign_game_to_shard(
+                                game,
+                                shard,
+                                kalshi_market_id=None,
+                                polymarket_market_id=str(cached.get("polymarket_moneyline")),
+                                market_ids_by_type={},
                             )
                     continue
 
@@ -1283,6 +1473,16 @@ class Orchestrator:
         while self._running:
             try:
                 await self._check_shard_health()
+                
+                # Update heartbeat metrics
+                if self._heartbeat_publisher:
+                    healthy_shards = sum(1 for s in self._shards.values() if s.is_healthy)
+                    self._heartbeat_publisher.update_metrics({
+                        "shards_total": float(len(self._shards)),
+                        "shards_healthy": float(healthy_shards),
+                        "games_assigned": float(len(self._assignments)),
+                        "discovery_success_count": float(self._discovery_success_count),
+                    })
             except Exception as e:
                 logger.error(f"Error in health check loop: {e}")
 

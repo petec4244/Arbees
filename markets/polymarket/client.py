@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 class PolymarketClient(BaseMarketClient):
     """Async Polymarket CLOB API client."""
 
+    # Default URLs (overridden by config)
     CLOB_URL = "https://clob.polymarket.com"
     GAMMA_URL = "https://gamma-api.polymarket.com"
 
@@ -62,6 +63,8 @@ class PolymarketClient(BaseMarketClient):
         proxy_url: Optional[str] = None,
         use_eu_proxy: bool = False,
         rate_limit: float = 10.0,
+        gamma_url: Optional[str] = None,
+        clob_url: Optional[str] = None,
     ):
         """
         Initialize Polymarket client.
@@ -71,24 +74,34 @@ class PolymarketClient(BaseMarketClient):
             proxy_url: Optional proxy URL for routing
             use_eu_proxy: If True, use EU proxy service (for regulatory compliance)
             rate_limit: Max requests per second
+            gamma_url: Override Gamma API URL (or use POLYMARKET_GAMMA_URL env var)
+            clob_url: Override CLOB API URL (or use POLYMARKET_CLOB_URL env var)
         """
+        # Import config for URL resolution
+        from markets.polymarket.config import (
+            get_polymarket_gamma_url,
+            get_polymarket_clob_url,
+            get_polymarket_api_key,
+            get_polymarket_proxy_url,
+        )
+        
+        # Resolve URLs
+        self._gamma_url = get_polymarket_gamma_url(override_url=gamma_url)
+        self._clob_url = get_polymarket_clob_url(override_url=clob_url)
+        
         super().__init__(
-            base_url=self.CLOB_URL,
+            base_url=self._clob_url,
             platform=Platform.POLYMARKET,
             rate_limit=rate_limit,
         )
 
-        self.api_key = api_key or os.environ.get("POLYMARKET_API_KEY")
+        self.api_key = api_key or get_polymarket_api_key()
         self.proxy_url = proxy_url
         self._token_id_cache: dict[str, Optional[str]] = {}
 
         # EU proxy configuration for regulatory compliance
-        # EU proxy configuration for regulatory compliance
-        if use_eu_proxy or os.environ.get("POLYMARKET_PROXY_URL"):
-            self.proxy_url = os.environ.get(
-                "POLYMARKET_PROXY_URL",
-                proxy_url  # Fallback to init arg
-            )
+        if use_eu_proxy or get_polymarket_proxy_url():
+            self.proxy_url = get_polymarket_proxy_url() or proxy_url
             if self.proxy_url:
                 logger.info(f"Polymarket client using proxy: {self.proxy_url}")
 
@@ -123,7 +136,7 @@ class PolymarketClient(BaseMarketClient):
     ) -> Any:
         """Make request to Gamma API."""
         session = self._ensure_connected()
-        url = f"{self.GAMMA_URL}{endpoint}"
+        url = f"{self._gamma_url}{endpoint}"
 
         await self._rate_limiter.acquire()
 
@@ -144,7 +157,7 @@ class PolymarketClient(BaseMarketClient):
     ) -> Any:
         """Make request to CLOB API."""
         session = self._ensure_connected()
-        url = f"{self.CLOB_URL}{endpoint}"
+        url = f"{self._clob_url}{endpoint}"
 
         await self._rate_limiter.acquire()
 
@@ -160,6 +173,61 @@ class PolymarketClient(BaseMarketClient):
     # ==========================================================================
     # Token ID Resolution
     # ==========================================================================
+
+    def _is_token_id(self, market_id: str) -> bool:
+        """
+        Detect if a market_id is a token_id vs condition_id.
+        
+        Token IDs: Numeric strings (digits only), typically long (50-80+ chars)
+            Example: "12345678901234567890123456789012345678901234567890"
+        
+        Condition IDs: Hex strings, often with 0x prefix
+            Example: "0xabc123..." or "abc123def456..."
+        
+        Returns True if market_id looks like a token_id (numeric).
+        """
+        if not market_id or not isinstance(market_id, str):
+            return False
+        
+        # Strip whitespace
+        market_id = market_id.strip()
+        
+        # Token IDs are purely numeric
+        if market_id.isdigit():
+            return True
+        
+        # Condition IDs typically have hex chars or 0x prefix
+        # If it has any non-digit chars, it's likely a condition_id
+        return False
+
+    def _is_condition_id(self, market_id: str) -> bool:
+        """
+        Detect if a market_id is a condition_id (hex format).
+        
+        Condition IDs: Hex strings, with or without 0x prefix
+            Example: "0xabc123..." or "abc123def456..."
+        
+        Returns True if market_id looks like a condition_id (hex).
+        """
+        if not market_id or not isinstance(market_id, str):
+            return False
+        
+        market_id = market_id.strip()
+        
+        # Check for 0x prefix (definitely hex)
+        if market_id.startswith("0x"):
+            return True
+        
+        # If it contains any hex letters (a-f), likely condition_id
+        if any(c in "abcdefABCDEF" for c in market_id):
+            return True
+        
+        # If it's purely numeric, it's a token_id, not condition_id
+        if market_id.isdigit():
+            return False
+        
+        # Default: assume condition_id if we can't tell
+        return True
 
     def _is_valid_token_id(self, token_id: Optional[str]) -> bool:
         """Validate that a token_id looks legitimate."""
@@ -360,16 +428,20 @@ class PolymarketClient(BaseMarketClient):
         """Get order book for a market (by condition_id or token_id)."""
         # First, resolve to token_id if given condition_id
         token_id = market_id
-        if len(market_id) < 30:
-            # Likely a condition_id, need to resolve
+        
+        # Use robust detection instead of length heuristic
+        if self._is_condition_id(market_id):
+            # Need to resolve condition_id to token_id
             market = await self.get_market(market_id)
             if market:
                 resolved = await self.resolve_yes_token_id(market)
                 if resolved:
                     token_id = resolved
                 else:
+                    logger.debug(f"Could not resolve token_id for condition_id: {market_id}")
                     return None
             else:
+                logger.debug(f"Market not found for condition_id: {market_id}")
                 return None
 
         try:

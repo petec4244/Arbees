@@ -29,6 +29,8 @@ from loguru import logger
 
 from arbees_shared.messaging.redis_bus import RedisBus, Channel, deserialize
 from arbees_shared.models.market import MarketPrice, MarketStatus, Platform
+from arbees_shared.health.heartbeat import HeartbeatPublisher
+from arbees_shared.models.health import ServiceStatus
 from markets.polymarket.hybrid_client import HybridPolymarketClient
 
 
@@ -70,6 +72,9 @@ class PolymarketMonitor:
         self._last_price_time: Optional[datetime] = None
         self._prices_published = 0
         self._poll_interval_s = float(os.environ.get("POLYMARKET_POLL_INTERVAL_SECONDS", "2.0"))
+
+        # Heartbeat publisher for health monitoring
+        self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
     # region agent log (helper)
     def _agent_dbg(self, hypothesisId: str, location: str, message: str, data: dict) -> None:
@@ -116,6 +121,19 @@ class PolymarketMonitor:
             except NotImplementedError:
                 pass  # Windows
 
+        # Start heartbeat publisher
+        self._heartbeat_publisher = HeartbeatPublisher(
+            service="polymarket_monitor",
+            instance_id=os.environ.get("HOSTNAME", "polymarket-monitor-1"),
+        )
+        await self._heartbeat_publisher.start()
+        self._heartbeat_publisher.set_status(ServiceStatus.HEALTHY)
+        self._heartbeat_publisher.update_checks({
+            "redis_ok": True,
+            "vpn_ok": self._health_ok,
+            "ws_ok": False,  # Will be updated when WS connects
+        })
+
         logger.info("PolymarketMonitor started successfully")
 
         # Run concurrent tasks
@@ -131,6 +149,10 @@ class PolymarketMonitor:
         """Graceful shutdown."""
         logger.info("Stopping PolymarketMonitor...")
         self._running = False
+
+        # Stop heartbeat publisher
+        if self._heartbeat_publisher:
+            await self._heartbeat_publisher.stop()
 
         await self.poly_client.disconnect()
         await self.redis.disconnect()
@@ -476,6 +498,8 @@ class PolymarketMonitor:
                                 contract_team=None,  # Unknown team
                                 yes_bid=polled.yes_bid,
                                 yes_ask=polled.yes_ask,
+                                yes_bid_size=float(getattr(polled, "yes_bid_size", 0.0) or 0.0),
+                                yes_ask_size=float(getattr(polled, "yes_ask_size", 0.0) or 0.0),
                                 volume=meta.get("volume", polled.volume),
                                 liquidity=polled.liquidity,
                                 status=polled.status,
@@ -539,6 +563,8 @@ class PolymarketMonitor:
                             contract_team=outcome,
                             yes_bid=yes_bid,
                             yes_ask=yes_ask,
+                            yes_bid_size=0.0,
+                            yes_ask_size=0.0,
                             volume=meta.get("volume", 0),
                             liquidity=float(market_data.get("liquidity", 0) or 0),
                             status=MarketStatus.OPEN,
@@ -568,17 +594,38 @@ class PolymarketMonitor:
                 await self._verify_vpn()
 
                 # Check WebSocket connection
-                if self.subscribed_tokens and not self.poly_client.ws_connected:
+                ws_ok = self.poly_client.ws_connected
+                if self.subscribed_tokens and not ws_ok:
                     logger.warning("Polymarket WS disconnected, reconnecting...")
                     # The stream_prices loop will handle reconnection
 
                 # Check for stale data
+                staleness_s = 0.0
                 if self._last_price_time:
-                    staleness = (datetime.utcnow() - self._last_price_time).total_seconds()
-                    if staleness > 120 and self.subscribed_tokens:
-                        logger.warning(f"Price data stale ({staleness:.0f}s), may need reconnection")
+                    staleness_s = (datetime.utcnow() - self._last_price_time).total_seconds()
+                    if staleness_s > 120 and self.subscribed_tokens:
+                        logger.warning(f"Price data stale ({staleness_s:.0f}s), may need reconnection")
 
                 self._health_ok = True
+
+                # Update heartbeat publisher
+                if self._heartbeat_publisher:
+                    self._heartbeat_publisher.update_checks({
+                        "redis_ok": True,
+                        "vpn_ok": self._health_ok,
+                        "ws_ok": ws_ok,
+                    })
+                    self._heartbeat_publisher.update_metrics({
+                        "subscribed_markets": float(len(self.subscribed_conditions)),
+                        "prices_published": float(self._prices_published),
+                        "last_price_age_s": staleness_s,
+                    })
+                    if self._health_ok and ws_ok:
+                        self._heartbeat_publisher.set_status(ServiceStatus.HEALTHY)
+                    elif self._health_ok:
+                        self._heartbeat_publisher.set_status(ServiceStatus.DEGRADED)
+                    else:
+                        self._heartbeat_publisher.set_status(ServiceStatus.UNHEALTHY)
 
                 # Publish health status
                 await self.redis.publish(Channel.SYSTEM_ALERTS.value, {
@@ -593,6 +640,10 @@ class PolymarketMonitor:
             except Exception as e:
                 logger.error(f"Health check failed: {e}")
                 self._health_ok = False
+
+                # Update heartbeat publisher
+                if self._heartbeat_publisher:
+                    self._heartbeat_publisher.set_unhealthy(str(e))
 
                 # Publish alert
                 await self.redis.publish(Channel.SYSTEM_ALERTS.value, {

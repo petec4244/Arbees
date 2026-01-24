@@ -2,9 +2,13 @@
 Kalshi WebSocket client for real-time market data streaming.
 
 Provides 10-50ms latency vs 500-3000ms with REST polling.
+
+Auth: Uses RSA-PSS signed headers (KALSHI-ACCESS-*), same as REST API.
+Schema: Kalshi sends 'yes' and 'no' bid arrays. To get YES ask, use 100 - best NO bid.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -13,6 +17,9 @@ from typing import AsyncIterator, Optional, Set
 
 import websockets
 from websockets.client import WebSocketClientProtocol
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from arbees_shared.models.market import MarketPrice, Platform
 
@@ -30,6 +37,7 @@ class KalshiWebSocketClient:
     - Heartbeat/ping-pong to keep connection alive
     """
     
+    # Default URL (overridden by config)
     WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     PING_INTERVAL = 30  # seconds
     RECONNECT_DELAY_BASE = 1.0  # seconds
@@ -40,17 +48,56 @@ class KalshiWebSocketClient:
         api_key: Optional[str] = None,
         private_key_path: Optional[str] = None,
         private_key_str: Optional[str] = None,
+        ws_url: Optional[str] = None,
+        env: Optional[str] = None,
     ):
         """
         Initialize Kalshi WebSocket client.
 
         Args:
-            api_key: Kalshi API key for authentication (or KALSHI_API_KEY env var)
+            api_key: Kalshi API key for authentication (or from env based on KALSHI_ENV)
             private_key_path: Path to RSA private key PEM file (unused, for compatibility)
             private_key_str: RSA private key as string (unused, for compatibility)
+            ws_url: Override WebSocket URL (or use KALSHI_WS_URL env var)
+            env: Environment name ("prod" or "demo"), defaults to KALSHI_ENV
         """
         import os
-        self.api_key = api_key or os.environ.get("KALSHI_API_KEY", "")
+        from markets.kalshi.config import (
+            KalshiEnvironment,
+            get_kalshi_ws_url,
+            get_kalshi_api_key,
+            get_kalshi_private_key,
+            get_kalshi_private_key_path,
+        )
+        
+        # Resolve environment
+        kalshi_env = None
+        if env:
+            try:
+                kalshi_env = KalshiEnvironment(env.lower())
+            except ValueError:
+                pass
+        
+        # Resolve WebSocket URL
+        self._ws_url = get_kalshi_ws_url(env=kalshi_env, override_url=ws_url)
+        
+        # Resolve API key
+        self.api_key = api_key or get_kalshi_api_key(env=kalshi_env)
+        
+        # Load RSA private key for signing (required for authenticated WS)
+        self._private_key: Optional[RSAPrivateKey] = None
+        if private_key_str:
+            self._load_private_key_from_string(private_key_str)
+        elif private_key_path:
+            self._load_private_key_from_file(private_key_path)
+        else:
+            # Try environment-aware key resolution
+            env_key_str = get_kalshi_private_key(env=kalshi_env)
+            env_key_path = get_kalshi_private_key_path(env=kalshi_env)
+            if env_key_str:
+                self._load_private_key_from_string(env_key_str)
+            elif env_key_path:
+                self._load_private_key_from_file(env_key_path)
         self._ws: Optional[WebSocketClientProtocol] = None
         self._subscribed_markets: Set[str] = set()
         self._running = False
@@ -73,21 +120,78 @@ class KalshiWebSocketClient:
         """Check if WebSocket is connected."""
         return self._ws is not None and not self._ws.closed
     
+    def _load_private_key_from_file(self, path: str) -> None:
+        """Load RSA private key from PEM file."""
+        try:
+            with open(path, "rb") as f:
+                self._private_key = serialization.load_pem_private_key(
+                    f.read(),
+                    password=None,
+                )
+            logger.info("Loaded Kalshi WS private key from file")
+        except Exception as e:
+            logger.error(f"Failed to load private key from {path}: {e}")
+            raise
+
+    def _load_private_key_from_string(self, key_str: str) -> None:
+        """Load RSA private key from PEM string."""
+        try:
+            self._private_key = serialization.load_pem_private_key(
+                key_str.encode(),
+                password=None,
+            )
+            logger.info("Loaded Kalshi WS private key from string")
+        except Exception as e:
+            logger.error(f"Failed to load private key from string: {e}")
+            raise
+
+    def _generate_signature(self, timestamp_ms: int, method: str, path: str) -> str:
+        """Generate RSA-PSS signature for WebSocket authentication."""
+        if not self._private_key:
+            logger.warning("No private key loaded for Kalshi WS signature")
+            return ""
+        
+        # Signature format: timestamp + method + path
+        message = f"{timestamp_ms}{method}{path}"
+        message_bytes = message.encode("utf-8")
+        
+        signature = self._private_key.sign(
+            message_bytes,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        
+        return base64.b64encode(signature).decode("utf-8")
+    
     async def connect(self) -> None:
-        """Connect to Kalshi WebSocket."""
+        """Connect to Kalshi WebSocket with RSA-signed authentication."""
         if self.is_connected:
             logger.warning("Already connected to Kalshi WebSocket")
             return
         
         try:
-            logger.info(f"Connecting to Kalshi WebSocket: {self.WS_URL}")
+            logger.info(f"Connecting to Kalshi WebSocket: {self._ws_url}")
             
-            # Connect with authentication
+            # Generate RSA-PSS signed headers (matches Rust bot implementation)
+            timestamp_ms = int(time.time() * 1000)
+            # WS path for signature: /trade-api/ws/v2
+            ws_path = "/trade-api/ws/v2"
+            signature = self._generate_signature(timestamp_ms, "GET", ws_path)
+            
+            # Auth headers (same as REST API, per Kalshi docs)
+            auth_headers = {
+                "KALSHI-ACCESS-KEY": self.api_key,
+                "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+                "KALSHI-ACCESS-SIGNATURE": signature,
+            }
+            
+            # Connect with RSA-signed authentication
             self._ws = await websockets.connect(
-                self.WS_URL,
-                extra_headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                },
+                self._ws_url,
+                extra_headers=auth_headers,
                 ping_interval=None,  # We handle ping ourselves
             )
             
@@ -241,9 +345,10 @@ class KalshiWebSocketClient:
                     data = json.loads(message)
                     
                     # Handle different message types
-                    msg_type = data.get("type")
+                    # Kalshi uses 'type' for top-level message type, or 'msg_type' in wrapped format
+                    msg_type = data.get("type") or data.get("msg_type")
                     
-                    if msg_type == "orderbook_delta":
+                    if msg_type in ("orderbook_delta", "orderbook_snapshot"):
                         # Price update - add to queue
                         try:
                             self._message_queue.put_nowait(data)
@@ -259,6 +364,10 @@ class KalshiWebSocketClient:
                     
                     elif msg_type == "subscribed":
                         logger.debug(f"Subscription confirmed: {data.get('channel')}")
+                    
+                    elif msg_type is None:
+                        # Unknown format - log for debugging
+                        logger.debug(f"Kalshi WS message without type: {str(data)[:200]}")
                     
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid JSON from Kalshi WebSocket: {message}")
@@ -331,40 +440,64 @@ class KalshiWebSocketClient:
     
     def _parse_price_update(self, data: dict) -> Optional[MarketPrice]:
         """
-        Parse Kalshi orderbook_delta message to MarketPrice.
+        Parse Kalshi orderbook_delta/orderbook_snapshot message to MarketPrice.
+        
+        Kalshi WebSocket schema (per official docs + Rust reference):
+        - `msg.yes`: YES side bids (what people will pay to buy YES) - [[price_cents, qty], ...]
+        - `msg.no`: NO side bids (what people will pay to buy NO) - [[price_cents, qty], ...]
+        
+        To compute effective prices:
+        - YES bid = best YES bid (highest price in `yes` array)
+        - YES ask = 100 - best NO bid (to buy YES, you sell NO at best NO bid)
         
         Args:
-            data: WebSocket message data
+            data: WebSocket message data (contains `msg` with market data)
             
         Returns:
             MarketPrice or None if parsing fails
         """
         try:
-            market_ticker = data.get("market_ticker")
+            # Handle both wrapped (msg.market_ticker) and flat (market_ticker) formats
+            msg = data.get("msg", data)
+            market_ticker = msg.get("market_ticker")
             if not market_ticker:
                 return None
             
-            # Extract best bid/ask from orderbook delta
-            yes_bids = data.get("yes_bids", [])
-            yes_asks = data.get("yes_asks", [])
+            # Kalshi sends 'yes' and 'no' bid arrays (NOT yes_bids/yes_asks!)
+            yes_side = msg.get("yes", [])  # YES bids: [[price_cents, qty], ...]
+            no_side = msg.get("no", [])     # NO bids: [[price_cents, qty], ...]
             
-            # Bids/asks are [price_cents, quantity] tuples
-            yes_bid = yes_bids[0][0] / 100.0 if yes_bids else 0.0
-            yes_ask = yes_asks[0][0] / 100.0 if yes_asks else 1.0
+            # Filter for levels with quantity > 0
+            yes_levels = [(l[0], l[1]) for l in yes_side if len(l) >= 2 and l[1] > 0]
+            no_levels = [(l[0], l[1]) for l in no_side if len(l) >= 2 and l[1] > 0]
             
-            # Extract depth (size at top of book)
-            yes_bid_size = float(yes_bids[0][1]) if yes_bids else 0.0
-            yes_ask_size = float(yes_asks[0][1]) if yes_asks else 0.0
+            # Best YES bid = highest price in yes_levels
+            best_yes_bid = max(yes_levels, key=lambda x: x[0]) if yes_levels else None
+            # Best NO bid = highest price in no_levels
+            best_no_bid = max(no_levels, key=lambda x: x[0]) if no_levels else None
             
-            # Calculate liquidity (sum of bid quantities)
-            liquidity = sum(bid[1] for bid in yes_bids) if yes_bids else 0.0
+            # YES bid = best YES bid price (what you get when selling YES)
+            yes_bid = best_yes_bid[0] / 100.0 if best_yes_bid else 0.0
+            yes_bid_size = float(best_yes_bid[1]) if best_yes_bid else 0.0
             
-            timestamp_ms = data.get("timestamp") or int(time.time() * 1000)
+            # YES ask = 100 - best NO bid (to buy YES, you pay 100 - NO_bid)
+            # This is because buying YES = selling NO at the NO bid
+            if best_no_bid:
+                yes_ask = (100 - best_no_bid[0]) / 100.0
+                yes_ask_size = float(best_no_bid[1])
+            else:
+                yes_ask = 1.0
+                yes_ask_size = 0.0
+            
+            # Calculate liquidity (sum of YES bid quantities)
+            liquidity = sum(qty for _, qty in yes_levels) if yes_levels else 0.0
+            
+            timestamp_ms = msg.get("timestamp") or int(time.time() * 1000)
             
             return MarketPrice(
                 market_id=market_ticker,
                 platform=Platform.KALSHI,
-                market_title=data.get("title", market_ticker),
+                market_title=msg.get("title", market_ticker),
                 yes_bid=yes_bid,
                 yes_ask=yes_ask,
                 yes_bid_size=yes_bid_size,

@@ -176,6 +176,8 @@ CREATE TABLE market_prices (
     market_title TEXT,
     yes_bid DECIMAL(5, 4) NOT NULL,
     yes_ask DECIMAL(5, 4) NOT NULL,
+    yes_bid_size DECIMAL(14, 2) DEFAULT 0,
+    yes_ask_size DECIMAL(14, 2) DEFAULT 0,
     volume DECIMAL(14, 2) DEFAULT 0,
     open_interest DECIMAL(14, 2) DEFAULT 0,
     liquidity DECIMAL(14, 2) DEFAULT 0,

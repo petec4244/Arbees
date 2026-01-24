@@ -34,20 +34,33 @@ services:
       timeout: 5s
       retries: 5
 
+  # ==========================================================================
+  # Market Discovery (Rust) - NO VPN needed (Gamma API is public)
+  # ==========================================================================
   market-discovery-rust:
     build:
       context: .
       dockerfile: services/market_discovery_rust/Dockerfile
     container_name: arbees-market-discovery
-    network_mode: "service:vpn"
     depends_on:
-      vpn:
+      redis:
         condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
     profiles:
       - full
+
+  # ==========================================================================
+  # Phase 4: Discovery Coordinator (orchestrator + market_discovery_rust)
+  # ==========================================================================
+  # These two services form a logical "discovery coordinator" unit:
+  # - orchestrator: Game discovery (ESPN), shard assignment, health monitoring
+  # - market-discovery-rust: Market ID lookup (Polymarket/Kalshi)
+  #
+  # They communicate via Redis pub/sub (discovery:requests / discovery:results).
+  # In production, both should always be running together.
+  # ==========================================================================
 
   orchestrator:
     build:
@@ -65,9 +78,22 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: DEBUG
-      POLYMARKET_VIA_REDIS: ${POLYMARKET_VIA_REDIS:-true}
+      # Phase 4: Always use Rust discovery in production
+      MARKET_DISCOVERY_MODE: "rust"
+      # Supervisor (container health monitoring + auto-restart)
+      SUPERVISOR_ENABLED: ${SUPERVISOR_ENABLED:-true}
+      MAX_RESTART_ATTEMPTS: ${MAX_RESTART_ATTEMPTS:-3}
+      RESTART_BACKOFF_SECS: ${RESTART_BACKOFF_SECS:-5,15,45}
+      RESTART_COOLDOWN_SECS: ${RESTART_COOLDOWN_SECS:-600}
+      SUPERVISOR_CHECK_INTERVAL_SECS: ${SUPERVISOR_CHECK_INTERVAL_SECS:-15}
+      HEARTBEAT_MISS_THRESHOLD: ${HEARTBEAT_MISS_THRESHOLD:-3}
+      # Heartbeat settings (all services use these)
+      HEARTBEAT_INTERVAL_SECS: ${HEARTBEAT_INTERVAL_SECS:-10}
+      HEARTBEAT_TTL_SECS: ${HEARTBEAT_TTL_SECS:-35}
     volumes:
       - ./:/app
+      # Mount Docker socket for supervisor to restart containers
+      - /var/run/docker.sock:/var/run/docker.sock
     profiles:
       - full
 
@@ -93,7 +119,8 @@ services:
       HALFTIME_INTERVAL: ${HALFTIME_INTERVAL:-30.0}
       MARKET_DATA_TTL: ${MARKET_DATA_TTL:-4.0}
       SYNC_DELTA_TOLERANCE: ${SYNC_DELTA_TOLERANCE:-2.0}
-      POLYMARKET_VIA_REDIS: ${POLYMARKET_VIA_REDIS:-true}
+      # Phase 3: Always use Redis for Polymarket prices (via polymarket_monitor)
+      POLYMARKET_VIA_REDIS: "true"
     ports:
       - "8001:80"
     volumes:
@@ -124,6 +151,106 @@ services:
     profiles:
       - full
 
+  # ==========================================================================
+  # Phase 1: Split Position Manager into Signal Processor + Execution + Tracker
+  # ==========================================================================
+
+  signal_processor:
+    build:
+      context: .
+      dockerfile: services/signal_processor/Dockerfile
+    container_name: arbees-signal-processor
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      # Risk management limits
+      MAX_DAILY_LOSS: "500.0"
+      MAX_GAME_EXPOSURE: "100.0"
+      MAX_SPORT_EXPOSURE: "800.0"
+      # Trading parameters
+      MIN_EDGE_PCT: "2.0"
+      KELLY_FRACTION: "0.25"
+      MAX_POSITION_PCT: "10.0"
+      MAX_BUY_PROB: "0.95"
+      MIN_SELL_PROB: "0.05"
+      INITIAL_BANKROLL: "1000"
+      # Cooldown timers
+      WIN_COOLDOWN_SECONDS: "180"
+      LOSS_COOLDOWN_SECONDS: "300"
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
+  execution_service:
+    build:
+      context: .
+      dockerfile: services/execution_service/Dockerfile
+    container_name: arbees-execution-service
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      PAPER_TRADING: "1"  # Set to "0" for real trading
+      INITIAL_BANKROLL: "1000"
+      MIN_EDGE_PCT: "2.0"
+      KELLY_FRACTION: "0.25"
+      MAX_POSITION_PCT: "10.0"
+      SLIPPAGE_BPS: "10.0"
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
+  position_tracker:
+    build:
+      context: .
+      dockerfile: services/position_tracker/Dockerfile
+    container_name: arbees-position-tracker
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      INITIAL_BANKROLL: "1000"
+      # Exit monitoring parameters
+      TAKE_PROFIT_PCT: "3.0"
+      DEFAULT_STOP_LOSS_PCT: "5.0"
+      EXIT_CHECK_INTERVAL: "1.0"
+      # Sport-specific stop-loss thresholds
+      STOP_LOSS_NBA: "3.0"
+      STOP_LOSS_NCAAB: "3.0"
+      STOP_LOSS_NFL: "5.0"
+      STOP_LOSS_NHL: "7.0"
+      STOP_LOSS_MLB: "6.0"
+      STOP_LOSS_SOCCER: "7.0"
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+
+  # Legacy position_manager (kept for backward compatibility, can be removed)
   position_manager:
     build:
       context: .
@@ -166,13 +293,17 @@ services:
     volumes:
       - ./:/app
     profiles:
-      - full
+      - legacy
 
-  archiver:
+  # ==========================================================================
+  # Phase 2: Merged Analytics Service (archiver + ml_analyzer)
+  # ==========================================================================
+
+  analytics_service:
     build:
       context: .
-      dockerfile: services/archiver/Dockerfile
-    container_name: arbees-archiver
+      dockerfile: services/analytics_service/Dockerfile
+    container_name: arbees-analytics
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -189,27 +320,6 @@ services:
       ARCHIVER_BATCH_SIZE: "10"
       ARCHIVER_POLL_INTERVAL: "300"
       ARCHIVER_CLEANUP_LIVE_DATA: "false"
-    volumes:
-      - ./:/app
-    profiles:
-      - full
-
-  ml_analyzer:
-    build:
-      context: .
-      dockerfile: services/ml_analyzer/Dockerfile
-    container_name: arbees-ml-analyzer
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
       # ML Analyzer configuration
       ML_ANALYZER_RUN_TIME: "23:00"
       ML_MIN_TRADES: "100"
@@ -236,6 +346,104 @@ services:
     profiles:
       - full
 
+  # Legacy archiver (kept for backward compatibility)
+  archiver:
+    build:
+      context: .
+      dockerfile: services/archiver/Dockerfile
+    container_name: arbees-archiver
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      ARCHIVER_GRACE_PERIOD_MINUTES: "60"
+      ARCHIVER_BATCH_SIZE: "10"
+      ARCHIVER_POLL_INTERVAL: "300"
+      ARCHIVER_CLEANUP_LIVE_DATA: "false"
+    volumes:
+      - ./:/app
+    profiles:
+      - legacy
+
+  # Legacy ml_analyzer (kept for backward compatibility)
+  ml_analyzer:
+    build:
+      context: .
+      dockerfile: services/ml_analyzer/Dockerfile
+    container_name: arbees-ml-analyzer
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      ML_ANALYZER_RUN_TIME: "23:00"
+      ML_MIN_TRADES: "100"
+      ML_LOOKBACK_DAYS: "30"
+      ML_RETRAIN_INTERVAL: "7"
+      ML_REPORT_DIR: "/app/reports"
+      ML_ENABLE_FILE_DELIVERY: "true"
+      ML_SLACK_ENABLED: "${ML_SLACK_ENABLED:-false}"
+      ML_SLACK_WEBHOOK: "${ML_SLACK_WEBHOOK:-}"
+      ML_SLACK_CHANNEL: "${ML_SLACK_CHANNEL:-}"
+      ML_EMAIL_ENABLED: "${ML_EMAIL_ENABLED:-false}"
+      ML_SMTP_HOST: "${ML_SMTP_HOST:-smtp.gmail.com}"
+      ML_SMTP_PORT: "${ML_SMTP_PORT:-587}"
+      ML_SMTP_USER: "${ML_SMTP_USER:-}"
+      ML_SMTP_PASSWORD: "${ML_SMTP_PASSWORD:-}"
+      ML_EMAIL_FROM: "${ML_EMAIL_FROM:-}"
+      ML_EMAIL_TO: "${ML_EMAIL_TO:-}"
+    volumes:
+      - ./:/app
+      - ./reports:/app/reports
+    profiles:
+      - legacy
+
+  futures_monitor:
+    build:
+      context: .
+      dockerfile: services/futures_monitor/Dockerfile
+    container_name: arbees-futures-monitor
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: INFO
+      # Futures Monitor configuration
+      FUTURES_LOOKAHEAD_HOURS: "48"
+      FUTURES_MIN_HOURS_BEFORE_START: "0.5"
+      FUTURES_HANDOFF_MINUTES: "15"
+      FUTURES_DISCOVERY_INTERVAL: "1800"
+      FUTURES_PRICE_POLL_INTERVAL: "60"
+      FUTURES_MIN_EDGE: "5.0"
+      FUTURES_LINE_MOVEMENT_ALERT: "3.0"
+      FUTURES_MAX_GAMES: "50"
+      # Market discovery mode: 'rust' uses Rust discovery service, 'local' uses Python clients
+      MARKET_DISCOVERY_MODE: "rust"
+    volumes:
+      - ./:/app
+    restart: unless-stopped
+    profiles:
+      - full
+
   frontend:
     build:
       context: ./frontend
@@ -249,7 +457,18 @@ services:
       - full
 
   # ==========================================================================
-  # VPN + Polymarket Monitor (geo-bypass for Polymarket API access)
+  # Phase 3: VPN + Polymarket Price Shard (geo-bypass for Polymarket CLOB/WS)
+  # ==========================================================================
+  # 
+  # VPN SCOPE (minimal blast radius):
+  # - ONLY polymarket_monitor needs VPN (CLOB/WebSocket are geo-blocked)
+  # - market-discovery-rust does NOT need VPN (Gamma API is public)
+  # - All other services access Polymarket prices via Redis
+  #
+  # AWS NOTE: Fargate does NOT support NET_ADMIN or /dev/net/tun.
+  # For AWS deployment, use either:
+  # - ECS EC2 launch type for VPN task
+  # - EU-hosted proxy instead of VPN
   # ==========================================================================
 
   vpn:
@@ -279,6 +498,7 @@ services:
       - full
       - vpn
 
+  # Polymarket Price Shard - publishes prices to Redis for all consumers
   polymarket_monitor:
     build:
       context: .
@@ -293,6 +513,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - LOG_LEVEL=INFO
+      # REST polling interval (fallback when WS is down)
+      - POLYMARKET_POLL_INTERVAL_SECONDS=2.0
     volumes:
       # DEBUG MODE: write NDJSON instrumentation to the host workspace file
       - ./.cursor:/app/.cursor

@@ -19,6 +19,9 @@ COPY services/ ./services/
 # Install Python dependencies
 RUN pip install --no-cache-dir .
 
+# Install docker SDK for supervisor (container restart)
+RUN pip install --no-cache-dir docker>=7.0
+
 ENV PYTHONPATH=/app:/app/shared
 
 # Health check

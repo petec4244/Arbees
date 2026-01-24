@@ -69,6 +69,7 @@ class SignatureCache:
 class KalshiClient(BaseMarketClient):
     """Async Kalshi API client with RSA signature authentication."""
 
+    # Default URL (overridden by config)
     BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
     # Sports series tickers
@@ -89,35 +90,64 @@ class KalshiClient(BaseMarketClient):
         private_key_path: Optional[str] = None,
         private_key_str: Optional[str] = None,
         rate_limit: float = 2.0,  # Kalshi rate limits to ~2 req/sec
+        base_url: Optional[str] = None,
+        env: Optional[str] = None,
     ):
         """
         Initialize Kalshi client.
 
         Args:
-            api_key: Kalshi API key ID (or KALSHI_API_KEY env var)
+            api_key: Kalshi API key ID (or from env based on KALSHI_ENV)
             private_key_path: Path to RSA private key PEM file
-            private_key_str: RSA private key as string (or KALSHI_PRIVATE_KEY env var)
+            private_key_str: RSA private key as string (or from env based on KALSHI_ENV)
             rate_limit: Max requests per second (default 2.0 to avoid Kalshi rate limits)
+            base_url: Override REST API base URL (or use KALSHI_BASE_URL env var)
+            env: Environment name ("prod" or "demo"), defaults to KALSHI_ENV
         """
+        # Import config module for environment-aware URL/key resolution
+        from markets.kalshi.config import (
+            KalshiEnvironment,
+            get_kalshi_rest_url,
+            get_kalshi_api_key,
+            get_kalshi_private_key,
+            get_kalshi_private_key_path,
+        )
+        
+        # Resolve environment
+        kalshi_env = None
+        if env:
+            try:
+                kalshi_env = KalshiEnvironment(env.lower())
+            except ValueError:
+                pass
+        
+        # Resolve base URL
+        resolved_url = get_kalshi_rest_url(env=kalshi_env, override_url=base_url)
+        
         super().__init__(
-            base_url=self.BASE_URL,
+            base_url=resolved_url,
             platform=Platform.KALSHI,
             rate_limit=rate_limit,
         )
 
-        self.api_key = api_key or os.environ.get("KALSHI_API_KEY", "")
+        # Resolve API key
+        self.api_key = api_key or get_kalshi_api_key(env=kalshi_env)
         self._private_key: Optional[RSAPrivateKey] = None
         self._signature_cache = SignatureCache()
 
-        # Load private key
+        # Load private key (explicit args take precedence over env-based config)
         if private_key_path:
             self._load_private_key_from_file(private_key_path)
         elif private_key_str:
             self._load_private_key_from_string(private_key_str)
-        elif os.environ.get("KALSHI_PRIVATE_KEY"):
-            self._load_private_key_from_string(os.environ["KALSHI_PRIVATE_KEY"])
-        elif os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
-            self._load_private_key_from_file(os.environ["KALSHI_PRIVATE_KEY_PATH"])
+        else:
+            # Try environment-aware key resolution
+            env_key_str = get_kalshi_private_key(env=kalshi_env)
+            env_key_path = get_kalshi_private_key_path(env=kalshi_env)
+            if env_key_str:
+                self._load_private_key_from_string(env_key_str)
+            elif env_key_path:
+                self._load_private_key_from_file(env_key_path)
 
     def _load_private_key_from_file(self, path: str) -> None:
         """Load RSA private key from PEM file."""

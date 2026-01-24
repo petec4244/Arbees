@@ -47,6 +47,9 @@ class HybridPolymarketClient:
         use_eu_proxy: bool = False,
         rate_limit: float = 10.0,
         prefer_websocket: bool = True,
+        gamma_url: Optional[str] = None,
+        clob_url: Optional[str] = None,
+        ws_url: Optional[str] = None,
     ):
         """
         Initialize hybrid client.
@@ -57,14 +60,19 @@ class HybridPolymarketClient:
             use_eu_proxy: If True, use EU proxy service (for regulatory compliance)
             rate_limit: Max REST requests per second
             prefer_websocket: If True, use WebSocket for prices when subscribed
+            gamma_url: Override Gamma API URL (or use POLYMARKET_GAMMA_URL env var)
+            clob_url: Override CLOB API URL (or use POLYMARKET_CLOB_URL env var)
+            ws_url: Override WebSocket URL (or use POLYMARKET_WS_URL env var)
         """
         self._rest = PolymarketClient(
             api_key=api_key,
             proxy_url=proxy_url,
             use_eu_proxy=use_eu_proxy,
             rate_limit=rate_limit,
+            gamma_url=gamma_url,
+            clob_url=clob_url,
         )
-        self._ws = PolymarketWebSocketClient()
+        self._ws = PolymarketWebSocketClient(ws_url=ws_url)
         self._prefer_websocket = prefer_websocket
 
         # Cache condition_id -> token_id mappings

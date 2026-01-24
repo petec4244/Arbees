@@ -362,11 +362,14 @@ class DatabaseClient:
         row = await pool.fetchrow(
             """
             SELECT * FROM market_prices
-            WHERE market_id = $1 AND platform = $2 AND contract_team = $3
+            WHERE market_id = $1
+              AND platform = $2
+              AND contract_team IS NOT NULL
+              AND contract_team ILIKE $3
             ORDER BY time DESC
             LIMIT 1
             """,
-            market_id, platform, contract_team
+            market_id, platform, f"%{contract_team}%"
         )
         return dict(row) if row else None
 
@@ -443,7 +446,7 @@ class DatabaseClient:
         side: str,
         entry_price: float,
         size: float,
-        entry_time: str,
+        entry_time: Union[datetime, str],
         signal_id: Optional[str] = None,
         game_id: Optional[str] = None,
         sport: Optional[str] = None,
@@ -454,6 +457,9 @@ class DatabaseClient:
         **kwargs
     ) -> None:
         """Insert a paper trade."""
+        # Convert string to datetime if necessary (TIMESTAMPTZ columns require datetime)
+        if isinstance(entry_time, str):
+            entry_time = datetime.fromisoformat(entry_time.replace("Z", "+00:00"))
         pool = await self._get_pool()
         await pool.execute(
             """
@@ -477,11 +483,14 @@ class DatabaseClient:
         self,
         trade_id: str,
         exit_price: float,
-        exit_time: str,
+        exit_time: Union[datetime, str],
         outcome: str,
         exit_fees: float = 0
     ) -> None:
         """Close a paper trade."""
+        # Convert string to datetime if necessary (TIMESTAMPTZ columns require datetime)
+        if isinstance(exit_time, str):
+            exit_time = datetime.fromisoformat(exit_time.replace("Z", "+00:00"))
         pool = await self._get_pool()
 
         # Calculate PnL

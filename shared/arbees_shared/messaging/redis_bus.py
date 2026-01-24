@@ -47,6 +47,19 @@ class Channel(str, Enum):
     DISCOVERY_REQUESTS = "discovery:requests"
     DISCOVERY_RESULTS = "discovery:results"
 
+    # Execution pipeline (Phase 1 split)
+    EXECUTION_REQUESTS = "execution:requests"
+    EXECUTION_RESULTS = "execution:results"
+    POSITION_UPDATES = "positions:updates"
+
+    # Health monitoring (heartbeats)
+    HEALTH_HEARTBEATS = "health:heartbeats"
+
+    # Feedback loop channels (loss analysis)
+    FEEDBACK_RULES = "feedback:rules"
+    FEEDBACK_LOSS_ANALYZED = "feedback:loss:analyzed"
+    FEEDBACK_PATTERN_DETECTED = "feedback:pattern:detected"
+
     def format(self, **kwargs) -> str:
         """Format channel name with parameters."""
         return self.value.format(**kwargs)

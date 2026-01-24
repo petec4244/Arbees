@@ -33,6 +33,7 @@ class SignalType(str, Enum):
     # Market signals
     LAGGING_MARKET = "lagging_market"
     LIQUIDITY_OPPORTUNITY = "liquidity_opportunity"
+    MARKET_MISPRICING = "market_mispricing"
 
 
 class SignalDirection(str, Enum):

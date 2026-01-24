@@ -15,6 +15,8 @@ env_logger = "0.10"
 anyhow = "1.0"
 dotenv = "0.15"
 futures-util = "0.3"
+chrono = "0.4"
+hostname = "0.4"
 
 [[bin]]
 name = "market_discovery"

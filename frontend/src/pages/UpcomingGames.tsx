@@ -1,6 +1,8 @@
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Clock, Filter, Calendar, MapPin, Tv, ChevronDown, ChevronUp, AlertCircle, Timer, CalendarClock } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { Clock, Filter, Calendar, MapPin, Tv, ChevronDown, ChevronUp, AlertCircle, Timer, CalendarClock, LineChart, ArrowUpDown } from 'lucide-react'
+import { getSportConfig, SportBackground } from '../utils/sports'
 
 interface UpcomingGame {
   game_id: string
@@ -75,6 +77,7 @@ export default function UpcomingGames() {
   const [selectedSport, setSelectedSport] = useState<string>('ALL')
   const [hoursAhead, setHoursAhead] = useState<number>(24)
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set())
+  const [sortBy, setSortBy] = useState<'time' | 'sport'>('time')
 
   const { data: games, isLoading, isError } = useQuery<UpcomingGame[]>({
     queryKey: ['upcomingGames', hoursAhead, selectedSport === 'ALL' ? undefined : selectedSport],
@@ -103,6 +106,22 @@ export default function UpcomingGames() {
     refetchInterval: 60000,
   })
 
+  // Fetch futures games to identify which are being monitored
+  const { data: futuresGames } = useQuery<{ game_id: string }[]>({
+    queryKey: ['futuresGamesIds'],
+    queryFn: async () => {
+      const res = await fetch('/api/futures/games?limit=100')
+      if (!res.ok) return []
+      return res.json()
+    },
+    refetchInterval: 60000,
+  })
+
+  // Set of game IDs being monitored by futures
+  const futuresGameIds = useMemo(() => {
+    return new Set(futuresGames?.map(g => g.game_id) || [])
+  }, [futuresGames])
+
   // Get unique sports from games or stats
   const sports = useMemo(() => {
     if (stats?.by_sport) {
@@ -115,9 +134,29 @@ export default function UpcomingGames() {
     return ['ALL']
   }, [games, stats])
 
-  // Group games by time category
+  // Group games by time category (or maintain flat list if sorting by sport)
   const groupedGames = useMemo(() => {
     if (!games) return {}
+
+    // Clone and sort games first
+    let sortedGames = [...games]
+    if (sortBy === 'sport') {
+      sortedGames.sort((a, b) => {
+        // Sort by sport, then by time
+        const sportDiff = a.sport.localeCompare(b.sport)
+        if (sportDiff !== 0) return sportDiff
+        return new Date(a.scheduled_time).getTime() - new Date(b.scheduled_time).getTime()
+      })
+    } else {
+      // Sort by time
+      sortedGames.sort((a, b) => new Date(a.scheduled_time).getTime() - new Date(b.scheduled_time).getTime())
+    }
+
+    // If sorting by sport, we might want to group differently or just respect the grouping
+    // Current design is grouping by time category. Let's keep that but sorting inside categories?
+    // User asked "Sort by Sport". If we group by "Starting Soon", "Today" etc, sorting by sport INSIDE those makes sense.
+    // If user explicitly wants to just see all NBA games together regardless of time, that's different.
+    // Let's assume sorting inside the time groups for now to maintain layout structure.
 
     const groups: Record<string, UpcomingGame[]> = {
       imminent: [],
@@ -126,7 +165,7 @@ export default function UpcomingGames() {
       future: [],
     }
 
-    games.forEach(game => {
+    sortedGames.forEach(game => {
       const category = game.time_category || 'upcoming'
       if (groups[category]) {
         groups[category].push(game)
@@ -134,7 +173,7 @@ export default function UpcomingGames() {
     })
 
     return groups
-  }, [games])
+  }, [games, sortBy])
 
   const toggleCategory = (category: string) => {
     setCollapsedCategories(prev => {
@@ -197,6 +236,17 @@ export default function UpcomingGames() {
               ))}
             </select>
           </div>
+
+          <div className="w-px h-4 bg-gray-700" />
+
+          {/* Sort Control */}
+          <button
+            onClick={() => setSortBy(prev => prev === 'time' ? 'sport' : 'time')}
+            className="flex items-center space-x-2 px-2 text-gray-400 hover:text-white transition-colors"
+          >
+            <ArrowUpDown className="w-4 h-4" />
+            <span className="text-sm">{sortBy === 'time' ? 'Time' : 'Sport'}</span>
+          </button>
         </div>
       </div>
 
@@ -280,7 +330,11 @@ export default function UpcomingGames() {
               {!isCollapsed && (
                 <div className="p-4 pt-0 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
                   {categoryGames.map((game) => (
-                    <GameCard key={game.game_id} game={game} />
+                    <GameCard
+                      key={game.game_id}
+                      game={game}
+                      isMonitoredByFutures={futuresGameIds.has(game.game_id)}
+                    />
                   ))}
                 </div>
               )}
@@ -292,60 +346,76 @@ export default function UpcomingGames() {
   )
 }
 
-function GameCard({ game }: { game: UpcomingGame }) {
+function GameCard({ game, isMonitoredByFutures }: { game: UpcomingGame; isMonitoredByFutures?: boolean }) {
   const config = TIME_CATEGORY_CONFIG[game.time_category]
   const scheduledDate = new Date(game.scheduled_time)
+  const sportConfig = getSportConfig(game.sport)
 
   return (
-    <div className="bg-gray-800 rounded-lg p-4 hover:bg-gray-750 transition-colors">
-      {/* Header */}
-      <div className="flex justify-between items-start mb-3">
-        <span className="text-xs font-bold bg-gray-900 border border-gray-700 px-2 py-0.5 rounded text-gray-300 uppercase">
-          {game.sport}
-        </span>
-        <span className={`text-xs font-bold px-2 py-0.5 rounded ${config.bgColor} ${config.color}`}>
-          {game.time_until_start}
-        </span>
-      </div>
-
-      {/* Teams */}
-      <div className="space-y-2 mb-3">
-        <div className="flex justify-between items-center">
-          <span className="text-gray-300 font-medium truncate max-w-[80%]">
-            {game.away_team_abbrev || game.away_team}
-          </span>
-          <span className="text-xs text-gray-500">AWAY</span>
-        </div>
-        <div className="flex justify-between items-center">
-          <span className="text-white font-medium truncate max-w-[80%]">
-            {game.home_team_abbrev || game.home_team}
-          </span>
-          <span className="text-xs text-gray-500">HOME</span>
-        </div>
-      </div>
-
-      {/* Game Time */}
-      <div className="border-t border-gray-700 pt-3 space-y-1">
-        <div className="flex items-center gap-2 text-xs text-gray-400">
-          <Clock className="w-3 h-3" />
-          <span>{scheduledDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-          <span className="text-gray-600">|</span>
-          <span>{scheduledDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</span>
-        </div>
-
-        {game.venue && (
-          <div className="flex items-center gap-2 text-xs text-gray-500">
-            <MapPin className="w-3 h-3" />
-            <span className="truncate">{game.venue}</span>
+    <div className={`rounded-lg overflow-hidden relative group border ${sportConfig.colors} transition-colors`}>
+      <SportBackground sport={game.sport} />
+      <div className="p-4 relative z-10">
+        {/* Header */}
+        <div className="flex justify-between items-start mb-3">
+          <div className="flex items-center gap-2">
+            <span className={`text-xs font-bold px-2 py-0.5 rounded uppercase border ${sportConfig.badge}`}>
+              {game.sport}
+            </span>
+            {isMonitoredByFutures && (
+              <Link
+                to="/futures"
+                className="flex items-center gap-1 text-xs font-bold bg-purple-900/50 border border-purple-500/30 px-2 py-0.5 rounded text-purple-300 hover:bg-purple-900/70 transition-colors"
+                title="Being monitored by Futures"
+              >
+                <LineChart className="w-3 h-3" />
+                <span>F</span>
+              </Link>
+            )}
           </div>
-        )}
+          <span className={`text-xs font-bold px-2 py-0.5 rounded ${config.bgColor} ${config.color}`}>
+            {game.time_until_start}
+          </span>
+        </div>
 
-        {game.broadcast && (
-          <div className="flex items-center gap-2 text-xs text-gray-500">
-            <Tv className="w-3 h-3" />
-            <span>{game.broadcast}</span>
+        {/* Teams */}
+        <div className="space-y-2 mb-3">
+          <div className="flex justify-between items-center">
+            <span className="text-gray-300 font-medium truncate max-w-[80%]">
+              {game.away_team_abbrev || game.away_team}
+            </span>
+            <span className="text-xs text-gray-500">AWAY</span>
           </div>
-        )}
+          <div className="flex justify-between items-center">
+            <span className="text-white font-medium truncate max-w-[80%]">
+              {game.home_team_abbrev || game.home_team}
+            </span>
+            <span className="text-xs text-gray-500">HOME</span>
+          </div>
+        </div>
+
+        {/* Game Time */}
+        <div className="border-t border-gray-700 pt-3 space-y-1">
+          <div className="flex items-center gap-2 text-xs text-gray-400">
+            <Clock className="w-3 h-3" />
+            <span>{scheduledDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+            <span className="text-gray-600">|</span>
+            <span>{scheduledDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+          </div>
+
+          {game.venue && (
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <MapPin className="w-3 h-3" />
+              <span className="truncate">{game.venue}</span>
+            </div>
+          )}
+
+          {game.broadcast && (
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <Tv className="w-3 h-3" />
+              <span>{game.broadcast}</span>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )

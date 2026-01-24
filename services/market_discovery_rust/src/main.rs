@@ -1,10 +1,11 @@
 mod matching;
 mod providers;
 
+use chrono::Utc;
 use dotenv::dotenv;
 use futures_util::StreamExt;
-use log::{error, info};
-use matching::names_match;
+use log::{debug, error, info, warn};
+use matching::{is_non_moneyline_market, match_game_in_text};
 use providers::{kalshi::KalshiClient, polymarket::PolymarketClient};
 use redis::AsyncCommands;
 use redis::aio::PubSub;
@@ -22,6 +23,12 @@ const CACHE_TTL_SECS: u64 = 60;
 const DISCOVERY_GAME_KEY_PREFIX: &str = "discovery:game:";
 const DISCOVERY_GAME_KEY_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 
+// Heartbeat constants
+const HEARTBEAT_KEY_PREFIX: &str = "health:hb";
+const HEARTBEAT_CHANNEL: &str = "health:heartbeats";
+const HEARTBEAT_INTERVAL_SECS: u64 = 10;
+const HEARTBEAT_TTL_SECS: u64 = 35;
+
 #[derive(Debug, Deserialize)]
 struct DiscoveryRequest {
     game_id: String,
@@ -30,6 +37,19 @@ struct DiscoveryRequest {
     away_team: String,
     home_abbr: String,
     away_abbr: String,
+}
+
+#[derive(Debug, Serialize)]
+struct Heartbeat {
+    service: String,
+    instance_id: String,
+    status: String,
+    started_at: String,
+    timestamp: String,
+    checks: HashMap<String, bool>,
+    metrics: HashMap<String, f64>,
+    version: Option<String>,
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +122,15 @@ async fn main() -> anyhow::Result<()> {
         .await
         {
             error!("Discovery request listener exited: {}", e);
+        }
+    });
+
+    // Spawn heartbeat task
+    let heartbeat_client = client.clone();
+    let started_at = chrono::Utc::now().to_rfc3339();
+    tokio::spawn(async move {
+        if let Err(e) = heartbeat_loop(heartbeat_client, started_at).await {
+            error!("Heartbeat loop exited: {}", e);
         }
     });
 
@@ -194,10 +223,30 @@ async fn request_listener(
 
     let mut stream = pubsub.on_message();
     while let Some(msg) = stream.next().await {
-        let payload: Vec<u8> = msg.get_payload()?;
-        let req: DiscoveryRequest = serde_json::from_slice(&payload)?;
+        let payload: Vec<u8> = match msg.get_payload() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Discovery request: failed to read payload: {}", e);
+                continue;
+            }
+        };
 
-        let (poly_id, kalshi_id) = discover_for_game(
+        let req: DiscoveryRequest = match serde_json::from_slice(&payload) {
+            Ok(r) => r,
+            Err(e) => {
+                // IMPORTANT: Never crash the listener due to one bad message.
+                // PubSub has no retry; crashing here would stop all discovery.
+                let preview = String::from_utf8_lossy(&payload);
+                warn!(
+                    "Discovery request: invalid JSON ({}). payload='{}'",
+                    e,
+                    preview.chars().take(400).collect::<String>()
+                );
+                continue;
+            }
+        };
+
+        let (poly_id, kalshi_id) = match discover_for_game(
             &poly_client,
             &kalshi_client,
             &req.game_id,
@@ -209,7 +258,17 @@ async fn request_listener(
             &poly_cache,
             &kalshi_cache,
         )
-        .await?;
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Discovery request: error discovering markets for game {}: {}",
+                    req.game_id, e
+                );
+                (None, None)
+            }
+        };
 
         let result = DiscoveryResult {
             game_id: req.game_id.clone(),
@@ -226,70 +285,28 @@ async fn request_listener(
         let json_str = String::from_utf8_lossy(&encoded).to_string();
         let key = format!("{}{}", DISCOVERY_GAME_KEY_PREFIX, req.game_id);
 
-        let mut con = redis_client.get_async_connection().await?;
-        // Publish for consumers needing low latency
-        let _: i64 = con.publish(DISCOVERY_RESULTS_CH, encoded).await?;
-        // Persist for pregame lookups / restarts
-        let _: () = con
-            .set_ex(key, json_str, DISCOVERY_GAME_KEY_TTL_SECS)
-            .await?;
-    }
-
-    Ok(())
-}
-
-/// Check if a market question indicates a non-moneyline market (totals, spreads, props).
-/// We only want to match moneyline (winner) markets.
-fn is_non_moneyline_market(question: &str) -> bool {
-    let q = question.to_lowercase();
-
-    // Totals indicators
-    if q.contains("o/u")
-        || q.contains("over/under")
-        || q.contains("total points")
-        || q.contains("total goals")
-        || q.contains("total runs")
-        || q.contains("combined score")
-        || q.contains("combined points")
-    {
-        return true;
-    }
-
-    // Spread indicators (look for +/- followed by numbers)
-    // e.g., "+5.5", "-3", "spread"
-    if q.contains("spread") || q.contains("handicap") {
-        return true;
-    }
-
-    // Check for spread patterns like "+5.5" or "-3.5"
-    // Simple heuristic: if there's a +/- followed by digits after team names
-    let spread_patterns = [" +", " -"];
-    for pattern in spread_patterns {
-        if let Some(pos) = q.find(pattern) {
-            // Check if followed by a digit
-            let rest = &q[pos + pattern.len()..];
-            if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                return true;
+        // NOTE: Keep the listener alive even if Redis has transient errors.
+        let mut con = match redis_client.get_async_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Discovery request: Redis connection error: {}", e);
+                continue;
             }
+        };
+        // Publish for consumers needing low latency
+        if let Err(e) = con.publish::<&str, Vec<u8>, i64>(DISCOVERY_RESULTS_CH, encoded).await {
+            warn!("Discovery request: Redis publish error: {}", e);
+        }
+        // Persist for pregame lookups / restarts
+        if let Err(e) = con
+            .set_ex::<String, String, ()>(key, json_str, DISCOVERY_GAME_KEY_TTL_SECS)
+            .await
+        {
+            warn!("Discovery request: Redis set_ex error: {}", e);
         }
     }
 
-    // Props/special markets
-    if q.contains("first to")
-        || q.contains("most")
-        || q.contains("mvp")
-        || q.contains("player")
-        || q.contains("quarter")
-        || q.contains("half")
-        || q.contains("period")
-        || q.contains("inning")
-        || q.contains("how many")
-        || q.contains("exact score")
-    {
-        return true;
-    }
-
-    false
+    Ok(())
 }
 
 async fn discover_for_game(
@@ -305,13 +322,18 @@ async fn discover_for_game(
     kalshi_cache: &Arc<RwLock<HashMap<String, (Instant, Vec<providers::kalshi::KalshiMarket>)>>>,
 ) -> anyhow::Result<(Option<String>, Option<String>)> {
     // Strategy:
-    // 1) Fetch by sport tag(s) (broad)
+    // 1) Fetch by sport tag(s) - use SPECIFIC tags to avoid cross-league matches
+    //    (e.g., "nba" NOT "basketball" to avoid matching NBA teams to NCAAB markets)
     // 2) Narrow by name matching (city/team/abbr fuzzy match)
     let sport_lower = sport.to_lowercase();
     let poly_tags: Vec<String> = match sport_lower.as_str() {
-        "ncaab" | "nba" => vec![sport_lower.clone(), "basketball".to_string()],
-        "ncaaf" | "nfl" => vec![sport_lower.clone(), "football".to_string()],
-        "nhl" => vec!["nhl".to_string(), "hockey".to_string()],
+        // IMPORTANT: Use specific league tags, not broad category tags
+        // Using "basketball" would match NBA teams to NCAAB markets (e.g., Cleveland Cavaliers -> Cleveland State)
+        "ncaab" => vec!["ncaab".to_string()],  // College basketball only
+        "nba" => vec!["nba".to_string()],      // NBA only
+        "ncaaf" => vec!["ncaaf".to_string()],  // College football only
+        "nfl" => vec!["nfl".to_string()],      // NFL only
+        "nhl" => vec!["nhl".to_string()],
         other => vec![other.to_string()],
     };
 
@@ -354,33 +376,103 @@ async fn discover_for_game(
     // Polymarket scan: return Gamma market id (numeric string)
     // IMPORTANT: Only match MONEYLINE markets, skip totals (O/U), spreads, props, etc.
     let mut poly_market_id: Option<String> = None;
+    let mut best_match_score: f64 = 0.0;
+
     for market in &poly_markets {
-        // Fast prefilter: require at least one of the abbreviations or a city token to appear.
-        let q = market.question.to_lowercase();
-        let pre_ok = q.contains(&home_abbr.to_lowercase())
-            || q.contains(&away_abbr.to_lowercase())
-            || q.contains(&home_team.split_whitespace().next().unwrap_or("").to_lowercase())
-            || q.contains(&away_team.split_whitespace().next().unwrap_or("").to_lowercase());
-        if !pre_ok {
-            continue;
-        }
-
         // Skip non-moneyline markets (totals, spreads, props)
-        // These contain patterns like "O/U", "Over/Under", "Total", spread numbers (+/-), etc.
-        if is_non_moneyline_market(&q) {
+        if is_non_moneyline_market(&market.question) {
             continue;
         }
 
-        let h_match = names_match(home_team, &market.question, sport) || names_match(home_abbr, &market.question, sport);
-        let a_match = names_match(away_team, &market.question, sport) || names_match(away_abbr, &market.question, sport);
-        if h_match && a_match {
-            poly_market_id = Some(market.id.clone());
-            info!("[DISCOVERY] Polymarket MONEYLINE match game={} {} vs {} -> market_id={}", game_id, away_team, home_team, market.id);
-            break;
+        // Use the improved game matching that requires BOTH teams to match
+        let (is_match, home_result, away_result) = match_game_in_text(
+            home_team,
+            away_team,
+            home_abbr,
+            away_abbr,
+            &market.question,
+            sport,
+        );
+
+        if is_match {
+            // Calculate combined confidence score
+            let combined_score = (home_result.score + away_result.score) / 2.0;
+
+            // Only accept if this is the best match so far
+            if combined_score > best_match_score {
+                best_match_score = combined_score;
+                poly_market_id = Some(market.id.clone());
+
+                info!(
+                    "[DISCOVERY] Polymarket MONEYLINE match: game={} {} vs {} -> market_id={} (home: {:.2} {}, away: {:.2} {})",
+                    game_id, away_team, home_team, market.id,
+                    home_result.score, home_result.reason,
+                    away_result.score, away_result.reason
+                );
+
+                // If we have a high-confidence match, stop searching
+                if combined_score >= 0.9 {
+                    break;
+                }
+            }
+        } else if home_result.is_match() || away_result.is_match() {
+            // Log near-misses for debugging
+            warn!(
+                "[DISCOVERY] Partial match (skipped): game={} {} vs {} question='{}' home={:?} away={:?}",
+                game_id, away_team, home_team, market.question,
+                home_result.is_match(), away_result.is_match()
+            );
         }
     }
 
     let kalshi_ticker: Option<String> = None;
 
     Ok((poly_market_id, kalshi_ticker))
+}
+
+/// Heartbeat loop - publishes periodic health status to Redis
+async fn heartbeat_loop(
+    client: redis::Client,
+    started_at: String,
+) -> anyhow::Result<()> {
+    let mut con = client.get_async_connection().await?;
+    let instance_id = env::var("HOSTNAME").unwrap_or_else(|_| "market-discovery-rust-1".to_string());
+    let version = env::var("BUILD_VERSION").ok();
+    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
+
+    info!("Heartbeat loop started for {}", instance_id);
+
+    loop {
+        let now = Utc::now().to_rfc3339();
+
+        let mut checks = HashMap::new();
+        checks.insert("redis_ok".to_string(), true);
+
+        let metrics = HashMap::new();
+
+        let heartbeat = Heartbeat {
+            service: "market_discovery_rust".to_string(),
+            instance_id: instance_id.clone(),
+            status: "healthy".to_string(),
+            started_at: started_at.clone(),
+            timestamp: now,
+            checks,
+            metrics,
+            version: version.clone(),
+            hostname: hostname.clone(),
+        };
+
+        let payload = serde_json::to_string(&heartbeat)?;
+        let key = format!("{}:market_discovery_rust:{}", HEARTBEAT_KEY_PREFIX, instance_id);
+
+        // SETEX for liveness
+        let _: () = con.set_ex(&key, &payload, HEARTBEAT_TTL_SECS).await?;
+
+        // Publish for real-time observability
+        let _: () = con.publish(HEARTBEAT_CHANNEL, &payload).await?;
+
+        debug!("Heartbeat published: {}", key);
+
+        tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+    }
 }

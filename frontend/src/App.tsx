@@ -7,6 +7,7 @@ import Analytics from './pages/Analytics'
 import Opportunities from './pages/Opportunities'
 import LiveGames from './pages/LiveGames'
 import UpcomingGames from './pages/UpcomingGames'
+import FuturesGames from './pages/FuturesGames'
 import PaperTrading from './pages/PaperTrading'
 import HistoricalGames from './pages/HistoricalGames'
 import SystemStatus from './components/SystemStatus'
@@ -85,6 +86,7 @@ function App() {
                 <NavLink to="/opportunities">Opportunities</NavLink>
                 <NavLink to="/live-games">Live Games</NavLink>
                 <NavLink to="/upcoming-games">Upcoming</NavLink>
+                <NavLink to="/futures">Futures</NavLink>
                 <NavLink to="/historical">Historical</NavLink>
                 <NavLink to="/paper-trading">Paper Trading</NavLink>
               </div>
@@ -113,6 +115,7 @@ function App() {
               <MobileNavLink to="/opportunities" onClick={closeMobileMenu}>Opportunities</MobileNavLink>
               <MobileNavLink to="/live-games" onClick={closeMobileMenu}>Live Games</MobileNavLink>
               <MobileNavLink to="/upcoming-games" onClick={closeMobileMenu}>Upcoming Games</MobileNavLink>
+              <MobileNavLink to="/futures" onClick={closeMobileMenu}>Futures</MobileNavLink>
               <MobileNavLink to="/historical" onClick={closeMobileMenu}>Historical Games</MobileNavLink>
               <MobileNavLink to="/paper-trading" onClick={closeMobileMenu}>Paper Trading</MobileNavLink>
             </div>
@@ -131,6 +134,7 @@ function App() {
           <Route path="/opportunities" element={<Opportunities />} />
           <Route path="/live-games" element={<LiveGames />} />
           <Route path="/upcoming-games" element={<UpcomingGames />} />
+          <Route path="/futures" element={<FuturesGames />} />
           <Route path="/historical" element={<HistoricalGames />} />
           <Route path="/paper-trading" element={<PaperTrading />} />
         </Routes>

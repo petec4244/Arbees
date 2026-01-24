@@ -14,7 +14,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from arbees_shared.db.connection import DatabaseClient, get_pool
@@ -23,12 +23,15 @@ from arbees_shared.models.game import GameState, Play, Sport
 from arbees_shared.models.market import MarketPrice, Platform
 from arbees_shared.models.market_types import MarketType, ParsedMarket
 from arbees_shared.models.signal import TradingSignal, SignalType, SignalDirection
+from arbees_shared.health.heartbeat import HeartbeatPublisher
+from arbees_shared.models.health import ServiceStatus
 from data_providers.espn.client import ESPNClient
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
 from markets.kalshi.hybrid_client import HybridKalshiClient
 from markets.polymarket.hybrid_client import HybridPolymarketClient
 from services.market_discovery.parser import parse_market
+from arbees_shared.utils.trace_logger import trace_log
 import arbees_core
 
 logger = logging.getLogger(__name__)
@@ -112,7 +115,14 @@ class GameShard:
 
         # VPN-based Polymarket mode: consume Polymarket prices from Redis
         # instead of connecting directly (requires polymarket_monitor service)
-        self.polymarket_via_redis = os.environ.get("POLYMARKET_VIA_REDIS", "false").lower() == "true"
+        # Phase 3: This should ALWAYS be true in production - direct mode is deprecated
+        self.polymarket_via_redis = os.environ.get("POLYMARKET_VIA_REDIS", "true").lower() == "true"
+        
+        if not self.polymarket_via_redis:
+            logger.warning(
+                "POLYMARKET_VIA_REDIS=false is DEPRECATED. Direct Polymarket access "
+                "from game_shard is not recommended. Use polymarket_monitor service instead."
+            )
 
         # Connections (shared across all games)
         self.db: Optional[DatabaseClient] = None
@@ -129,6 +139,9 @@ class GameShard:
         self._game_tasks: dict[str, asyncio.Task] = {}
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
+
+        # Heartbeat publisher for health monitoring
+        self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
         # WebSocket streaming tasks
         self._ws_stream_tasks: dict[Platform, asyncio.Task] = {}
@@ -213,8 +226,22 @@ class GameShard:
         await self.redis.subscribe(command_channel, self._handle_command)
         asyncio.create_task(self.redis.start_listening())
 
-        # Start heartbeat
+        # Start shard heartbeat (to orchestrator)
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+        # Start health monitoring heartbeat publisher
+        self._heartbeat_publisher = HeartbeatPublisher(
+            service="game_shard",
+            instance_id=self.shard_id,
+        )
+        await self._heartbeat_publisher.start()
+        self._heartbeat_publisher.set_status(ServiceStatus.HEALTHY)
+        self._heartbeat_publisher.update_checks({
+            "redis_ok": True,
+            "db_ok": True,
+            "kalshi_ws_ok": self.use_websocket_streaming,
+            "polymarket_via_redis": self.polymarket_via_redis,
+        })
 
         logger.info(f"GameShard {self.shard_id} started")
 
@@ -260,6 +287,10 @@ class GameShard:
         """Stop the shard gracefully."""
         logger.info(f"Stopping GameShard {self.shard_id}")
         self._running = False
+
+        # Stop heartbeat publisher
+        if self._heartbeat_publisher:
+            await self._heartbeat_publisher.stop()
 
         # Cancel heartbeat
         if self._heartbeat_task:
@@ -314,6 +345,15 @@ class GameShard:
                 }
                 if self.redis:
                     await self.redis.publish_shard_heartbeat(self.shard_id, status)
+
+                # Update health monitoring heartbeat metrics
+                if self._heartbeat_publisher:
+                    total_signals = sum(ctx.signals_generated for ctx in self._games.values())
+                    self._heartbeat_publisher.update_metrics({
+                        "games_monitored": float(self.game_count),
+                        "signals_generated": float(total_signals),
+                        "circuit_breaker_ok": 1.0 if self.circuit_breaker.is_trading_allowed() else 0.0,
+                    })
             except Exception as e:
                 logger.warning(f"Heartbeat failed: {e}")
 
@@ -451,6 +491,23 @@ class GameShard:
         ctx = self._games[game_id]
         ctx.is_active = False
 
+        # Best-effort settlement on removal.
+        # Orchestrator may remove a game once it no longer appears "live", even if ESPN lags flipping
+        # to FINAL. We should not leave open paper trades stranded.
+        if self.db and ctx.last_state:
+            try:
+                open_positions = await self.db.get_open_positions_for_game(ctx.game_id)
+                if open_positions:
+                    if self._is_game_complete(ctx.last_state) or ctx.last_state.game_progress >= 0.98:
+                        logger.info(
+                            f"Game {ctx.game_id} removed with {len(open_positions)} open positions; "
+                            f"attempting settlement (status={ctx.last_state.status}, progress={ctx.last_state.game_progress:.3f})"
+                        )
+                        await self.db.update_game_status(ctx.game_id, "final")
+                        await self._settle_game_positions(ctx)
+            except Exception as e:
+                logger.error(f"Failed settlement on remove_game for {ctx.game_id}: {e}")
+
         # Cancel monitoring task
         task = self._game_tasks.get(game_id)
         if task:
@@ -502,13 +559,19 @@ class GameShard:
                 interval = self._get_poll_interval(ctx)
 
                 # Poll game state and market prices in parallel
-                await asyncio.gather(
+                # IMPORTANT: never let a transient market poll failure kill the entire
+                # game monitor loop (which would prevent end-of-game settlement).
+                results = await asyncio.gather(
                     self._poll_game_state(ctx),
                     self._poll_market_prices(ctx),
+                    return_exceptions=True,
                 )
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.warning(f"Monitor subtask error for game {ctx.game_id}: {r}")
 
                 # Check if game is final
-                if ctx.last_state and (ctx.last_state.status == "final" or ctx.last_state.status == "complete"):
+                if ctx.last_state and self._is_game_complete(ctx.last_state):
                     logger.info(f"Game {ctx.game_id} is final: {ctx.last_state.home_team} {ctx.last_state.home_score} - {ctx.last_state.away_score} {ctx.last_state.away_team}")
 
                     # Ensure final state is persisted
@@ -530,6 +593,41 @@ class GameShard:
             # Clean up
             ctx.is_active = False
 
+            # Safety net: if we already know the game is complete, ensure we settle even if
+            # the loop exited due to errors/cancellation.
+            if self.db and ctx.last_state and self._is_game_complete(ctx.last_state):
+                try:
+                    # Ensure final state is persisted
+                    await self.db.update_game_status(ctx.game_id, "final")
+                    await self._settle_game_positions(ctx)
+                except Exception as e:
+                    logger.error(f"Failed to settle positions in cleanup for game {ctx.game_id}: {e}")
+
+    def _is_game_complete(self, state: GameState) -> bool:
+        """Return True if the game should be treated as complete/final."""
+        status = (state.status or "").lower()
+
+        # Canonical statuses
+        if status in ("final", "complete", "completed"):
+            return True
+
+        # ESPN sometimes emits raw codes like "status_final" / "status_complete"
+        if status.endswith("_final") or status.endswith("_complete") or status.endswith("_completed"):
+            return True
+
+        # Fallback: substring match for safety
+        if "final" in status or "complete" in status:
+            return True
+
+        # Heuristic: end of regulation and clock at 0:00.
+        # This helps when orchestrator stops sending the game as "live" before ESPN flips to FINAL,
+        # or when finalization is delayed.
+        if status in ("end_period", "status_end_period") and state.time_remaining_seconds == 0:
+            # Only treat as complete when we are at/after the final scheduled period.
+            if state.period >= state.sport.periods:
+                return True
+
+        return False
     async def _settle_game_positions(self, ctx: GameContext) -> None:
         """
         Settle all open paper trading positions for a completed game.
@@ -566,7 +664,8 @@ class GameShard:
         losing_exit_price = 0.0
 
         total_pnl = 0.0
-        exit_time = datetime.utcnow().isoformat()
+        # TIMESTAMPTZ in DB expects datetime, not string
+        exit_time = datetime.now(timezone.utc)
 
         for position in open_positions:
             trade_id = position['trade_id']
@@ -674,7 +773,7 @@ class GameShard:
         # ---------------------------------------------------------
         # "3 mins for positive trades and 5 minutes for negative"
         cooldown_minutes = 3 if total_pnl > 0 else 5
-        cooldown_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
+        cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes)
         
         ctx.cooldown_until = cooldown_until
         
@@ -953,6 +1052,8 @@ class GameShard:
                 contract_team=contract_team,
                 yes_bid=float(data.get("yes_bid", 0)),
                 yes_ask=float(data.get("yes_ask", 1)),
+                yes_bid_size=float(data.get("yes_bid_size", 0) or 0),
+                yes_ask_size=float(data.get("yes_ask_size", 0) or 0),
                 volume=float(data.get("volume", 0)),
                 liquidity=float(data.get("liquidity", 0)),
                 timestamp=datetime.fromisoformat(data["timestamp"]) if "timestamp" in data else datetime.utcnow(),
@@ -992,6 +1093,8 @@ class GameShard:
                 platform=Platform.POLYMARKET.value,
                 yes_bid=price.yes_bid,
                 yes_ask=price.yes_ask,
+                yes_bid_size=price.yes_bid_size,
+                yes_ask_size=price.yes_ask_size,
                 volume=price.volume,
                 liquidity=price.liquidity,
                 game_id=ctx.game_id,
@@ -1212,10 +1315,19 @@ class GameShard:
             model_prob = 1.0 - ctx.last_home_win_prob  # Away team prob
             target_team = ctx.last_state.away_team
 
-        market_prob = price.mid_price
+        # Use executable price for edge to avoid overstating edge due to spread.
+        buy_edge = (model_prob - price.yes_ask) * 100.0   # if we BUY, we pay ask
+        sell_edge = (price.yes_bid - model_prob) * 100.0  # if we SELL/NO, we receive bid
 
-        # Calculate edge using MATCHED probabilities
-        edge = (model_prob - market_prob) * 100.0
+        # Choose direction based on which executable edge is positive
+        if buy_edge >= 0:
+            direction = SignalDirection.BUY
+            market_prob = price.yes_ask
+            edge = buy_edge
+        else:
+            direction = SignalDirection.SELL
+            market_prob = price.yes_bid
+            edge = sell_edge
 
         # Log for debugging
         logger.debug(
@@ -1236,7 +1348,6 @@ class GameShard:
             return
 
         # Hysteresis check
-        direction = SignalDirection.BUY if edge > 0 else SignalDirection.SELL
         if ctx.active_signal and ctx.active_signal.direction != direction:
             if abs(edge) < (required_edge * 2.0):
                 return
@@ -1275,12 +1386,29 @@ class GameShard:
                 reason=signal.reason,
             )
 
+        # Log signal with shard_id for race condition visibility
+        trace_log(
+            service="game_shard",
+            event="signal_generated",
+            signal_id=signal.signal_id,
+            game_id=signal.game_id,
+            shard_id=self.shard_id,
+            sport=signal.sport.value if signal.sport else None,
+            team=signal.team,
+            direction=signal.direction.value,
+            signal_type=signal.signal_type.value,
+            model_prob=signal.model_prob,
+            market_prob=signal.market_prob,
+            edge_pct=signal.edge_pct,
+            source="websocket_market_mispricing",
+        )
+
         # Publish signal
         if self.redis:
             await self.redis.publish_signal(signal)
 
         logger.info(
-            f"[WS] Generated signal: {signal.direction.value} {signal.team} "
+            f"[WS][shard={self.shard_id}] Generated signal: {signal.direction.value} {signal.team} "
             f"(edge: {signal.edge_pct:.1f}%, platform: {platform.value})"
         )
 
@@ -1452,12 +1580,32 @@ class GameShard:
                 reason=signal.reason,
             )
 
+        # Log signal with shard_id for race condition visibility
+        trace_log(
+            service="game_shard",
+            event="signal_generated",
+            signal_id=signal.signal_id,
+            game_id=signal.game_id,
+            shard_id=self.shard_id,
+            sport=signal.sport.value if signal.sport else None,
+            team=signal.team,
+            direction=signal.direction.value,
+            signal_type=signal.signal_type.value,
+            model_prob=signal.model_prob,
+            market_prob=signal.market_prob,
+            edge_pct=signal.edge_pct,
+            source="cross_market_arb",
+            arb_type=arb_type,
+            buy_platform=buy_platform.value,
+            sell_platform=sell_platform.value,
+        )
+
         # Publish signal
         if self.redis:
             await self.redis.publish_signal(signal)
 
         logger.info(
-            f"[ARB] {market_type.value}: BUY {buy_platform.value}@{buy_price*100:.1f}¢ "
+            f"[ARB][shard={self.shard_id}] {market_type.value}: BUY {buy_platform.value}@{buy_price*100:.1f}¢ "
             f"SELL {sell_platform.value}@{sell_price*100:.1f}¢ (edge: {edge_pct:.1f}%)"
         )
 
@@ -1763,17 +1911,22 @@ class GameShard:
                  # We still signal but with reduced confidence or logging
                  logger.info(f"Signal sync warning for {ctx.game_id}: Game/Market delta {sync_delta:.1f}s > {self.sync_delta_tolerance}s")
             
-            # With market data: calculate edge vs market
-            # IMPORTANT: market_prob should be for the SAME team as our model probability
-            # capped_new_prob is HOME team probability
-            # If we're betting on AWAY team, we need to use (1 - capped_new_prob)
-            market_prob = market_price.mid_price
-
-            # Adjust model probability to match target team
-            # capped_new_prob is always HOME win probability
+            # With market data: calculate edge vs market using EXECUTABLE prices (bid/ask),
+            # not mid, otherwise we systematically overstate edge (and lose to spread).
             model_prob_for_target = capped_new_prob if is_home_team_bet else (1.0 - capped_new_prob)
 
-            edge = (model_prob_for_target - market_prob) * 100.0
+            buy_edge = (model_prob_for_target - market_price.yes_ask) * 100.0   # pay ask
+            sell_edge = (market_price.yes_bid - model_prob_for_target) * 100.0  # receive bid
+
+            # Pick the best executable action
+            if buy_edge >= sell_edge:
+                direction = SignalDirection.BUY
+                market_prob = market_price.yes_ask
+                edge = buy_edge
+            else:
+                direction = SignalDirection.SELL
+                market_prob = market_price.yes_bid
+                edge = sell_edge
 
             # Log the team-aware calculation
             logger.info(
@@ -1789,7 +1942,7 @@ class GameShard:
             required_edge = estimated_fees + (spread / 2.0) + 1.0 # 1% extra margin
             
             # Only signal if edge exceeds friction
-            if abs(edge) < required_edge:
+            if edge < required_edge:
                 return
         else:
             # Without market data: skip signal generation
@@ -1797,10 +1950,7 @@ class GameShard:
             logger.debug(f"Skipping signal for {ctx.game_id}: no market price available")
             return
 
-        # Determine direction based on EDGE (market mispricing), not probability change
-        # BUY if edge > 0 (model thinks higher than market = underpriced)
-        # SELL if edge < 0 (model thinks lower than market = overpriced)
-        direction = SignalDirection.BUY if edge > 0 else SignalDirection.SELL
+        # `direction` already chosen based on executable edge.
 
         # 3. Hysteresis (Flip-Flop Protection)
         # If we have an active signal in the OPPOSITE direction, we need much stronger evidence to flip
@@ -1822,7 +1972,7 @@ class GameShard:
             direction=direction,
             model_prob=model_prob_for_target,  # Probability for TARGET team, not always home
             market_prob=market_prob,
-            edge_pct=abs(edge),
+            edge_pct=float(edge),
             confidence=min(1.0, abs(prob_change) * 10),
             reason=f"Win prob changed {prob_change*100:.1f}% ({old_prob*100:.1f}% → {new_prob*100:.1f}%)",
             play_id=new_plays[-1].play_id if new_plays else None,
@@ -1848,12 +1998,31 @@ class GameShard:
                 play_id=signal.play_id,
             )
 
+        # Log signal with shard_id for race condition visibility
+        trace_log(
+            service="game_shard",
+            event="signal_generated",
+            signal_id=signal.signal_id,
+            game_id=signal.game_id,
+            shard_id=self.shard_id,
+            sport=signal.sport.value if signal.sport else None,
+            team=signal.team,
+            direction=signal.direction.value,
+            signal_type=signal.signal_type.value,
+            model_prob=signal.model_prob,
+            market_prob=signal.market_prob,
+            edge_pct=signal.edge_pct,
+            source="win_prob_shift",
+            prob_change=prob_change,
+            contract_team=market_price.contract_team if market_price else None,
+        )
+
         # Publish signal
         if self.redis:
             await self.redis.publish_signal(signal)
 
         logger.info(
-            f"[{ctx.game_id}] SIGNAL: {signal.direction.value} {signal.team} "
+            f"[{ctx.game_id}][shard={self.shard_id}] SIGNAL: {signal.direction.value} {signal.team} "
             f"(model={model_prob_for_target:.1%}, market={market_prob:.1%}, edge={signal.edge_pct:.1f}%, "
             f"contract_team='{market_price.contract_team}')"
         )

@@ -93,6 +93,8 @@ class PositionManager:
         max_position_pct: float = 10.0,
         max_buy_prob: float = 0.95,  # Don't buy above 95% - limited upside
         min_sell_prob: float = 0.05,  # Don't sell below 5% - limited upside
+        # Position policy
+        allow_hedging: bool = False,
         # Risk management settings
         max_daily_loss: float = 100.0,
         max_game_exposure: float = 50.0,
@@ -130,6 +132,7 @@ class PositionManager:
         self.max_position_pct = max_position_pct
         self.max_buy_prob = max_buy_prob
         self.min_sell_prob = min_sell_prob
+        self.allow_hedging = allow_hedging
 
         # Risk management settings
         self.max_daily_loss = max_daily_loss
@@ -472,7 +475,7 @@ class PositionManager:
             # Check for existing position on this game
             existing_position = await self._get_open_position_for_game(signal.game_id)
 
-            if existing_position:
+            if existing_position and not self.allow_hedging:
                 existing_side = existing_position["side"]
                 new_side = "buy" if signal.direction == SignalDirection.BUY else "sell"
 
@@ -508,6 +511,27 @@ class PositionManager:
                     logger.warning(f"No market price available for signal {signal.signal_id} - skipping (synthetic disabled)")
                     return
 
+            # If hedging is enabled, allow multiple positions per game as long as we aren't opening
+            # the exact same position (platform + market_id + side).
+            if self.allow_hedging:
+                new_side = "buy" if signal.direction == SignalDirection.BUY else "sell"
+                existing_same = await self._get_open_position_for_market(
+                    platform=market_price.platform.value,
+                    market_id=str(market_price.market_id),
+                    side=new_side,
+                )
+                if existing_same:
+                    self._duplicate_rejected_count += 1
+                    logger.info(
+                        "Skipping signal: duplicate position already open (%s on %s:%s) game=%s trade_id=%s",
+                        new_side,
+                        market_price.platform.value,
+                        market_price.market_id,
+                        signal.game_id,
+                        existing_same.get("trade_id"),
+                    )
+                    return
+
             # Calculate proposed position size for risk check
             # Use paper engine's sizing logic to estimate
             proposed_size = self._estimate_position_size(signal, market_price)
@@ -539,6 +563,16 @@ class PositionManager:
 
             # Execute through paper engine
             if self.paper_engine:
+                # Fee-aware minimum edge check using configured take-profit/stop-loss (Kalshi only)
+                if market_price.platform == Platform.KALSHI:
+                    ok = self._fee_aware_take_profit_check(signal, market_price)
+                    if not ok:
+                        logger.info(
+                            f"Trade rejected: fees absorb take-profit edge "
+                            f"for {signal.game_id} {signal.team}"
+                        )
+                        return
+
                 # region agent log
                 _agent_dbg(
                     "H1_H3",
@@ -601,6 +635,55 @@ class PositionManager:
         min_size = 1.0
         return max(min_size, position_size)
 
+    def _fee_aware_take_profit_check(self, signal: TradingSignal, market_price: MarketPrice) -> bool:
+        """Reject Kalshi trades where fees would erase take-profit edge."""
+        if not self.paper_engine:
+            return True
+
+        # Determine side and entry (includes slippage)
+        side = TradeSide.BUY if signal.direction == SignalDirection.BUY else TradeSide.SELL
+        entry_price = market_price.yes_ask if side == TradeSide.BUY else market_price.yes_bid
+        exec_price = self.paper_engine.apply_slippage(entry_price, side)
+
+        size = self._estimate_position_size(signal, market_price)
+        if size < 1.0:
+            return True
+
+        # Target exits based on configured take-profit / stop-loss
+        take_profit = self.take_profit_pct / 100.0
+        stop_loss = self._get_stop_loss_for_sport(signal.sport.value) / 100.0
+
+        if side == TradeSide.BUY:
+            tp_exit = min(1.0, exec_price + take_profit)
+            sl_exit = max(0.0, exec_price - stop_loss)
+        else:
+            tp_exit = max(0.0, exec_price - take_profit)
+            sl_exit = min(1.0, exec_price + stop_loss)
+
+        entry_fees = self.paper_engine._estimate_kalshi_fees(exec_price, size)
+        exit_fees_tp = self.paper_engine._estimate_kalshi_fees(tp_exit, size)
+        exit_fees_sl = self.paper_engine._estimate_kalshi_fees(sl_exit, size)
+
+        gross_tp = size * (tp_exit - exec_price) if side == TradeSide.BUY else size * (exec_price - tp_exit)
+        gross_sl = size * (sl_exit - exec_price) if side == TradeSide.BUY else size * (exec_price - sl_exit)
+
+        net_tp = gross_tp - entry_fees - exit_fees_tp
+        net_sl = gross_sl - entry_fees - exit_fees_sl
+
+        if net_tp <= 0:
+            logger.info(
+                f"Fee-aware TP reject: net_tp=${net_tp:.2f} "
+                f"(entry={exec_price:.3f}, tp={tp_exit:.3f}, fees=${entry_fees + exit_fees_tp:.2f})"
+            )
+            return False
+
+        # Log worst-case for visibility (does not reject)
+        logger.debug(
+            f"Fee-aware SL estimate: net_sl=${net_sl:.2f} "
+            f"(entry={exec_price:.3f}, sl={sl_exit:.3f}, fees=${entry_fees + exit_fees_sl:.2f})"
+        )
+        return True
+
     async def _get_open_position_for_game(self, game_id: str) -> Optional[dict]:
         """Get existing open position for a game."""
         pool = await get_pool()
@@ -611,6 +694,31 @@ class PositionManager:
             ORDER BY time DESC
             LIMIT 1
         """, game_id)
+        return dict(row) if row else None
+
+    async def _get_open_position_for_market(
+        self,
+        platform: str,
+        market_id: str,
+        side: str,
+    ) -> Optional[dict]:
+        """Get existing open position for an exact position identity (platform/market/side)."""
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            """
+            SELECT trade_id, game_id, side, entry_price, size, time, platform, market_id
+            FROM paper_trades
+            WHERE platform = $1
+              AND market_id = $2
+              AND side = $3
+              AND status = 'open'
+            ORDER BY time DESC
+            LIMIT 1
+            """,
+            platform,
+            market_id,
+            side,
+        )
         return dict(row) if row else None
 
     async def _close_position(self, position: dict, signal: TradingSignal) -> None:
@@ -708,7 +816,7 @@ class PositionManager:
                 if target_team:
                     # Look for market with matching contract_team
                     row = await pool.fetchrow("""
-                        SELECT market_id, market_title, contract_team, yes_bid, yes_ask, volume, liquidity, time
+                        SELECT market_id, market_title, contract_team, yes_bid, yes_ask, yes_bid_size, yes_ask_size, volume, liquidity, time
                         FROM market_prices
                         WHERE game_id = $1 AND platform = 'polymarket'
                           AND contract_team IS NOT NULL
@@ -726,6 +834,8 @@ class PositionManager:
                             contract_team=row["contract_team"],
                             yes_bid=float(row["yes_bid"]),
                             yes_ask=float(row["yes_ask"]),
+                            yes_bid_size=float(row.get("yes_bid_size") or 0),
+                            yes_ask_size=float(row.get("yes_ask_size") or 0),
                             volume=float(row["volume"] or 0),
                             liquidity=float(row.get("liquidity") or 0),
                         )
@@ -733,7 +843,7 @@ class PositionManager:
 
                     # Fallback: look for market_title containing the team name
                     row = await pool.fetchrow("""
-                        SELECT market_id, market_title, contract_team, yes_bid, yes_ask, volume, liquidity, time
+                        SELECT market_id, market_title, contract_team, yes_bid, yes_ask, yes_bid_size, yes_ask_size, volume, liquidity, time
                         FROM market_prices
                         WHERE game_id = $1 AND platform = 'polymarket'
                           AND (market_title ILIKE $2 OR market_title ILIKE $3)
@@ -750,6 +860,8 @@ class PositionManager:
                             contract_team=row.get("contract_team"),
                             yes_bid=float(row["yes_bid"]),
                             yes_ask=float(row["yes_ask"]),
+                            yes_bid_size=float(row.get("yes_bid_size") or 0),
+                            yes_ask_size=float(row.get("yes_ask_size") or 0),
                             volume=float(row["volume"] or 0),
                             liquidity=float(row.get("liquidity") or 0),
                         )
@@ -757,7 +869,7 @@ class PositionManager:
 
                 # Fallback: get any recent price for this game
                 row = await pool.fetchrow("""
-                    SELECT market_id, market_title, contract_team, yes_bid, yes_ask, volume, liquidity
+                    SELECT market_id, market_title, contract_team, yes_bid, yes_ask, yes_bid_size, yes_ask_size, volume, liquidity
                     FROM market_prices
                     WHERE game_id = $1 AND platform = 'polymarket'
                     ORDER BY time DESC LIMIT 1
@@ -772,6 +884,8 @@ class PositionManager:
                         contract_team=row.get("contract_team"),
                         yes_bid=float(row["yes_bid"]),
                         yes_ask=float(row["yes_ask"]),
+                        yes_bid_size=float(row.get("yes_bid_size") or 0),
+                        yes_ask_size=float(row.get("yes_ask_size") or 0),
                         volume=float(row["volume"] or 0),
                         liquidity=float(row.get("liquidity") or 0),
                     )
@@ -1349,6 +1463,7 @@ async def main():
         max_position_pct=float(os.environ.get("MAX_POSITION_PCT", "10.0")),
         max_buy_prob=float(os.environ.get("MAX_BUY_PROB", "0.95")),  # Don't buy above 95%
         min_sell_prob=float(os.environ.get("MIN_SELL_PROB", "0.05")),  # Don't sell below 5%
+        allow_hedging=os.environ.get("ALLOW_HEDGING", "false").lower() in ("1", "true", "yes", "y", "on"),
         # Risk management parameters
         max_daily_loss=float(os.environ.get("MAX_DAILY_LOSS", "100.0")),  # $100 max daily loss
         max_game_exposure=float(os.environ.get("MAX_GAME_EXPOSURE", "50.0")),  # $50 max per game

@@ -52,6 +52,17 @@ export default function RiskStatusBar({ compact = true }: RiskStatusBarProps) {
     return (
       <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700">
         <div className="flex items-center justify-between gap-4 flex-wrap">
+          {/* Piggybank */}
+          <div className="flex items-center gap-2 mr-2">
+            <span className="text-lg">🐷</span>
+            <div className="flex flex-col leading-none">
+              <span className="text-[10px] text-gray-400 uppercase font-bold">Piggybank</span>
+              <span className="text-sm font-mono text-pink-400 font-bold">
+                ${(riskMetrics.piggybank_balance || 0).toFixed(2)}
+              </span>
+            </div>
+          </div>
+
           {/* Daily Limit */}
           <div className="flex items-center gap-3 min-w-[200px]">
             <span className="text-xs text-gray-400 whitespace-nowrap">Daily Limit:</span>

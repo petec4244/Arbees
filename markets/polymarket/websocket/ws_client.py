@@ -30,6 +30,7 @@ class PolymarketWebSocketClient:
     - Heartbeat to keep connection alive
     """
     
+    # Default URL (overridden by config)
     WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     # The Rust reference bot pings every 30s using WS ping frames. Polymarket docs
     # sometimes require more frequent pings; we use 5s to be safe.
@@ -37,8 +38,16 @@ class PolymarketWebSocketClient:
     RECONNECT_DELAY_BASE = 1.0  # seconds
     RECONNECT_DELAY_MAX = 60.0  # seconds
     
-    def __init__(self):
-        """Initialize Polymarket WebSocket client."""
+    def __init__(self, ws_url: Optional[str] = None):
+        """
+        Initialize Polymarket WebSocket client.
+        
+        Args:
+            ws_url: Override WebSocket URL (or use POLYMARKET_WS_URL env var)
+        """
+        from markets.polymarket.config import get_polymarket_ws_url
+        
+        self._ws_url = get_polymarket_ws_url(override_url=ws_url)
         self._ws: Optional[WebSocketClientProtocol] = None
         self._subscribed_token_ids: Set[str] = set()
         self._token_metadata: Dict[str, dict] = {}  # token_id -> {condition_id, title, etc}
@@ -84,10 +93,10 @@ class PolymarketWebSocketClient:
             return
         
         try:
-            logger.info(f"Connecting to Polymarket WebSocket: {self.WS_URL}")
+            logger.info(f"Connecting to Polymarket WebSocket: {self._ws_url}")
             
             self._ws = await websockets.connect(
-                self.WS_URL,
+                self._ws_url,
                 ping_interval=None,  # We handle ping ourselves
             )
             

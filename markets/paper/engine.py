@@ -11,7 +11,7 @@ Features:
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
 import json
@@ -36,23 +36,20 @@ from markets.base import BaseMarketClient
 
 logger = logging.getLogger(__name__)
 
-# region agent log (helper)
+# Import shared trace logger
+from arbees_shared.utils.trace_logger import trace_log
+
+
+# region agent log (helper) - kept for backwards compat, delegates to trace_log
 def _agent_dbg(hypothesisId: str, location: str, message: str, data: dict) -> None:
     """Write a single NDJSON debug line to the host-mounted .cursor/debug.log (DEBUG MODE ONLY)."""
-    try:
-        payload = {
-            "sessionId": "debug-session",
-            "runId": os.environ.get("DEBUG_RUN_ID", "pre-fix"),
-            "hypothesisId": hypothesisId,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open("/app/.cursor/debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, default=str) + "\n")
-    except Exception:
-        pass
+    trace_log(
+        service="paper_engine",
+        event=message,
+        hypothesis_id=hypothesisId,
+        location=location,
+        **data,
+    )
 # endregion
 
 
@@ -109,6 +106,7 @@ class PaperTradingEngine(BaseMarketClient):
         self._positions: dict[str, Position] = {}
         self._trades: list[PaperTrade] = []
         self._pending_orders: dict[str, dict] = {}
+        self._last_rejection_reason: Optional[str] = None  # Set when execute_signal returns None
 
     @property
     def bankroll(self) -> Bankroll:
@@ -198,6 +196,25 @@ class PaperTradingEngine(BaseMarketClient):
             return min(1.0, price + slip)
         return max(0.0, price - slip)
 
+    @staticmethod
+    def _kalshi_fee_cents(price: float) -> int:
+        """Kalshi fee per contract in cents for a given price (0-1)."""
+        price_cents = int(round(price * 100))
+        if price_cents <= 0 or price_cents >= 100:
+            return 0
+        numerator = 7 * price_cents * (100 - price_cents) + 9999
+        return numerator // 10000
+
+    def _estimate_kalshi_fees(self, price: float, size: float) -> float:
+        """Estimate total Kalshi fees in dollars for a trade of `size` contracts."""
+        fee_cents = self._kalshi_fee_cents(price)
+        return (fee_cents / 100.0) * size
+
+    def _reject(self, reason: str) -> None:
+        """Log rejection and store reason for caller inspection."""
+        logger.info(f"Signal rejected: {reason}")
+        self._last_rejection_reason = reason
+
     async def execute_signal(
         self,
         signal: TradingSignal,
@@ -211,22 +228,43 @@ class PaperTradingEngine(BaseMarketClient):
             market_price: Current market price
 
         Returns:
-            PaperTrade if executed, None if rejected
+            PaperTrade if executed, None if rejected.
+            Check self._last_rejection_reason for details if None.
         """
+        # Clear previous rejection reason
+        self._last_rejection_reason = None
+
         # Validate edge
         if signal.edge_pct < self.min_edge_pct:
-            logger.info(f"Signal rejected: edge {signal.edge_pct:.1f}% < min {self.min_edge_pct}%")
+            self._reject(f"edge {signal.edge_pct:.1f}% < min {self.min_edge_pct}%")
             return None
 
         # Determine side and price
         side = TradeSide.BUY if signal.direction == SignalDirection.BUY else TradeSide.SELL
+
+        # Check for duplicate position on same platform/market/side
+        if self.db:
+            existing = await self._get_open_position(
+                platform=market_price.platform.value,
+                market_id=str(market_price.market_id),
+                side=side.value,
+            )
+            if existing:
+                self._reject(
+                    f"duplicate position - already have {side.value} on "
+                    f"{market_price.platform.value}:{market_price.market_id} "
+                    f"({signal.game_id} {signal.team}) (trade_id={existing.get('trade_id')})"
+                )
+                return None
+
+        # Determine entry price (side already computed above)
         entry_price = market_price.yes_ask if side == TradeSide.BUY else market_price.yes_bid
 
         # Guardrail: if orderbook is effectively empty/unknown (defaults 0/1), do not trade.
         # This prevents pathological entries like BUY @ 1.000 (100%) due to missing asks.
         if market_price.yes_bid <= 0.0 and market_price.yes_ask >= 1.0:
-            logger.info(
-                f"Signal rejected: invalid market book (bid={market_price.yes_bid:.3f}, ask={market_price.yes_ask:.3f}) "
+            self._reject(
+                f"invalid market book (bid={market_price.yes_bid:.3f}, ask={market_price.yes_ask:.3f}) "
                 f"for {signal.game_id} {signal.team}"
             )
             # region agent log
@@ -279,8 +317,32 @@ class PaperTradingEngine(BaseMarketClient):
         size = self.calculate_position_size(signal, exec_price)
 
         if size < 1.0:
-            logger.info(f"Signal rejected: position size too small (${size:.2f}) - model_prob={signal.model_prob:.3f}, edge={signal.edge_pct:.1f}%")
+            self._reject(f"position size too small (${size:.2f}) - model_prob={signal.model_prob:.3f}, edge={signal.edge_pct:.1f}%")
             return None
+
+        # Enforce depth at best price when available (strict for Polymarket)
+        bid_size = float(getattr(market_price, "yes_bid_size", 0.0) or 0.0)
+        ask_size = float(getattr(market_price, "yes_ask_size", 0.0) or 0.0)
+        if market_price.platform == Platform.POLYMARKET:
+            if side == TradeSide.BUY:
+                if ask_size <= 0:
+                    self._reject(f"missing ask depth for BUY ({signal.game_id} {signal.team})")
+                    return None
+                if size > ask_size:
+                    self._reject(f"insufficient ask depth ({size:.2f} > {ask_size:.2f})")
+                    return None
+            else:
+                if bid_size <= 0:
+                    self._reject(f"missing bid depth for SELL ({signal.game_id} {signal.team})")
+                    return None
+                if size > bid_size:
+                    self._reject(f"insufficient bid depth ({size:.2f} > {bid_size:.2f})")
+                    return None
+
+        # Estimate entry fees (Kalshi only)
+        entry_fees = 0.0
+        if market_price.platform == Platform.KALSHI:
+            entry_fees = self._estimate_kalshi_fees(exec_price, size)
 
         # region agent log
         _agent_dbg(
@@ -299,7 +361,7 @@ class PaperTradingEngine(BaseMarketClient):
                 "yes_ask": float(market_price.yes_ask),
                 "yes_bid_size": float(getattr(market_price, "yes_bid_size", 0.0) or 0.0),
                 "yes_ask_size": float(getattr(market_price, "yes_ask_size", 0.0) or 0.0),
-                "entry_fees": 0.0,
+                "entry_fees": float(entry_fees),
                 "exit_fees": 0.0,
             },
         )
@@ -307,8 +369,9 @@ class PaperTradingEngine(BaseMarketClient):
 
         # Check available balance
         cost = size * exec_price if side == TradeSide.BUY else size * (1.0 - exec_price)
+        cost += entry_fees
         if cost > self.available_balance:
-            logger.warning(f"Signal rejected: insufficient balance ({cost} > {self.available_balance})")
+            self._reject(f"insufficient balance (${cost:.2f} > ${self.available_balance:.2f})")
             return None
 
         # Create trade
@@ -328,6 +391,8 @@ class PaperTradingEngine(BaseMarketClient):
             edge_at_entry=signal.edge_pct,
             kelly_fraction=self.kelly_fraction,
             status=TradeStatus.OPEN,
+            entry_time=datetime.now(timezone.utc),
+            entry_fees=entry_fees,
         )
 
         # Update bankroll
@@ -335,6 +400,30 @@ class PaperTradingEngine(BaseMarketClient):
 
         # Track trade
         self._trades.append(trade)
+
+        # Log detailed trade entry with model/market probs
+        trace_log(
+            service="paper_engine",
+            event="trade_opened",
+            trade_id=trade.trade_id,
+            signal_id=trade.signal_id,
+            game_id=trade.game_id,
+            sport=trade.sport.value if trade.sport else None,
+            platform=trade.platform.value,
+            market_id=trade.market_id,
+            market_title=trade.market_title,
+            contract_team=market_price.contract_team,
+            side=trade.side.value,
+            entry_price=trade.entry_price,
+            size=trade.size,
+            model_prob=signal.model_prob,
+            market_prob=signal.market_prob,
+            edge_at_entry=trade.edge_at_entry,
+            kelly_fraction=trade.kelly_fraction,
+            yes_bid=market_price.yes_bid,
+            yes_ask=market_price.yes_ask,
+            entry_fees=trade.entry_fees,
+        )
 
         # Persist to database
         if self.db:
@@ -397,6 +486,11 @@ class PaperTradingEngine(BaseMarketClient):
             side = TradeSide.SELL if trade.side == TradeSide.BUY else TradeSide.BUY
             exec_price = self.apply_slippage(exit_price, side)
 
+        # Estimate exit fees (Kalshi only, not on settlement)
+        exit_fees = 0.0
+        if trade.platform == Platform.KALSHI and not is_game_settlement:
+            exit_fees = self._estimate_kalshi_fees(exec_price, trade.size)
+
         # Determine outcome if not provided
         if outcome is None:
             if trade.side == TradeSide.BUY:
@@ -429,11 +523,11 @@ class PaperTradingEngine(BaseMarketClient):
             edge_at_entry=trade.edge_at_entry,
             kelly_fraction=trade.kelly_fraction,
             entry_time=trade.entry_time,
-            exit_time=datetime.utcnow(),
+            exit_time=datetime.now(timezone.utc),
             status=TradeStatus.CLOSED,
             outcome=outcome,
             entry_fees=trade.entry_fees,
-            exit_fees=0.0,
+            exit_fees=exit_fees,
         )
 
         # Update bankroll
@@ -470,7 +564,7 @@ class PaperTradingEngine(BaseMarketClient):
             await self.db.close_paper_trade(
                 trade_id=closed_trade.trade_id,
                 exit_price=exec_price,
-                exit_time=closed_trade.exit_time if closed_trade.exit_time else datetime.utcnow(),
+                exit_time=closed_trade.exit_time if closed_trade.exit_time else datetime.now(timezone.utc),
                 outcome=outcome.value,
             )
 
@@ -488,6 +582,7 @@ class PaperTradingEngine(BaseMarketClient):
     def _update_bankroll_for_entry(self, trade: PaperTrade) -> None:
         """Update bankroll when opening a trade."""
         cost = trade.size * trade.entry_price if trade.side == TradeSide.BUY else trade.size * (1.0 - trade.entry_price)
+        cost += trade.entry_fees or 0.0
 
         new_bankroll = Bankroll(
             initial_balance=self._bankroll.initial_balance,
@@ -514,6 +609,7 @@ class PaperTradingEngine(BaseMarketClient):
             return
 
         cost = trade.size * trade.entry_price if trade.side == TradeSide.BUY else trade.size * (1.0 - trade.entry_price)
+        cost += trade.entry_fees or 0.0
         pnl = trade.pnl
 
         # Calculate new balances with piggybank split
@@ -556,6 +652,26 @@ class PaperTradingEngine(BaseMarketClient):
     def get_closed_trades(self) -> list[PaperTrade]:
         """Get all closed trades."""
         return [t for t in self._trades if t.status == TradeStatus.CLOSED]
+
+    async def _get_open_position(
+        self, platform: str, market_id: str, side: str
+    ) -> Optional[dict]:
+        """Check for existing open position on same platform/market/side."""
+        if not self.db:
+            return None
+
+        pool = self.db._pool
+        row = await pool.fetchrow("""
+            SELECT trade_id, game_id, side, entry_price, size, time, platform, market_id
+            FROM paper_trades
+            WHERE platform = $1
+              AND market_id = $2
+              AND side = $3
+              AND status = 'open'
+            ORDER BY time DESC
+            LIMIT 1
+        """, platform, market_id, side)
+        return dict(row) if row else None
 
     def get_performance_stats(self) -> PerformanceStats:
         """Calculate performance statistics."""

@@ -9,6 +9,7 @@ Features:
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -20,6 +21,8 @@ from pydantic import BaseModel
 from arbees_shared.db.connection import DatabaseClient, get_pool, close_pool
 from arbees_shared.messaging.redis_bus import RedisBus
 from arbees_shared.models.game import Sport
+from arbees_shared.health.heartbeat import HeartbeatPublisher
+from arbees_shared.models.health import ServiceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +30,13 @@ logger = logging.getLogger(__name__)
 db: Optional[DatabaseClient] = None
 redis: Optional[RedisBus] = None
 websocket_clients: set[WebSocket] = set()
+heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global db, redis
+    global db, redis, heartbeat_publisher
 
     # Startup
     logger.info("Starting Arbees API")
@@ -45,12 +49,30 @@ async def lifespan(app: FastAPI):
 
     # Subscribe to signals for WebSocket broadcast
     await redis.subscribe("signals:new", broadcast_to_websockets)
+
+    # Subscribe to futures signals for real-time updates
+    await redis.subscribe("futures:signals:new", broadcast_futures_signal)
+
     await redis.start_listening()
+
+    # Start heartbeat publisher
+    heartbeat_publisher = HeartbeatPublisher(
+        service="api",
+        instance_id=os.environ.get("HOSTNAME", "api-1"),
+    )
+    await heartbeat_publisher.start()
+    heartbeat_publisher.set_status(ServiceStatus.HEALTHY)
+    heartbeat_publisher.update_checks({
+        "redis_ok": True,
+        "db_ok": True,
+    })
 
     yield
 
     # Shutdown
     logger.info("Shutting down Arbees API")
+    if heartbeat_publisher:
+        await heartbeat_publisher.stop()
     await redis.disconnect()
     await close_pool()
 
@@ -92,6 +114,23 @@ async def broadcast_to_websockets(data: dict) -> None:
         return
 
     message = {"type": "signal", "data": data}
+    disconnected = set()
+
+    for ws in websocket_clients:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            disconnected.add(ws)
+
+    websocket_clients.difference_update(disconnected)
+
+
+async def broadcast_futures_signal(data: dict) -> None:
+    """Broadcast futures signal to all WebSocket clients."""
+    if not websocket_clients:
+        return
+
+    message = {"type": "futures_signal", "data": data}
     disconnected = set()
 
     for ws in websocket_clients:
@@ -347,33 +386,60 @@ async def get_live_games(
 
     pool = await get_pool()
 
-    # Get latest state for each game with team names from games table
-    # Filter out:
-    # - Games with final/completed/scheduled status
-    # - Games with no updates beyond max_age_hours (stale)
-    # - Games in 'status_end_period' or 'halftime' with no updates in last 45 minutes (likely finished)
-    # Use COALESCE to show game_id if team names are missing
+    # IMPORTANT:
+    # We must filter using the *latest* game_state per game.
+    # If we filter rows first (e.g., exclude 'final') and then DISTINCT ON, we'll
+    # accidentally return the previous non-final row and the game will "stick" in the UI.
+    #
+    # Filters:
+    # - Exclude games whose latest status is final/completed/scheduled (or contains those strings)
+    # - Exclude stale games older than max_age_hours
+    # - Exclude games stuck in end_period/halftime for too long
+    # - Exclude games that appear ended (end_period + 0:00) and haven't updated recently
     query = f"""
-        SELECT DISTINCT ON (gs.game_id)
-            gs.game_id, gs.sport, gs.home_score, gs.away_score, gs.period,
-            gs.time_remaining, gs.status, gs.possession, gs.home_win_prob,
-            gs.time as last_update, g.cooldown_until,
-            COALESCE(NULLIF(g.home_team, ''), 'Home ' || gs.game_id) as home_team,
-            COALESCE(NULLIF(g.away_team, ''), 'Away ' || gs.game_id) as away_team,
+        WITH latest AS (
+            SELECT DISTINCT ON (gs.game_id)
+                gs.game_id, gs.sport, gs.home_score, gs.away_score, gs.period,
+                gs.time_remaining, gs.status, gs.possession, gs.home_win_prob,
+                gs.time as last_update
+            FROM game_states gs
+            ORDER BY gs.game_id, gs.time DESC
+        )
+        SELECT
+            l.game_id, l.sport, l.home_score, l.away_score, l.period,
+            l.time_remaining, l.status, l.possession, l.home_win_prob,
+            l.last_update, g.cooldown_until,
+            COALESCE(NULLIF(g.home_team, ''), 'Home ' || l.game_id) as home_team,
+            COALESCE(NULLIF(g.away_team, ''), 'Away ' || l.game_id) as away_team,
             g.home_team_abbrev, g.away_team_abbrev
-        FROM game_states gs
-        LEFT JOIN games g ON gs.game_id = g.game_id
-        WHERE gs.status NOT IN ('final', 'completed', 'scheduled', 'status_scheduled')
-          AND gs.time > NOW() - INTERVAL '{max_age_hours} hours'
-          AND NOT (gs.status IN ('status_end_period', 'halftime') AND gs.time < NOW() - INTERVAL '45 minutes')
+        FROM latest l
+        LEFT JOIN games g ON l.game_id = g.game_id
+        WHERE l.last_update > NOW() - INTERVAL '{max_age_hours} hours'
+          -- Any game that hasn't updated recently is not "live" for the UI.
+          -- (Halftime/end_period can be legitimately quiet, so we exempt those for longer.)
+          AND NOT (
+            lower(COALESCE(l.status, '')) NOT IN ('halftime', 'status_end_period', 'end_period')
+            AND l.last_update < NOW() - INTERVAL '15 minutes'
+          )
+          AND NOT (
+            lower(COALESCE(l.status, '')) IN ('final', 'completed', 'scheduled', 'status_scheduled')
+            OR lower(COALESCE(l.status, '')) LIKE '%final%'
+            OR lower(COALESCE(l.status, '')) LIKE '%complete%'
+          )
+          AND NOT (l.status IN ('status_end_period', 'halftime') AND l.last_update < NOW() - INTERVAL '45 minutes')
+          AND NOT (
+            lower(COALESCE(l.status, '')) LIKE '%end_period%'
+            AND (l.time_remaining LIKE '0:%' OR l.time_remaining IN ('0', '0.0', '0:00'))
+            AND l.last_update < NOW() - INTERVAL '10 minutes'
+          )
     """
     params = []
 
     if sport:
-        query += f" AND gs.sport = ${len(params) + 1}"
+        query += f" AND l.sport = ${len(params) + 1}"
         params.append(sport)
 
-    query += " ORDER BY gs.game_id, gs.time DESC"
+    query += " ORDER BY l.last_update DESC"
 
     rows = await pool.fetch(query, *params)
     return [dict(row) for row in rows]
@@ -664,6 +730,301 @@ async def get_upcoming_games_stats(
 
 
 # =============================================================================
+# Futures Monitoring Endpoints
+# =============================================================================
+
+class FuturesGameResponse(BaseModel):
+    """Response model for futures games being monitored."""
+    game_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    scheduled_time: datetime
+    hours_until_start: float
+    has_kalshi: bool
+    has_polymarket: bool
+    opening_home_prob: Optional[float]
+    current_home_prob: Optional[float]
+    line_movement_pct: Optional[float]
+    movement_direction: Optional[str]
+    total_volume: float
+    active_signals: int
+    lifecycle_status: str
+
+
+class FuturesPriceHistoryResponse(BaseModel):
+    """Response model for futures price history."""
+    time: datetime
+    platform: str
+    market_type: str
+    yes_mid: Optional[float]
+    spread_cents: Optional[float]
+    volume: Optional[float]
+    hours_until_start: Optional[float]
+
+
+class FuturesSignalResponse(BaseModel):
+    """Response model for futures signals."""
+    signal_id: str
+    game_id: str
+    sport: str
+    signal_type: str
+    direction: str
+    edge_pct: float
+    confidence: Optional[float]
+    hours_until_start: Optional[float]
+    reason: Optional[str]
+    executed: bool
+    time: datetime
+
+
+class FuturesStatsResponse(BaseModel):
+    """Statistics for futures monitoring."""
+    total_monitored: int
+    games_with_markets: int
+    active_signals: int
+    avg_line_movement: float
+    by_sport: dict
+
+
+@app.get("/api/futures/games", response_model=list[FuturesGameResponse])
+async def get_futures_games(
+    sport: Optional[str] = Query(None, description="Filter by sport"),
+    min_hours: float = Query(0, ge=0, description="Minimum hours until start"),
+    max_hours: float = Query(48, ge=0, le=168, description="Maximum hours until start"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum games to return"),
+):
+    """Get games currently being monitored by FuturesMonitor.
+
+    Returns games with pre-game market tracking data including:
+    - Opening and current probabilities
+    - Line movement tracking
+    - Market discovery status
+    - Active futures signals count
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    rows = await pool.fetch("""
+        SELECT
+            fg.game_id,
+            fg.sport,
+            fg.home_team,
+            fg.away_team,
+            fg.scheduled_time,
+            EXTRACT(EPOCH FROM (fg.scheduled_time - NOW())) / 3600 as hours_until_start,
+            fg.kalshi_market_id IS NOT NULL as has_kalshi,
+            fg.polymarket_market_id IS NOT NULL as has_polymarket,
+            fg.opening_home_prob,
+            fg.current_home_prob,
+            fg.line_movement_pct,
+            fg.movement_direction,
+            COALESCE(fg.total_volume_kalshi, 0) + COALESCE(fg.total_volume_polymarket, 0) as total_volume,
+            fg.lifecycle_status,
+            (
+                SELECT COUNT(*) FROM futures_signals fs
+                WHERE fs.game_id = fg.game_id AND NOT fs.executed
+            ) as active_signals
+        FROM futures_games fg
+        WHERE fg.lifecycle_status = 'futures_monitoring'
+          AND fg.scheduled_time > NOW() + INTERVAL '%s hours'
+          AND fg.scheduled_time < NOW() + INTERVAL '%s hours'
+    """ % (min_hours, max_hours) + (
+        " AND LOWER(fg.sport) = $1" if sport else ""
+    ) + """
+        ORDER BY fg.scheduled_time ASC
+        LIMIT %s
+    """ % limit, *([sport.lower()] if sport else []))
+
+    return [
+        FuturesGameResponse(
+            game_id=row["game_id"],
+            sport=row["sport"],
+            home_team=row["home_team"],
+            away_team=row["away_team"],
+            scheduled_time=row["scheduled_time"],
+            hours_until_start=float(row["hours_until_start"] or 0),
+            has_kalshi=row["has_kalshi"],
+            has_polymarket=row["has_polymarket"],
+            opening_home_prob=float(row["opening_home_prob"]) if row["opening_home_prob"] else None,
+            current_home_prob=float(row["current_home_prob"]) if row["current_home_prob"] else None,
+            line_movement_pct=float(row["line_movement_pct"]) if row["line_movement_pct"] else None,
+            movement_direction=row["movement_direction"],
+            total_volume=float(row["total_volume"] or 0),
+            active_signals=int(row["active_signals"] or 0),
+            lifecycle_status=row["lifecycle_status"],
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/futures/games/{game_id}/prices", response_model=list[FuturesPriceHistoryResponse])
+async def get_futures_price_history(
+    game_id: str,
+    platform: Optional[str] = Query(None, description="Filter by platform (kalshi, polymarket)"),
+    limit: int = Query(200, ge=1, le=1000, description="Maximum price points to return"),
+):
+    """Get price history for a futures game.
+
+    Returns chronological price snapshots from both platforms,
+    useful for charting line movement over time.
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    query = """
+        SELECT time, platform, market_type, yes_mid, spread_cents, volume, hours_until_start
+        FROM futures_price_history
+        WHERE game_id = $1
+    """
+    params = [game_id]
+
+    if platform:
+        query += " AND platform = $2"
+        params.append(platform.lower())
+
+    query += " ORDER BY time DESC LIMIT %s" % limit
+
+    rows = await pool.fetch(query, *params)
+
+    return [
+        FuturesPriceHistoryResponse(
+            time=row["time"],
+            platform=row["platform"],
+            market_type=row["market_type"],
+            yes_mid=float(row["yes_mid"]) if row["yes_mid"] else None,
+            spread_cents=float(row["spread_cents"]) if row["spread_cents"] else None,
+            volume=float(row["volume"]) if row["volume"] else None,
+            hours_until_start=float(row["hours_until_start"]) if row["hours_until_start"] else None,
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/futures/signals", response_model=list[FuturesSignalResponse])
+async def get_futures_signals(
+    sport: Optional[str] = Query(None, description="Filter by sport"),
+    signal_type: Optional[str] = Query(None, description="Filter by signal type"),
+    min_edge: float = Query(0, ge=0, description="Minimum edge percentage"),
+    executed: Optional[bool] = Query(None, description="Filter by execution status"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum signals to return"),
+):
+    """Get active futures trading signals.
+
+    Returns pre-game signals with edge calculations based on:
+    - Cross-platform price discrepancies
+    - Line movement from opening
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    query = """
+        SELECT
+            fs.signal_id, fs.game_id, fs.sport, fs.signal_type,
+            fs.direction, fs.edge_pct, fs.confidence,
+            fs.hours_until_start, fs.reason, fs.executed, fs.time
+        FROM futures_signals fs
+        WHERE fs.edge_pct >= $1
+          AND fs.time > NOW() - INTERVAL '24 hours'
+    """
+    params = [min_edge]
+    param_idx = 2
+
+    if sport:
+        query += f" AND LOWER(fs.sport) = ${param_idx}"
+        params.append(sport.lower())
+        param_idx += 1
+
+    if signal_type:
+        query += f" AND fs.signal_type = ${param_idx}"
+        params.append(signal_type)
+        param_idx += 1
+
+    if executed is not None:
+        query += f" AND fs.executed = ${param_idx}"
+        params.append(executed)
+        param_idx += 1
+
+    query += f" ORDER BY fs.edge_pct DESC, fs.time DESC LIMIT ${param_idx}"
+    params.append(limit)
+
+    rows = await pool.fetch(query, *params)
+
+    return [
+        FuturesSignalResponse(
+            signal_id=row["signal_id"],
+            game_id=row["game_id"],
+            sport=row["sport"],
+            signal_type=row["signal_type"],
+            direction=row["direction"],
+            edge_pct=float(row["edge_pct"]),
+            confidence=float(row["confidence"]) if row["confidence"] else None,
+            hours_until_start=float(row["hours_until_start"]) if row["hours_until_start"] else None,
+            reason=row["reason"],
+            executed=row["executed"],
+            time=row["time"],
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/futures/stats", response_model=FuturesStatsResponse)
+async def get_futures_stats():
+    """Get statistics for futures monitoring.
+
+    Returns aggregate metrics about games being monitored,
+    market discovery rates, and signal generation.
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    pool = await get_pool()
+
+    # Get overall stats
+    row = await pool.fetchrow("""
+        SELECT
+            COUNT(*) as total_monitored,
+            COUNT(*) FILTER (WHERE kalshi_market_id IS NOT NULL OR polymarket_market_id IS NOT NULL) as games_with_markets,
+            AVG(ABS(line_movement_pct)) as avg_line_movement
+        FROM futures_games
+        WHERE lifecycle_status = 'futures_monitoring'
+    """)
+
+    # Count active signals
+    signals_row = await pool.fetchrow("""
+        SELECT COUNT(*) as active_signals
+        FROM futures_signals
+        WHERE NOT executed
+          AND time > NOW() - INTERVAL '24 hours'
+    """)
+
+    # Breakdown by sport
+    sport_rows = await pool.fetch("""
+        SELECT sport, COUNT(*) as count
+        FROM futures_games
+        WHERE lifecycle_status = 'futures_monitoring'
+        GROUP BY sport
+        ORDER BY count DESC
+    """)
+
+    by_sport = {r["sport"]: r["count"] for r in sport_rows}
+
+    return FuturesStatsResponse(
+        total_monitored=int(row["total_monitored"] or 0) if row else 0,
+        games_with_markets=int(row["games_with_markets"] or 0) if row else 0,
+        active_signals=int(signals_row["active_signals"] or 0) if signals_row else 0,
+        avg_line_movement=float(row["avg_line_movement"] or 0) if row else 0,
+        by_sport=by_sport,
+    )
+
+
+# =============================================================================
 # Paper Trading Endpoints
 # =============================================================================
 
@@ -702,10 +1063,19 @@ async def get_paper_trading_status():
             pt.entry_price,
             pt.size,
             pt.time,
+            pt.edge_at_entry,
             g.home_team,
-            g.away_team
+            g.away_team,
+            gs.home_win_prob as current_prob
         FROM paper_trades pt
         LEFT JOIN games g ON pt.game_id = g.game_id
+        LEFT JOIN LATERAL (
+            SELECT home_win_prob
+            FROM game_states
+            WHERE game_id = pt.game_id
+            ORDER BY time DESC
+            LIMIT 1
+        ) gs ON true
         WHERE pt.status = 'open'
         ORDER BY pt.time DESC
     """)

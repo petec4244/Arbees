@@ -279,82 +279,7 @@ export default function PaperTrading() {
             </thead>
             <tbody className="divide-y divide-gray-700">
               {trades?.map((trade: any) => (
-                <tr key={trade.trade_id} className="hover:bg-gray-700/50">
-                  <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-400">
-                    {new Date(trade.entry_time).toLocaleString()}
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-sm">
-                    <div className="flex items-center space-x-2">
-                      <span className="px-1.5 py-0.5 rounded text-xs bg-gray-700 text-gray-300 uppercase font-medium">
-                        {trade.sport}
-                      </span>
-                      <div>
-                        <div className="font-medium">
-                          {trade.away_team && trade.home_team ? (
-                            <>
-                              <span className={`${trade.entry_price < 0.5
-                                ? 'text-orange-300 font-semibold'
-                                : 'text-orange-400/70'
-                                }`}>
-                                {trade.away_team}
-                              </span>
-                              <span className="text-gray-500"> @ </span>
-                              <span className={`${trade.entry_price >= 0.5
-                                ? 'text-blue-300 font-semibold'
-                                : 'text-blue-400/70'
-                                }`}>
-                                {trade.home_team}
-                              </span>
-                            </>
-                          ) : (
-                            `Game ${trade.game_id}`
-                          )}
-                        </div>
-                        {trade.edge_at_entry && (
-                          <div className="text-xs text-gray-400">
-                            Edge: {trade.edge_at_entry.toFixed(1)}%
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap">
-                    <span className={`px-2 py-1 rounded text-xs font-medium ${trade.side === 'buy'
-                      ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
-                      : 'bg-orange-900/50 text-orange-300 border border-orange-700'
-                      }`}>
-                      {trade.side === 'buy' ? 'YES' : 'NO'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
-                    ${trade.size.toFixed(2)}
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
-                    {(trade.entry_price * 100).toFixed(1)}%
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
-                    {trade.exit_price ? `${(trade.exit_price * 100).toFixed(1)}%` : '-'}
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap">
-                    {trade.pnl !== null ? (
-                      <span className={`font-mono ${trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
-                      </span>
-                    ) : (
-                      <span className="text-gray-500">-</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap">
-                    <span className={`px-2 py-1 rounded text-xs font-medium ${trade.status === 'closed'
-                      ? (trade.outcome === 'win'
-                        ? 'bg-green-900/50 text-green-300'
-                        : 'bg-red-900/50 text-red-300')
-                      : 'bg-yellow-900/50 text-yellow-300'
-                      }`}>
-                      {trade.status === 'closed' ? trade.outcome.toUpperCase() : 'OPEN'}
-                    </span>
-                  </td>
-                </tr>
+                <TradeHistoryRow key={trade.trade_id} trade={trade} />
               ))}
               {(!trades || trades.length === 0) && (
                 <tr>
@@ -457,6 +382,21 @@ function PositionCard({ position }: { position: any }) {
     ? position.size * position.entry_price
     : position.size * (1 - position.entry_price)
 
+  // Calculate current value ("Take")
+  // If we have current_prob, use it. Otherwise fallback to entry_price (no PnL change visible)
+  const currentProb = position.current_prob ?? position.entry_price
+  const takeValue = position.side === 'buy'
+    ? position.size * currentProb
+    : position.size * (1 - currentProb)
+
+  // Calculate unrealized PnL for coloring
+  const pnl = takeValue - cost
+  const pnlColor = pnl >= 0 ? 'text-green-400' : 'text-red-400'
+
+  // Edge coloring
+  const edge = position.edge_at_entry || 0
+  const edgeColor = edge >= 5 ? 'text-green-400' : edge >= 2 ? 'text-yellow-400' : 'text-gray-400'
+
   return (
     <div className="bg-gray-900/50 rounded-lg p-4 border border-gray-700">
       <div className="flex justify-between items-start mb-2">
@@ -496,14 +436,193 @@ function PositionCard({ position }: { position: any }) {
           `Game ${position.game_id}`
         )}
       </div>
-      <div className="flex justify-between text-sm text-gray-400">
-        <span>Size: <span className="text-white font-mono">${position.size.toFixed(2)}</span></span>
-        <span>Entry: <span className="text-white font-mono">{(position.entry_price * 100).toFixed(1)}%</span></span>
-      </div>
-      <div className="mt-2 pt-2 border-t border-gray-700 text-sm">
-        <span className="text-gray-400">Cost: </span>
-        <span className="text-yellow-400 font-mono">${cost.toFixed(2)}</span>
+
+      {/* Stats Grid */}
+      <div className="grid grid-cols-2 gap-y-1 gap-x-4 text-sm text-gray-400 mt-2">
+        <div className="flex justify-between">
+          <span>Size:</span>
+          <span className="text-white font-mono">${position.size.toFixed(2)}</span>
+        </div>
+        <div className="flex justify-between">
+          <span>Cost:</span>
+          <span className="text-yellow-400 font-mono">${cost.toFixed(2)}</span>
+        </div>
+
+        <div className="flex justify-between">
+          <span>Entry:</span>
+          <span className="text-white font-mono">{(position.entry_price * 100).toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between">
+          <span>Take:</span>
+          <span className={`${pnlColor} font-mono font-bold`}>${takeValue.toFixed(2)}</span>
+        </div>
+
+        <div className="flex justify-between col-span-2 pt-1 border-t border-gray-700/50 mt-1">
+          <span>Edge:</span>
+          <span className={`${edgeColor} font-mono`}>
+            {edge > 0 ? '+' : ''}{edge.toFixed(1)}%
+          </span>
+        </div>
       </div>
     </div>
+  )
+}
+
+function TradeHistoryRow({ trade }: { trade: any }) {
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <>
+      <tr onClick={() => setExpanded(!expanded)} className="hover:bg-gray-700/50 cursor-pointer transition-colors group">
+        <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-400">
+          <div className="flex items-center gap-2">
+            {expanded ? <ChevronUp className="w-4 h-4 text-gray-500" /> : <ChevronDown className="w-4 h-4 text-gray-500" />}
+            {new Date(trade.entry_time).toLocaleString()}
+          </div>
+        </td>
+        <td className="px-4 py-3 whitespace-nowrap text-sm">
+          <div className="flex items-center space-x-2">
+            <span className="px-1.5 py-0.5 rounded text-xs bg-gray-700 text-gray-300 uppercase font-medium">
+              {trade.sport}
+            </span>
+            <div>
+              <div className="font-medium group-hover:text-blue-300 transition-colors">
+                {trade.away_team && trade.home_team ? (
+                  <>
+                    <span className={`${trade.entry_price < 0.5
+                      ? 'text-orange-300 font-semibold'
+                      : 'text-orange-400/70'
+                      }`}>
+                      {trade.away_team}
+                    </span>
+                    <span className="text-gray-500"> @ </span>
+                    <span className={`${trade.entry_price >= 0.5
+                      ? 'text-blue-300 font-semibold'
+                      : 'text-blue-400/70'
+                      }`}>
+                      {trade.home_team}
+                    </span>
+                  </>
+                ) : (
+                  `Game ${trade.game_id}`
+                )}
+              </div>
+              {trade.edge_at_entry && (
+                <div className="text-xs text-gray-400">
+                  Edge: {trade.edge_at_entry.toFixed(1)}%
+                </div>
+              )}
+            </div>
+          </div>
+        </td>
+        <td className="px-4 py-3 whitespace-nowrap">
+          <span className={`px-2 py-1 rounded text-xs font-medium ${trade.side === 'buy'
+            ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
+            : 'bg-orange-900/50 text-orange-300 border border-orange-700'
+            }`}>
+            {trade.side === 'buy' ? 'YES' : 'NO'}
+          </span>
+        </td>
+        <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
+          ${trade.size.toFixed(2)}
+        </td>
+        <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
+          {(trade.entry_price * 100).toFixed(1)}%
+        </td>
+        <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">
+          {trade.exit_price ? `${(trade.exit_price * 100).toFixed(1)}%` : '-'}
+        </td>
+        <td className="px-4 py-3 whitespace-nowrap">
+          {trade.pnl !== null ? (
+            <span className={`font-mono ${trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
+            </span>
+          ) : (
+            <span className="text-gray-500">-</span>
+          )}
+        </td>
+        <td className="px-4 py-3 whitespace-nowrap">
+          <span className={`px-2 py-1 rounded text-xs font-medium ${trade.status === 'closed'
+            ? (trade.outcome === 'win'
+              ? 'bg-green-900/50 text-green-300'
+              : 'bg-red-900/50 text-red-300')
+            : 'bg-yellow-900/50 text-yellow-300'
+            }`}>
+            {trade.status === 'closed' ? trade.outcome.toUpperCase() : 'OPEN'}
+          </span>
+        </td>
+      </tr>
+      {expanded && (
+        <tr className="bg-gray-800/50 animate-in fade-in slide-in-from-top-1 duration-200">
+          <td colSpan={8} className="px-4 py-4 border-b border-gray-700 shadow-inner">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 text-sm">
+              <div className="space-y-2">
+                <h4 className="text-gray-500 uppercase text-xs font-bold tracking-wider">Identifiers</h4>
+                <div className="grid grid-cols-[80px_1fr] gap-1">
+                  <span className="text-gray-500">Trade ID:</span>
+                  <span className="font-mono text-gray-300 select-all">{trade.trade_id}</span>
+                  <span className="text-gray-500">Game ID:</span>
+                  <span className="font-mono text-gray-300 select-all">{trade.game_id}</span>
+                  <span className="text-gray-500">Signal:</span>
+                  <span className="text-gray-300">{trade.signal_type || 'N/A'}</span>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <h4 className="text-gray-500 uppercase text-xs font-bold tracking-wider">Market Data</h4>
+                <div className="grid grid-cols-[80px_1fr] gap-1">
+                  <span className="text-gray-500">Platform:</span>
+                  <span className="text-blue-300 bg-blue-900/20 px-1 py-0.5 rounded text-xs w-fit">{trade.platform}</span>
+                  <span className="text-gray-500">Market ID:</span>
+                  <span className="font-mono text-gray-300 text-xs truncate" title={trade.market_id}>{trade.market_id}</span>
+                  <span className="text-gray-500">Model Prob:</span>
+                  <span className="font-mono text-gray-300">{trade.model_prob ? `${(trade.model_prob * 100).toFixed(1)}%` : 'N/A'}</span>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <h4 className="text-gray-500 uppercase text-xs font-bold tracking-wider">Timing</h4>
+                <div className="grid grid-cols-[80px_1fr] gap-1">
+                  <span className="text-gray-500">Opened:</span>
+                  <span className="text-gray-300">{new Date(trade.entry_time).toLocaleString()}</span>
+                  <span className="text-gray-500">Closed:</span>
+                  <span className="text-gray-300">{trade.exit_time ? new Date(trade.exit_time).toLocaleString() : '-'}</span>
+                  {trade.exit_time && (
+                    <>
+                      <span className="text-gray-500">Duration:</span>
+                      <span className="text-gray-300">
+                        {(() => {
+                          const diff = new Date(trade.exit_time).getTime() - new Date(trade.entry_time).getTime();
+                          const mins = Math.floor(diff / 60000);
+                          const hours = Math.floor(mins / 60);
+                          if (hours > 0) return `${hours}h ${mins % 60}m`;
+                          return `${mins}m ${Math.floor((diff % 60000) / 1000)}s`;
+                        })()}
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <h4 className="text-gray-500 uppercase text-xs font-bold tracking-wider">Financials</h4>
+                <div className="grid grid-cols-[80px_1fr] gap-1">
+                  <span className="text-gray-500">Invested:</span>
+                  <span className="font-mono text-gray-300">${(trade.size * (trade.side === 'buy' ? trade.entry_price : 1 - trade.entry_price)).toFixed(2)}</span>
+                  <span className="text-gray-500">Result:</span>
+                  <span className={`font-bold ${trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {trade.pnl !== null ? `$${trade.pnl.toFixed(2)}` : 'Open'}
+                  </span>
+                  <span className="text-gray-500">ROI:</span>
+                  <span className={`${trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {trade.pnl !== null ? `${((trade.pnl / (trade.size * (trade.side === 'buy' ? trade.entry_price : 1 - trade.entry_price))) * 100).toFixed(1)}%` : '-'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
   )
 }

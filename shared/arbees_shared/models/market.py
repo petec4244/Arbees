@@ -115,7 +115,8 @@ class MarketPrice(BaseModel):
     yes_bid: float = Field(ge=0.0, le=1.0)
     yes_ask: float = Field(ge=0.0, le=1.0)
     
-    # Depth (size at top of book)
+    # Best-level depth (number of contracts at best bid/ask)
+    # 0.0 means depth unknown/unavailable
     yes_bid_size: float = Field(ge=0.0, default=0.0)
     yes_ask_size: float = Field(ge=0.0, default=0.0)
 

@@ -3,12 +3,13 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ChevronUp, Activity, Filter, ArrowUpDown, CheckCircle } from 'lucide-react'
 import { useWebSocket } from '../hooks/useWebSocket'
 import GameTracker from '../components/GameTracker'
+import { getSportConfig, SportBackground } from '../utils/sports'
 
 export default function LiveGames() {
   const { subscribe, lastMessage } = useWebSocket()
   const queryClient = useQueryClient()
   const [selectedSport, setSelectedSport] = useState<string>('ALL')
-  const [sortBy, setSortBy] = useState<'time' | 'score'>('time')
+  const [sortBy, setSortBy] = useState<'time' | 'score' | 'sport'>('time')
   const [pinnedGames, setPinnedGames] = useState<Set<string>>(new Set())
   const [trackedGames, setTrackedGames] = useState<Set<string>>(new Set())
 
@@ -85,6 +86,12 @@ export default function LiveGames() {
       if (sortBy === 'time') {
         return b.game_id.localeCompare(a.game_id)
       }
+      if (sortBy === 'score') {
+        return (b.home_score + b.away_score) - (a.home_score + a.away_score)
+      }
+      if (sortBy === 'sport') {
+        return a.sport.localeCompare(b.sport)
+      }
       return 0
     })
 
@@ -114,11 +121,15 @@ export default function LiveGames() {
           </div>
           <div className="w-px h-4 bg-gray-700" />
           <button
-            onClick={() => setSortBy(prev => prev === 'time' ? 'score' : 'time')}
+            onClick={() => setSortBy(prev => {
+              if (prev === 'time') return 'score'
+              if (prev === 'score') return 'sport'
+              return 'time'
+            })}
             className="flex items-center space-x-2 text-sm px-2 text-gray-300 hover:text-white"
           >
             <ArrowUpDown className="w-4 h-4" />
-            <span>{sortBy === 'time' ? 'Time' : 'Score'}</span>
+            <span>{sortBy === 'time' ? 'Time' : sortBy === 'score' ? 'Score' : 'Sport'}</span>
           </button>
         </div>
       </div>
@@ -224,14 +235,17 @@ function GameCard({ game, onSubscribe, isTracked, isPinned, onTogglePin }: { gam
     staleTime: 30000
   })
 
+  const sportConfig = getSportConfig(game.sport)
+
   return (
-    <div className={`bg-gray-800 rounded-lg overflow-hidden transition-all duration-300 ${isFinal ? 'opacity-60 grayscale' : ''} ${expanded ? 'col-span-1 md:col-span-2 row-span-2 ring-2 ring-green-500/50' : 'hover:bg-gray-750'}`}>
-      <div className="p-4">
+    <div className={`rounded-lg overflow-hidden transition-all duration-300 relative group border ${sportConfig.colors} ${isFinal ? 'opacity-60 grayscale' : ''} ${expanded ? 'col-span-1 md:col-span-2 row-span-2 ring-2 ring-green-500/50' : ''}`}>
+      <SportBackground sport={game.sport} />
+      <div className="p-4 relative z-10">
         {/* Header */}
         <div className="flex justify-between items-start mb-4">
           <div className="flex flex-col">
             <div className="flex items-center space-x-2">
-              <span className="text-xs font-bold bg-gray-900 border border-gray-700 px-2 py-0.5 rounded text-gray-300 uppercase">
+              <span className={`text-xs font-bold px-2 py-0.5 rounded uppercase border ${sportConfig.badge}`}>
                 {game.sport}
               </span>
               <button onClick={(e) => { e.stopPropagation(); onTogglePin(); }} className={`text-xs px-2 py-0.5 rounded border transition-colors ${isPinned ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500/50' : 'bg-gray-800 text-gray-500 border-gray-700 hover:text-gray-300'}`}>

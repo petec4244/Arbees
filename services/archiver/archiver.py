@@ -11,7 +11,7 @@ Workflow:
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from arbees_shared.db.connection import DatabaseClient, get_pool, transaction
@@ -19,6 +19,27 @@ from arbees_shared.messaging.redis_bus import RedisBus
 from .config import ArchiverConfig
 
 logger = logging.getLogger(__name__)
+
+# region agent log (debug mode)
+def _dbg(hypothesisId: str, location: str, message: str, data: dict) -> None:
+    """Write a single NDJSON debug line to /app/.cursor/debug.log (no secrets)."""
+    try:
+        import json
+        import time
+        payload = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open("/app/.cursor/debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+# endregion
 
 
 class GameArchiver:
@@ -68,6 +89,9 @@ class GameArchiver:
             pool = await get_pool()
             self.db = DatabaseClient(pool)
 
+        # Ensure archive schema exists (existing DB volumes won't rerun init migrations)
+        await self._ensure_archive_schema()
+
         # Connect to Redis
         if self.redis is None:
             self.redis = RedisBus()
@@ -84,6 +108,34 @@ class GameArchiver:
         self._archive_task = asyncio.create_task(self._archive_loop())
 
         logger.info("GameArchiver started")
+
+    async def _ensure_archive_schema(self) -> None:
+        """Create archive tables if missing (idempotent)."""
+        # Hypothesis A: archive migration never ran on existing DB volume -> tables missing.
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            reg = await conn.fetchval("SELECT to_regclass('public.archived_games')")
+            _dbg("A", "services/archiver/archiver.py:_ensure_archive_schema", "precheck_to_regclass", {"archived_games": reg})
+            if reg:
+                return
+
+            # Apply the migration SQL directly (uses IF NOT EXISTS / OR REPLACE)
+            sql_path = "/app/shared/arbees_shared/db/migrations/014_archive_tables.sql"
+            try:
+                with open(sql_path, "r", encoding="utf-8") as f:
+                    sql = f.read()
+            except Exception as e:
+                _dbg("A", "services/archiver/archiver.py:_ensure_archive_schema", "read_migration_failed", {"path": sql_path, "error": str(e)})
+                raise
+
+            try:
+                await conn.execute(sql)
+                reg2 = await conn.fetchval("SELECT to_regclass('public.archived_games')")
+                _dbg("A", "services/archiver/archiver.py:_ensure_archive_schema", "post_apply_to_regclass", {"archived_games": reg2})
+            except Exception as e:
+                # Hypothesis C: permissions / SQL execution failure
+                _dbg("C", "services/archiver/archiver.py:_ensure_archive_schema", "apply_migration_failed", {"error": str(e)})
+                raise
 
     async def stop(self) -> None:
         """Stop the archiver service."""
@@ -125,7 +177,21 @@ class GameArchiver:
             return
 
         logger.info(f"Game ended: {game_id}, queuing for archive (grace period: {self.config.grace_period_minutes}min)")
-        self._pending_archives[game_id] = datetime.utcnow()
+        ended_at = datetime.now(timezone.utc)
+        self._pending_archives[game_id] = ended_at
+        # region agent log (debug mode)
+        _dbg(
+            "TZ1",
+            "services/archiver/archiver.py:_on_game_ended",
+            "queued_pending_archive",
+            {
+                "game_id": game_id,
+                "ended_at": ended_at,
+                "ended_at_type": str(type(ended_at)),
+                "ended_at_tzinfo": str(getattr(ended_at, "tzinfo", None)),
+            },
+        )
+        # endregion
 
     async def _poll_for_completed_games(self) -> None:
         """Poll database for completed games not yet archived.
@@ -152,7 +218,21 @@ class GameArchiver:
                     game_id = row["game_id"]
                     if game_id not in self._pending_archives:
                         logger.info(f"Found unarchived game from poll: {game_id}")
-                        self._pending_archives[game_id] = row["updated_at"]
+                        ended_at = row["updated_at"]
+                        self._pending_archives[game_id] = ended_at
+                        # region agent log (debug mode)
+                        _dbg(
+                            "TZ1",
+                            "services/archiver/archiver.py:_poll_for_completed_games",
+                            "poll_queued_pending_archive",
+                            {
+                                "game_id": game_id,
+                                "ended_at": ended_at,
+                                "ended_at_type": str(type(ended_at)),
+                                "ended_at_tzinfo": str(getattr(ended_at, "tzinfo", None)),
+                            },
+                        )
+                        # endregion
 
             except Exception as e:
                 logger.error(f"Error polling for completed games: {e}")
@@ -172,15 +252,52 @@ class GameArchiver:
 
     async def _process_ready_games(self) -> None:
         """Archive games that have passed the grace period."""
-        grace_cutoff = datetime.utcnow() - timedelta(
+        grace_cutoff = datetime.now(timezone.utc) - timedelta(
             minutes=self.config.grace_period_minutes
         )
+        # region agent log (debug mode)
+        try:
+            sample = []
+            for gid, et in list(self._pending_archives.items())[:5]:
+                sample.append(
+                    {
+                        "game_id": gid,
+                        "end_time": et,
+                        "end_time_type": str(type(et)),
+                        "end_time_tzinfo": str(getattr(et, "tzinfo", None)),
+                    }
+                )
+            _dbg(
+                "TZ1",
+                "services/archiver/archiver.py:_process_ready_games",
+                "ready_check_snapshot",
+                {
+                    "pending_count": len(self._pending_archives),
+                    "grace_cutoff": grace_cutoff,
+                    "grace_cutoff_type": str(type(grace_cutoff)),
+                    "grace_cutoff_tzinfo": str(getattr(grace_cutoff, "tzinfo", None)),
+                    "sample": sample,
+                },
+            )
+        except Exception:
+            pass
+        # endregion
 
-        ready_games = [
-            game_id
-            for game_id, end_time in self._pending_archives.items()
-            if end_time < grace_cutoff
-        ]
+        def _as_utc_aware(dt: datetime) -> datetime:
+            # Defensive normalization: older entries may be naive `utcnow()`,
+            # while DB timestamps are offset-aware (TIMESTAMPTZ).
+            if getattr(dt, "tzinfo", None) is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+        ready_games: list[str] = []
+        for game_id, end_time in self._pending_archives.items():
+            end_time_utc = _as_utc_aware(end_time)
+            # Normalize stored value so subsequent loops are consistent
+            if end_time_utc is not end_time:
+                self._pending_archives[game_id] = end_time_utc
+            if end_time_utc < grace_cutoff:
+                ready_games.append(game_id)
 
         if not ready_games:
             return
@@ -195,7 +312,7 @@ class GameArchiver:
             except Exception as e:
                 logger.error(f"Failed to archive {game_id}: {e}", exc_info=True)
                 # Keep in pending for retry, but update timestamp to delay retry
-                self._pending_archives[game_id] = datetime.utcnow()
+                self._pending_archives[game_id] = datetime.now(timezone.utc)
 
     async def _archive_game(self, game_id: str) -> None:
         """
@@ -231,10 +348,20 @@ class GameArchiver:
                     game_id
                 )
 
-                # 3. Get all signals for this game
+                # 3. Get all signals for this game (live signals)
                 signals = await conn.fetch(
                     """
                     SELECT * FROM trading_signals
+                    WHERE game_id = $1
+                    ORDER BY time ASC
+                    """,
+                    game_id
+                )
+
+                # 3b. Get futures signals for this game (pre-game signals)
+                futures_signals = await conn.fetch(
+                    """
+                    SELECT * FROM futures_signals
                     WHERE game_id = $1
                     ORDER BY time ASC
                     """,
@@ -252,11 +379,12 @@ class GameArchiver:
                     game_id
                 )
 
-                # 5. Compute summary statistics
-                stats = self._compute_stats(trades, signals)
+                # 5. Compute summary statistics (include futures signals in total)
+                all_signals = list(signals) + list(futures_signals)
+                stats = self._compute_stats(trades, all_signals)
 
                 # Determine ended_at time
-                ended_at = latest_state["time"] if latest_state else game.get("updated_at") or datetime.utcnow()
+                ended_at = latest_state["time"] if latest_state else game.get("updated_at") or datetime.now(timezone.utc)
 
                 # 6. Insert into archived_games
                 archive_id = await conn.fetchval(
@@ -339,7 +467,7 @@ class GameArchiver:
                         None,  # market_prob_at_entry - not stored in paper_trades
                     )
 
-                # 8. Insert archived signals
+                # 8. Insert archived signals (live signals)
                 executed_signal_ids = {t["signal_id"] for t in trades if t.get("signal_id")}
                 for signal in signals:
                     was_executed = signal["signal_id"] in executed_signal_ids
@@ -373,18 +501,61 @@ class GameArchiver:
                         was_executed,
                     )
 
-                # 9. Mark original game as archived
+                # 8b. Insert archived futures signals (pre-game signals)
+                for signal in futures_signals:
+                    was_executed = signal["executed"]
+                    await conn.execute(
+                        """
+                        INSERT INTO archived_signals (
+                            signal_id, archive_game_id, game_id,
+                            signal_type, direction, team, market_type,
+                            model_prob, market_prob, edge_pct, confidence, reason,
+                            generated_at, expires_at,
+                            was_executed
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            $13, $14, $15
+                        )
+                        """,
+                        signal["signal_id"],
+                        archive_id,
+                        game_id,
+                        signal["signal_type"],
+                        signal["direction"],
+                        signal.get("team"),
+                        signal.get("market_type", "moneyline"),
+                        signal.get("model_prob"),
+                        signal.get("market_prob"),
+                        signal["edge_pct"],
+                        signal.get("confidence"),
+                        signal.get("reason"),
+                        signal["time"],
+                        signal.get("expires_at"),
+                        was_executed,
+                    )
+
+                # 9. Mark original game as archived and update lifecycle_status
                 await conn.execute(
                     """
                     UPDATE games
-                    SET archived = TRUE, archived_at = NOW()
+                    SET archived = TRUE, archived_at = NOW(), lifecycle_status = 'archived'
+                    WHERE game_id = $1
+                    """,
+                    game_id
+                )
+
+                # 10. Clean up futures_games record (update lifecycle_status)
+                await conn.execute(
+                    """
+                    UPDATE futures_games
+                    SET lifecycle_status = 'archived', updated_at = NOW()
                     WHERE game_id = $1
                     """,
                     game_id
                 )
 
                 logger.info(
-                    f"Archived game {game_id}: {len(trades)} trades, {len(signals)} signals"
+                    f"Archived game {game_id}: {len(trades)} trades, {len(signals)} live signals, {len(futures_signals)} futures signals"
                 )
 
     def _compute_stats(self, trades: list, signals: list) -> dict:

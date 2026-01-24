@@ -41,27 +41,37 @@ class HybridKalshiClient:
         private_key_str: Optional[str] = None,
         rate_limit: float = 2.0,  # Kalshi rate limits to ~2 req/sec
         prefer_websocket: bool = True,
+        base_url: Optional[str] = None,
+        ws_url: Optional[str] = None,
+        env: Optional[str] = None,
     ):
         """
         Initialize hybrid client.
 
         Args:
-            api_key: Kalshi API key ID (or KALSHI_API_KEY env var)
+            api_key: Kalshi API key ID (or from env based on KALSHI_ENV)
             private_key_path: Path to RSA private key PEM file
-            private_key_str: RSA private key as string (or KALSHI_PRIVATE_KEY env var)
+            private_key_str: RSA private key as string (or from env based on KALSHI_ENV)
             rate_limit: Max REST requests per second (default 2.0 to avoid rate limits)
             prefer_websocket: If True, use WebSocket for prices when subscribed
+            base_url: Override REST API base URL (or use KALSHI_BASE_URL env var)
+            ws_url: Override WebSocket URL (or use KALSHI_WS_URL env var)
+            env: Environment name ("prod" or "demo"), defaults to KALSHI_ENV
         """
         self._rest = KalshiClient(
             api_key=api_key,
             private_key_path=private_key_path,
             private_key_str=private_key_str,
             rate_limit=rate_limit,
+            base_url=base_url,
+            env=env,
         )
         self._ws = KalshiWebSocketClient(
             api_key=api_key,
             private_key_path=private_key_path,
             private_key_str=private_key_str,
+            ws_url=ws_url,
+            env=env,
         )
         self._prefer_websocket = prefer_websocket
         self._ws_stream_task: Optional[asyncio.Task] = None
