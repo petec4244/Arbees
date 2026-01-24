@@ -31,10 +31,14 @@ from markets.kalshi.client import KalshiClient
 from markets.kalshi.websocket import KalshiWebSocketClient
 from markets.polymarket.client import PolymarketClient
 from markets.polymarket.websocket import PolymarketWebSocketClient
-from services.market_discovery import MarketDiscoveryService
+# NOTE: MarketDiscoveryService removed - use Rust market_discovery_rust service instead
+# from services.market_discovery import MarketDiscoveryService
 from arbees_shared.models.game import Sport, GameState
 from arbees_shared.models.market import Platform, MarketPrice
 import arbees_core
+
+# DEPRECATED: This standalone bot needs updating to use the Rust market discovery service
+MarketDiscoveryService = None  # Placeholder - this script needs refactoring
 
 logging.basicConfig(
     level=logging.INFO,

@@ -30,8 +30,9 @@ from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
 from markets.kalshi.hybrid_client import HybridKalshiClient
 from markets.polymarket.hybrid_client import HybridPolymarketClient
-from services.market_discovery.parser import parse_market
 from arbees_shared.utils.trace_logger import trace_log
+# NOTE: Market parsing is handled by the Rust market_discovery_rust service.
+# Cross-market compatibility is verified at discovery time.
 import arbees_core
 
 logger = logging.getLogger(__name__)
@@ -1291,6 +1292,16 @@ class GameShard:
         if ctx.last_home_win_prob is None or not ctx.last_state:
             return
 
+        # GUARD: Don't generate signals if game is complete or nearly complete
+        # This prevents false signals from end-of-game probability swings
+        if self._is_game_complete(ctx.last_state):
+            logger.debug(f"[{ctx.game_id}] Skipping market signal check: game is complete")
+            return
+
+        if ctx.last_state.game_progress >= 0.99:
+            logger.debug(f"[{ctx.game_id}] Skipping market signal check: game nearly complete (progress={ctx.last_state.game_progress:.1%})")
+            return
+
         # Check trading cooldown
         if ctx.cooldown_until and datetime.utcnow() < ctx.cooldown_until:
              return
@@ -1447,21 +1458,15 @@ class GameShard:
             if not kalshi_price or not poly_price:
                 continue
 
-            # Parse market titles to verify compatibility
+            # Log market titles for debugging
+            # Note: Market compatibility is validated by the Rust market_discovery_rust service
             kalshi_title = ctx.market_titles.get(kalshi_id, "")
             poly_title = ctx.market_titles.get(poly_id, "")
-
             if kalshi_title and poly_title:
-                kalshi_parsed = parse_market(kalshi_title, platform="kalshi")
-                poly_parsed = parse_market(poly_title, platform="polymarket")
-
-                if kalshi_parsed and poly_parsed:
-                    if not kalshi_parsed.is_compatible_with(poly_parsed):
-                        logger.warning(
-                            f"Market incompatibility detected for {market_type.value}: "
-                            f"Kalshi='{kalshi_title}' vs Poly='{poly_title}'"
-                        )
-                        continue
+                logger.debug(
+                    f"Cross-market arb check for {market_type.value}: "
+                    f"Kalshi='{kalshi_title}' Poly='{poly_title}'"
+                )
 
             # NEW: SIMD-accelerated arbitrage detection (terauss integration)
             # Convert prices to cents (0-100 scale)
@@ -1820,6 +1825,17 @@ class GameShard:
         new_plays: list[Play],
     ) -> None:
         """Generate trading signals from game updates."""
+        # GUARD: Don't generate signals if game is complete or nearly complete
+        # This prevents false signals from end-of-game probability swings
+        if self._is_game_complete(new_state):
+            logger.debug(f"[{ctx.game_id}] Skipping signal generation: game is complete (status={new_state.status})")
+            return
+
+        # Also skip if game progress is >= 99% (game likely ending)
+        if new_state.game_progress >= 0.99:
+            logger.debug(f"[{ctx.game_id}] Skipping signal generation: game nearly complete (progress={new_state.game_progress:.1%})")
+            return
+
         prob_change = new_prob - old_prob
 
         # Only signal on significant changes (> 3% for probability shifts)

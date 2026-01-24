@@ -260,15 +260,20 @@ class ExecutionService:
                     trace.log(
                         "execution_filled",
                         trade_id=result.order_id,
+                        contract_team=request.contract_team,
                         avg_price=result.avg_price,
                         filled_qty=result.filled_qty,
                         fees=result.fees,
                         latency_ms=result_latency,
+                        limit_price=request.limit_price,
+                        edge_pct=request.edge_pct,
+                        model_prob=request.model_prob,
+                        market_prob=request.market_prob,
                     )
                     trace.update(trade_id=result.order_id)
                     logger.info(
                         f"Execution SUCCESS: {request.request_id} filled @ {result.avg_price:.3f} "
-                        f"(latency={result_latency:.1f}ms)"
+                        f"for '{request.contract_team}' (latency={result_latency:.1f}ms)"
                     )
                 else:
                     self._failure_count += 1

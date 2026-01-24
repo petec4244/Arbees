@@ -46,7 +46,7 @@ DEFAULT_MISS_THRESHOLD = 3
 DEFAULT_RESTART_ALLOW_SERVICES = [
     "arbees-game-shard-1",
     "arbees-polymarket-monitor",
-    "arbees-futures-monitor",
+    # "arbees-futures-monitor",  # Disabled - will revive later
     "arbees-api",
     "arbees-frontend",
     "arbees-signal-processor",
@@ -434,7 +434,7 @@ class Supervisor:
             "orchestrator": "arbees-orchestrator",
             "game_shard": f"arbees-game-shard-{instance_id.split('-')[-1] if '-' in instance_id else '1'}",
             "polymarket_monitor": "arbees-polymarket-monitor",
-            "futures_monitor": "arbees-futures-monitor",
+            # "futures_monitor": "arbees-futures-monitor",  # Disabled - will revive later
             "api": "arbees-api",
             "signal_processor": "arbees-signal-processor",
             "execution_service": "arbees-execution-service",

@@ -29,8 +29,10 @@ from arbees_shared.models.health import ServiceStatus
 from data_providers.espn.client import ESPNClient
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
-from services.market_discovery.parser import parse_market
 from services.orchestrator.supervisor import Supervisor
+
+# NOTE: Market parsing is handled by the Rust market_discovery_rust service.
+# For local filtering, we use simple heuristics below.
 
 logger = logging.getLogger(__name__)
 
@@ -591,6 +593,22 @@ class Orchestrator:
         self._assignments[game.game_id] = assignment
         shard.game_count += 1
         shard.games.append(game.game_id)
+
+        # Update lifecycle_status to 'live' and status to 'in_progress' in database
+        try:
+            pool = await get_pool()
+            await pool.execute(
+                """
+                UPDATE games
+                SET lifecycle_status = 'live',
+                    status = CASE WHEN status = 'scheduled' THEN 'in_progress' ELSE status END,
+                    updated_at = NOW()
+                WHERE game_id = $1 AND lifecycle_status != 'live'
+                """,
+                game.game_id,
+            )
+        except Exception as e:
+            logger.warning(f"Error updating lifecycle status for {game.game_id}: {e}")
 
         market_count = len(market_ids_by_type) if market_ids_by_type else (1 if kalshi_market_id or polymarket_market_id else 0)
         logger.info(f"Assigned game {game.game_id} to shard {shard.shard_id} with {market_count} market type(s)")
@@ -1198,6 +1216,49 @@ class Orchestrator:
         # Unknown pattern - be conservative and skip
         return False
 
+    def _detect_market_type(self, title: str) -> MarketType:
+        """
+        Detect market type from title using simple heuristics.
+
+        The Rust market_discovery_rust service handles detailed parsing.
+        This is a fallback filter for local market searches.
+
+        Returns:
+            MarketType - defaults to MONEYLINE if no other type detected
+        """
+        title_lower = title.lower()
+
+        # Spread indicators
+        spread_keywords = ["cover", "spread", "point spread", "handicap", "win by"]
+        if any(kw in title_lower for kw in spread_keywords):
+            return MarketType.SPREAD
+
+        # Total/Over-Under indicators
+        total_keywords = ["over", "under", "total", "o/u", "combined score"]
+        if any(kw in title_lower for kw in total_keywords):
+            return MarketType.TOTAL
+
+        # Player prop indicators
+        prop_keywords = ["points", "rebounds", "assists", "touchdowns", "yards",
+                         "goals", "saves", "strikeouts", "hits", "home runs"]
+        if any(kw in title_lower for kw in prop_keywords):
+            return MarketType.PLAYER_PROP
+
+        # First scorer indicators
+        if "first basket" in title_lower or "first scorer" in title_lower:
+            return MarketType.FIRST_BASKET
+        if "first touchdown" in title_lower or "first td" in title_lower:
+            return MarketType.FIRST_TD
+
+        # Quarter/half indicators
+        if "quarter" in title_lower or "1q" in title_lower or "2q" in title_lower:
+            return MarketType.QUARTER_WINNER
+        if "half" in title_lower or "1h" in title_lower or "2h" in title_lower:
+            return MarketType.HALF_WINNER
+
+        # Default: moneyline (team to win)
+        return MarketType.MONEYLINE
+
     async def _find_kalshi_market(self, game: GameInfo) -> Optional[str]:
         """Find Kalshi market for a game using cached markets and team matching.
 
@@ -1355,11 +1416,10 @@ class Orchestrator:
                 if not self._is_single_game_market(ticker):
                     continue
 
-                # Parse the market title to determine type
-                parsed = parse_market(title, platform="kalshi")
-                if not parsed or parsed.market_type != market_type:
-                    # Very verbose, maybe limit?
-                    # logger.debug(f"Skipping {title}: Parsed {parsed} != {market_type}")
+                # Filter by market type using simple heuristics
+                # (Rust service handles detailed parsing; this is a fallback filter)
+                detected_type = self._detect_market_type(title)
+                if detected_type != market_type:
                     continue
 
                 # Must match one of the teams
@@ -1434,10 +1494,10 @@ class Orchestrator:
                 for market in markets:
                     title = market.get("question", market.get("title", ""))
 
-                    # Parse the market title to determine type
-                    parsed = parse_market(title, platform="polymarket")
-                    if not parsed or parsed.market_type != market_type:
-                        # logger.debug(f"Skipping {title}: Parsed {parsed} mismatch {market_type}")
+                    # Filter by market type using simple heuristics
+                    # (Rust service handles detailed parsing; this is a fallback filter)
+                    detected_type = self._detect_market_type(title)
+                    if detected_type != market_type:
                         continue
 
                     # Strict match: Check BOTH teams are in title

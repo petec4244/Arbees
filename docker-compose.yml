@@ -185,6 +185,8 @@ services:
       # Cooldown timers
       WIN_COOLDOWN_SECONDS: "180"
       LOSS_COOLDOWN_SECONDS: "300"
+      # Team matching (emergency debug hardening)
+      TEAM_MATCH_MIN_CONFIDENCE: "0.7"
     volumes:
       - ./:/app
     profiles:
@@ -245,6 +247,8 @@ services:
       STOP_LOSS_NHL: "7.0"
       STOP_LOSS_MLB: "6.0"
       STOP_LOSS_SOCCER: "7.0"
+      # Team matching (emergency debug hardening)
+      EXIT_TEAM_MATCH_MIN_CONFIDENCE: "0.7"
     volumes:
       - ./:/app
     profiles:
@@ -411,38 +415,39 @@ services:
     profiles:
       - legacy
 
-  futures_monitor:
-    build:
-      context: .
-      dockerfile: services/futures_monitor/Dockerfile
-    container_name: arbees-futures-monitor
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
-      # Futures Monitor configuration
-      FUTURES_LOOKAHEAD_HOURS: "48"
-      FUTURES_MIN_HOURS_BEFORE_START: "0.5"
-      FUTURES_HANDOFF_MINUTES: "15"
-      FUTURES_DISCOVERY_INTERVAL: "1800"
-      FUTURES_PRICE_POLL_INTERVAL: "60"
-      FUTURES_MIN_EDGE: "5.0"
-      FUTURES_LINE_MOVEMENT_ALERT: "3.0"
-      FUTURES_MAX_GAMES: "50"
-      # Market discovery mode: 'rust' uses Rust discovery service, 'local' uses Python clients
-      MARKET_DISCOVERY_MODE: "rust"
-    volumes:
-      - ./:/app
-    restart: unless-stopped
-    profiles:
-      - full
+  # DISABLED: futures_monitor - will revive later when everything else works
+  # futures_monitor:
+  #   build:
+  #     context: .
+  #     dockerfile: services/futures_monitor/Dockerfile
+  #   container_name: arbees-futures-monitor
+  #   depends_on:
+  #     timescaledb:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
+  #     REDIS_URL: redis://redis:6379
+  #     LOG_LEVEL: INFO
+  #     # Futures Monitor configuration
+  #     FUTURES_LOOKAHEAD_HOURS: "48"
+  #     FUTURES_MIN_HOURS_BEFORE_START: "0.5"
+  #     FUTURES_HANDOFF_MINUTES: "15"
+  #     FUTURES_DISCOVERY_INTERVAL: "1800"
+  #     FUTURES_PRICE_POLL_INTERVAL: "60"
+  #     FUTURES_MIN_EDGE: "5.0"
+  #     FUTURES_LINE_MOVEMENT_ALERT: "3.0"
+  #     FUTURES_MAX_GAMES: "50"
+  #     # Market discovery mode: 'rust' uses Rust discovery service, 'local' uses Python clients
+  #     MARKET_DISCOVERY_MODE: "rust"
+  #   volumes:
+  #     - ./:/app
+  #   restart: unless-stopped
+  #   profiles:
+  #     - full
 
   frontend:
     build:

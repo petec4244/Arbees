@@ -29,6 +29,7 @@ from arbees_shared.risk import RiskController
 from arbees_shared.health.heartbeat import HeartbeatPublisher
 from arbees_shared.models.health import ServiceStatus
 from arbees_shared.utils.trace_logger import TraceContext
+from arbees_shared.utils.team_validator import TeamValidator, TeamMatchResult
 
 from .rule_evaluator import RuleEvaluator, RuleDecisionType
 
@@ -75,6 +76,8 @@ class SignalProcessor:
         loss_cooldown_seconds: float = 300.0,
         # Initial bankroll (for sizing estimation)
         initial_bankroll: float = 1000.0,
+        # Team matching confidence threshold
+        team_match_min_confidence: float = 0.7,
     ):
         self.min_edge_pct = min_edge_pct
         self.kelly_fraction = kelly_fraction
@@ -89,6 +92,10 @@ class SignalProcessor:
         self.win_cooldown_seconds = win_cooldown_seconds
         self.loss_cooldown_seconds = loss_cooldown_seconds
         self.initial_bankroll = initial_bankroll
+        self.team_match_min_confidence = team_match_min_confidence
+
+        # Team name validator for entry price selection
+        self.team_validator = TeamValidator()
 
         # Connections
         self.db: Optional[DatabaseClient] = None
@@ -476,111 +483,142 @@ class SignalProcessor:
     async def _get_market_price(
         self, signal: TradingSignal, trace: Optional[TraceContext] = None
     ) -> Optional[MarketPrice]:
-        """Get current market price for the signal."""
+        """
+        Get current market price for the signal with strict team validation.
+
+        Uses confidence-scored team matching to prevent wrong-team price selection.
+        """
         pool = await get_pool()
         target_team = (signal.team or "").strip()
 
-        def team_candidates(team: str) -> list[str]:
-            """Generate candidate strings to match Polymarket contract_team.
-
-            Polymarket often stores `contract_team` as a nickname (e.g. "Flyers") while
-            our signals may use full names (e.g. "Philadelphia Flyers").
-            """
-            if not team:
-                return []
-            parts = [p for p in team.replace("@", " ").split() if p]
-            cands: list[str] = [team]
-            if len(parts) >= 2:
-                cands.append(" ".join(parts[-2:]))
-            if len(parts) >= 1:
-                cands.append(parts[-1])
-
-            # Deduplicate preserving order
-            seen = set()
-            out = []
-            for c in cands:
-                key = c.lower().strip()
-                if key and key not in seen:
-                    seen.add(key)
-                    out.append(c)
-            return out
-
-        candidates_tried = []
-
-        # Try to find price with matching contract_team
+        # If signal has a team, use confidence-scored matching
         if target_team:
-            candidates = team_candidates(target_team)
-            for cand in candidates:
-                candidates_tried.append(cand)
-                row = await pool.fetchrow(
-                    """
-                    SELECT market_id, market_title, contract_team, yes_bid, yes_ask,
-                           yes_bid_size, yes_ask_size, volume, liquidity, time, platform
-                    FROM market_prices
-                    WHERE game_id = $1
-                      AND contract_team IS NOT NULL
-                      AND contract_team ILIKE $2
-                    ORDER BY time DESC
-                    LIMIT 1
-                    """,
-                    signal.game_id,
-                    f"%{cand}%",
-                )
-                if row:
-                    price = MarketPrice(
-                        market_id=row["market_id"],
-                        platform=Platform(row["platform"]),
-                        market_title=row["market_title"],
-                        contract_team=row["contract_team"],
-                        yes_bid=float(row["yes_bid"]),
-                        yes_ask=float(row["yes_ask"]),
-                        yes_bid_size=float(row.get("yes_bid_size") or 0),
-                        yes_ask_size=float(row.get("yes_ask_size") or 0),
-                        volume=float(row["volume"] or 0),
-                        liquidity=float(row.get("liquidity") or 0),
-                    )
-                    # Log successful team match
-                    if trace:
-                        trace.log(
-                            "market_lookup_success",
-                            source="db_team_match",
-                            matched_candidate=cand,
-                            candidates_tried=candidates_tried,
-                            contract_team=row["contract_team"],
-                            market_id=row["market_id"],
-                            platform=row["platform"],
-                            yes_bid=float(row["yes_bid"]),
-                            yes_ask=float(row["yes_ask"]),
-                            price_age_ms=(datetime.now(timezone.utc) - row["time"]).total_seconds() * 1000 if row.get("time") else None,
-                        )
-                    return price
+            # Fetch recent prices with contract_team for this game
+            rows = await pool.fetch(
+                """
+                SELECT market_id, market_title, contract_team, yes_bid, yes_ask,
+                       yes_bid_size, yes_ask_size, volume, liquidity, time, platform
+                FROM market_prices
+                WHERE game_id = $1
+                  AND contract_team IS NOT NULL
+                  AND time > NOW() - INTERVAL '2 minutes'
+                ORDER BY time DESC
+                LIMIT 10
+                """,
+                signal.game_id,
+            )
 
-        # Fallback: any recent price for this game
-        # IMPORTANT: For Polymarket moneyline (multi-contract per market_id), falling back to an
-        # arbitrary row can select the *wrong team* and create systematic losses.
-        if target_team:
+            # Score each candidate and track all for logging
+            candidates_scored: list[dict] = []
+            best_match: Optional[dict] = None
+            best_confidence = 0.0
+            best_result: Optional[TeamMatchResult] = None
+
+            for row in rows:
+                contract_team = row["contract_team"]
+                match_result = self.team_validator.validate_match(target_team, contract_team)
+
+                candidates_scored.append({
+                    "contract_team": contract_team,
+                    "confidence": match_result.confidence,
+                    "method": match_result.method,
+                    "is_match": match_result.is_match,
+                })
+
+                if match_result.is_match and match_result.confidence > best_confidence:
+                    best_confidence = match_result.confidence
+                    best_result = match_result
+                    best_match = dict(row)
+
+            # Log all candidates evaluated
             if trace:
                 trace.log(
-                    "market_lookup_failed",
-                    reason="no_team_match",
+                    "market_lookup_candidates",
                     target_team=target_team,
-                    candidates_tried=candidates_tried,
+                    candidates_found=len(rows),
+                    candidates_scored=candidates_scored,
+                    best_confidence=best_confidence,
+                    min_confidence_threshold=self.team_match_min_confidence,
                 )
+
+            # Only accept matches with confidence >= threshold
+            if best_match and best_confidence >= self.team_match_min_confidence:
+                price = MarketPrice(
+                    market_id=best_match["market_id"],
+                    platform=Platform(best_match["platform"]),
+                    market_title=best_match["market_title"],
+                    contract_team=best_match["contract_team"],
+                    yes_bid=float(best_match["yes_bid"]),
+                    yes_ask=float(best_match["yes_ask"]),
+                    yes_bid_size=float(best_match.get("yes_bid_size") or 0),
+                    yes_ask_size=float(best_match.get("yes_ask_size") or 0),
+                    volume=float(best_match["volume"] or 0),
+                    liquidity=float(best_match.get("liquidity") or 0),
+                )
+
+                price_age_ms = None
+                if best_match.get("time"):
+                    price_age_ms = (datetime.now(timezone.utc) - best_match["time"]).total_seconds() * 1000
+
+                if trace:
+                    trace.log(
+                        "market_lookup_selected",
+                        target_team=target_team,
+                        contract_team=price.contract_team,
+                        confidence=best_confidence,
+                        match_method=best_result.method if best_result else None,
+                        match_reason=best_result.reason if best_result else None,
+                        market_id=price.market_id,
+                        platform=price.platform.value,
+                        yes_bid=price.yes_bid,
+                        yes_ask=price.yes_ask,
+                        price_age_ms=price_age_ms,
+                    )
+
+                logger.info(
+                    f"Team match validated: '{target_team}' -> '{price.contract_team}' "
+                    f"(confidence={best_confidence:.0%}, method={best_result.method if best_result else 'N/A'})"
+                )
+
+                return price
+
+            # No confident match found - reject
+            if trace:
+                trace.log(
+                    "market_lookup_rejected",
+                    reason="low_confidence_team_match",
+                    target_team=target_team,
+                    best_confidence=best_confidence,
+                    min_confidence_threshold=self.team_match_min_confidence,
+                    candidates_found=len(rows),
+                )
+
+            logger.warning(
+                f"No confident team match for '{target_team}' in game {signal.game_id} "
+                f"(best_confidence={best_confidence:.0%}, threshold={self.team_match_min_confidence:.0%}, "
+                f"candidates={len(rows)})"
+            )
             return None
 
-        row = await pool.fetchrow("""
+        # Fallback: no team specified - use any recent price (legacy behavior)
+        # This path is for signals that don't have a team specified
+        row = await pool.fetchrow(
+            """
             SELECT market_id, market_title, contract_team, yes_bid, yes_ask,
                    yes_bid_size, yes_ask_size, volume, liquidity, time, platform
             FROM market_prices
             WHERE game_id = $1
-            ORDER BY time DESC LIMIT 1
-        """, signal.game_id)
+            ORDER BY time DESC
+            LIMIT 1
+            """,
+            signal.game_id,
+        )
 
         if row:
             if trace:
                 trace.log(
-                    "market_lookup_success",
-                    source="db_fallback",
+                    "market_lookup_selected",
+                    source="fallback_no_team_in_signal",
                     market_id=row["market_id"],
                     platform=row["platform"],
                     contract_team=row.get("contract_team"),
@@ -601,7 +639,7 @@ class SignalProcessor:
             )
 
         if trace:
-            trace.log("market_lookup_failed", reason="no_price_found")
+            trace.log("market_lookup_rejected", reason="no_price_found")
         return None
 
     def _create_price_from_signal(self, signal: TradingSignal) -> MarketPrice:
@@ -731,6 +769,7 @@ async def main():
         win_cooldown_seconds=float(os.environ.get("WIN_COOLDOWN_SECONDS", "180.0")),
         loss_cooldown_seconds=float(os.environ.get("LOSS_COOLDOWN_SECONDS", "300.0")),
         initial_bankroll=float(os.environ.get("INITIAL_BANKROLL", "1000")),
+        team_match_min_confidence=float(os.environ.get("TEAM_MATCH_MIN_CONFIDENCE", "0.7")),
     )
 
     await processor.start()

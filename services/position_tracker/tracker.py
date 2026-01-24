@@ -30,6 +30,7 @@ from arbees_shared.models.execution import (
 from arbees_shared.health.heartbeat import HeartbeatPublisher
 from arbees_shared.models.health import ServiceStatus
 from arbees_shared.utils.trace_logger import trace_log, TraceContext
+from arbees_shared.utils.team_validator import TeamValidator, TeamMatchResult
 from markets.paper.engine import PaperTradingEngine
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ class PositionTracker:
         price_staleness_ttl: float = 30.0,  # Max age of market price in seconds
         require_valid_book: bool = True,  # Reject exits on empty/pathological books
         debounce_exit_checks: int = 0,  # Require N consecutive checks before exit (0=disabled)
+        exit_team_match_min_confidence: float = 0.7,  # Min confidence for exit price team match
     ):
         self.take_profit_pct = take_profit_pct
         self.default_stop_loss_pct = default_stop_loss_pct
@@ -79,6 +81,10 @@ class PositionTracker:
         self.price_staleness_ttl = price_staleness_ttl
         self.require_valid_book = require_valid_book
         self.debounce_exit_checks = debounce_exit_checks
+        self.exit_team_match_min_confidence = exit_team_match_min_confidence
+
+        # Team name validator for exit price selection
+        self.team_validator = TeamValidator()
 
         # Track consecutive exit triggers per trade for debounce
         self._exit_trigger_counts: dict[str, int] = {}
@@ -133,6 +139,9 @@ class PositionTracker:
 
         # Start position monitoring loop
         asyncio.create_task(self._position_monitor_loop())
+
+        # Start orphaned position sweep loop (backup for missed game:ended events)
+        asyncio.create_task(self._orphan_sweep_loop())
 
         # Start heartbeat
         asyncio.create_task(self._heartbeat_loop())
@@ -449,6 +458,105 @@ class PositionTracker:
                 logger.error(f"Position monitor error: {e}")
             await asyncio.sleep(self.exit_check_interval)
 
+    async def _orphan_sweep_loop(self) -> None:
+        """Periodically sweep for orphaned positions (games ended but positions still open).
+        
+        This is a backup mechanism for when games:ended Redis messages are missed.
+        Runs every 5 minutes.
+        """
+        # Wait a bit before starting the first sweep
+        await asyncio.sleep(60)
+        
+        while self._running:
+            try:
+                await self._sweep_orphaned_positions()
+            except Exception as e:
+                logger.error(f"Orphan sweep error: {e}", exc_info=True)
+            # Run every 5 minutes
+            await asyncio.sleep(300)
+
+    async def _sweep_orphaned_positions(self) -> None:
+        """Check for open positions where the game has ended in the database."""
+        if not self.paper_engine or not self.db:
+            return
+
+        open_trades = self.paper_engine.get_open_trades()
+        if not open_trades:
+            return
+
+        # Get unique game IDs from open positions
+        game_ids = list(set(t.game_id for t in open_trades if t.game_id))
+        if not game_ids:
+            return
+
+        # Query database to check which games have ended
+        try:
+            pool = await get_pool()
+            rows = await pool.fetch(
+                """
+                SELECT game_id, home_team, away_team, final_home_score, final_away_score, status
+                FROM games
+                WHERE game_id = ANY($1)
+                  AND status IN ('final', 'complete', 'completed')
+                """,
+                game_ids,
+            )
+
+            ended_games = {row["game_id"]: dict(row) for row in rows}
+
+            if ended_games:
+                logger.info(f"Orphan sweep: found {len(ended_games)} ended games with open positions")
+
+            for trade in open_trades:
+                if trade.game_id in ended_games:
+                    game_info = ended_games[trade.game_id]
+                    
+                    home_score = game_info.get("final_home_score") or 0
+                    away_score = game_info.get("final_away_score") or 0
+                    home_team = game_info.get("home_team") or ""
+                    away_team = game_info.get("away_team") or ""
+                    home_won = home_score > away_score
+
+                    logger.warning(
+                        f"Orphan sweep: settling orphaned position {trade.trade_id} "
+                        f"for ended game {trade.game_id} ({home_team} {home_score} - {away_score} {away_team})"
+                    )
+
+                    # Determine if trade was on winning team
+                    title = (trade.market_title or "").lower()
+                    trade_on_home = self._teams_match(home_team, title) if home_team else False
+                    trade_on_away = self._teams_match(away_team, title) if away_team else False
+
+                    if trade_on_home:
+                        team_won = home_won
+                    elif trade_on_away:
+                        team_won = not home_won
+                    else:
+                        # Fallback: assume home team
+                        team_won = home_won
+
+                    exit_price = 1.0 if team_won else 0.0
+
+                    logger.info(
+                        f"Orphan sweep: closing trade {trade.trade_id} - "
+                        f"side={trade.side.value}, team_won={team_won}, exit_price={exit_price:.2f}"
+                    )
+
+                    await self.paper_engine.close_trade(trade, exit_price, is_game_settlement=True)
+                    self._positions_closed += 1
+
+                    trace_log(
+                        service="position_tracker",
+                        event="orphan_position_settled",
+                        trade_id=trade.trade_id,
+                        game_id=trade.game_id,
+                        exit_price=exit_price,
+                        team_won=team_won,
+                    )
+
+        except Exception as e:
+            logger.error(f"Error in orphan sweep DB query: {e}", exc_info=True)
+
     async def _check_exit_conditions(self) -> None:
         """Check all open positions against current market prices."""
         if not self.paper_engine:
@@ -647,49 +755,151 @@ class PositionTracker:
         mark, exec_px, _, _, _ = result
         return mark, exec_px
 
+    def _extract_entry_team(self, trade: PaperTrade) -> Optional[str]:
+        """
+        Extract the entry team from the trade's market_title.
+
+        Paper trades have market_title like "{contract_team} to win".
+        """
+        title = (trade.market_title or "").strip()
+        lower = title.lower()
+
+        # Try to parse "{team} to win" pattern
+        if " to win" in lower:
+            team = title[: lower.rfind(" to win")].strip()
+            if team:
+                return team
+
+        # Fallback: use the whole title if it's not empty
+        if title:
+            return title
+
+        return None
+
     async def _get_current_prices_with_metadata(
         self, trade: PaperTrade
     ) -> Optional[tuple[float, float, Optional[float], float, float]]:
         """
         Get pricing data with metadata for an open trade.
 
+        Uses confidence-scored team matching to prevent wrong-team price selection
+        at exit.
+
         Returns:
             Tuple of (mark_price, exec_price, price_age_ms, yes_bid, yes_ask)
-            or None if no price available
+            or None if no price available or team mismatch
         """
         pool = await get_pool()
 
-        row = None
+        # Extract entry team from trade
+        entry_team = self._extract_entry_team(trade)
 
-        # Polymarket moneyline uses one market_id with multiple contracts; filter by contract_team
-        if trade.platform == Platform.POLYMARKET and trade.market_title:
-            for cand in self._extract_contract_team_candidates(trade.market_title):
-                row = await pool.fetchrow(
-                    """
-                    SELECT yes_bid, yes_ask, time
-                    FROM market_prices
-                    WHERE platform = $1 AND market_id = $2
-                      AND contract_team ILIKE $3
-                    ORDER BY time DESC
-                    LIMIT 1
-                    """,
-                    trade.platform.value,
-                    trade.market_id,
-                    f"%{cand}%",
-                )
-                if row:
-                    break
-
-        if not row:
-            row = await pool.fetchrow(
+        # For Polymarket, we need to validate team match to prevent wrong-team exits
+        if trade.platform == Platform.POLYMARKET and entry_team:
+            # Fetch recent prices with contract_team for this market
+            rows = await pool.fetch(
                 """
-                SELECT yes_bid, yes_ask, time FROM market_prices
-                WHERE platform = $1 AND market_id = $2
-                ORDER BY time DESC LIMIT 1
+                SELECT yes_bid, yes_ask, time, contract_team
+                FROM market_prices
+                WHERE platform = $1
+                  AND market_id = $2
+                  AND contract_team IS NOT NULL
+                  AND time > NOW() - INTERVAL '2 minutes'
+                ORDER BY time DESC
+                LIMIT 5
                 """,
                 trade.platform.value,
                 trade.market_id,
             )
+
+            # Score each candidate
+            best_match: Optional[dict] = None
+            best_confidence = 0.0
+            best_result: Optional[TeamMatchResult] = None
+            candidates_scored: list[dict] = []
+
+            for row in rows:
+                contract_team = row["contract_team"]
+                match_result = self.team_validator.validate_match(entry_team, contract_team)
+
+                candidates_scored.append({
+                    "contract_team": contract_team,
+                    "confidence": match_result.confidence,
+                    "method": match_result.method,
+                    "is_match": match_result.is_match,
+                })
+
+                if match_result.is_match and match_result.confidence > best_confidence:
+                    best_confidence = match_result.confidence
+                    best_result = match_result
+                    best_match = dict(row)
+
+            # Require minimum confidence
+            if not best_match or best_confidence < self.exit_team_match_min_confidence:
+                trace_log(
+                    service="position_tracker",
+                    event="exit_check_skipped",
+                    trade_id=trade.trade_id,
+                    game_id=trade.game_id,
+                    reason="team_mismatch",
+                    entry_team=entry_team,
+                    best_confidence=best_confidence,
+                    min_confidence_threshold=self.exit_team_match_min_confidence,
+                    candidates_found=len(rows),
+                    candidates_scored=candidates_scored,
+                )
+                logger.debug(
+                    f"Exit skipped for {trade.trade_id}: team mismatch "
+                    f"(entry_team='{entry_team}', best_confidence={best_confidence:.0%})"
+                )
+                return None
+
+            # We have a confident match
+            bid = float(best_match["yes_bid"])
+            ask = float(best_match["yes_ask"])
+
+            # Calculate price age
+            price_age_ms = None
+            if best_match.get("time"):
+                price_time = best_match["time"]
+                if price_time.tzinfo is None:
+                    price_time = price_time.replace(tzinfo=timezone.utc)
+                price_age_ms = (datetime.now(timezone.utc) - price_time).total_seconds() * 1000
+
+            # Mark-to-market uses mid; execution uses bid/ask
+            mark = (bid + ask) / 2.0
+            exec_px = bid if trade.side == TradeSide.BUY else ask
+
+            # Log successful validation
+            trace_log(
+                service="position_tracker",
+                event="exit_price_validated",
+                trade_id=trade.trade_id,
+                game_id=trade.game_id,
+                entry_team=entry_team,
+                exit_contract_team=best_match["contract_team"],
+                confidence=best_confidence,
+                match_method=best_result.method if best_result else None,
+                yes_bid=bid,
+                yes_ask=ask,
+                exec_price=exec_px,
+                price_age_ms=price_age_ms,
+            )
+
+            return mark, exec_px, price_age_ms, bid, ask
+
+        # Non-Polymarket or no entry_team: use simple fallback
+        row = await pool.fetchrow(
+            """
+            SELECT yes_bid, yes_ask, time, contract_team
+            FROM market_prices
+            WHERE platform = $1 AND market_id = $2
+            ORDER BY time DESC
+            LIMIT 1
+            """,
+            trade.platform.value,
+            trade.market_id,
+        )
 
         if not row:
             return None
@@ -838,6 +1048,7 @@ async def main():
         price_staleness_ttl=float(os.environ.get("PRICE_STALENESS_TTL", "30.0")),
         require_valid_book=os.environ.get("REQUIRE_VALID_BOOK", "true").lower() in ("1", "true", "yes"),
         debounce_exit_checks=int(os.environ.get("DEBOUNCE_EXIT_CHECKS", "0")),
+        exit_team_match_min_confidence=float(os.environ.get("EXIT_TEAM_MATCH_MIN_CONFIDENCE", "0.7")),
     )
 
     await tracker.start()

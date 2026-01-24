@@ -7,15 +7,15 @@ use futures_util::StreamExt;
 use log::{debug, error, info, warn};
 use matching::{is_non_moneyline_market, match_game_in_text};
 use providers::{kalshi::KalshiClient, polymarket::PolymarketClient};
-use redis::AsyncCommands;
 use redis::aio::PubSub;
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::RwLock;
 
 const DISCOVERY_REQUESTS_CH: &str = "discovery:requests";
 const DISCOVERY_RESULTS_CH: &str = "discovery:results";
@@ -61,7 +61,7 @@ struct DiscoveryResult {
     home_abbr: String,
     away_abbr: String,
     polymarket_moneyline: Option<String>, // Gamma market id (numeric string)
-    kalshi_moneyline: Option<String>,     // Kalshi ticker (currently not populated; Orchestrator handles Kalshi)
+    kalshi_moneyline: Option<String>, // Kalshi ticker (currently not populated; Orchestrator handles Kalshi)
 }
 
 #[tokio::main]
@@ -102,8 +102,9 @@ async fn main() -> anyhow::Result<()> {
     // Spawn request/response listener (lowest-latency path)
     let poly_cache: Arc<RwLock<HashMap<String, (Instant, Vec<providers::polymarket::Market>)>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    let kalshi_cache: Arc<RwLock<HashMap<String, (Instant, Vec<providers::kalshi::KalshiMarket>)>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let kalshi_cache: Arc<
+        RwLock<HashMap<String, (Instant, Vec<providers::kalshi::KalshiMarket>)>>,
+    > = Arc::new(RwLock::new(HashMap::new()));
 
     let poly_client_req = poly_client.clone();
     let kalshi_client_req = kalshi_client.clone();
@@ -198,10 +199,21 @@ async fn main() -> anyhow::Result<()> {
                         "kalshi_moneyline": kalshi_id,
                     });
 
-                    let _: () = con.set(&key, value.to_string()).await.unwrap_or_else(|e| {
+                    let json_str = value.to_string();
+
+                    let _: () = con.set(&key, &json_str).await.unwrap_or_else(|e| {
                         error!("Redis error: {}", e);
                     });
-                    info!("Wrote discovery data to Redis: {}", key);
+
+                    // Also publish to channel so Orchestrator picks it up immediately
+                    let _: () = con
+                        .publish(DISCOVERY_RESULTS_CH, &json_str)
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!("Redis publish error: {}", e);
+                        });
+
+                    info!("Wrote discovery data to Redis and Published: {}", key);
                 }
             }
         }
@@ -219,7 +231,10 @@ async fn request_listener(
     poly_cache: Arc<RwLock<HashMap<String, (Instant, Vec<providers::polymarket::Market>)>>>,
     kalshi_cache: Arc<RwLock<HashMap<String, (Instant, Vec<providers::kalshi::KalshiMarket>)>>>,
 ) -> anyhow::Result<()> {
-    info!("Listening for discovery requests on {}", DISCOVERY_REQUESTS_CH);
+    info!(
+        "Listening for discovery requests on {}",
+        DISCOVERY_REQUESTS_CH
+    );
 
     let mut stream = pubsub.on_message();
     while let Some(msg) = stream.next().await {
@@ -294,7 +309,10 @@ async fn request_listener(
             }
         };
         // Publish for consumers needing low latency
-        if let Err(e) = con.publish::<&str, Vec<u8>, i64>(DISCOVERY_RESULTS_CH, encoded).await {
+        if let Err(e) = con
+            .publish::<&str, Vec<u8>, i64>(DISCOVERY_RESULTS_CH, encoded)
+            .await
+        {
             warn!("Discovery request: Redis publish error: {}", e);
         }
         // Persist for pregame lookups / restarts
@@ -329,10 +347,10 @@ async fn discover_for_game(
     let poly_tags: Vec<String> = match sport_lower.as_str() {
         // IMPORTANT: Use specific league tags, not broad category tags
         // Using "basketball" would match NBA teams to NCAAB markets (e.g., Cleveland Cavaliers -> Cleveland State)
-        "ncaab" => vec!["ncaab".to_string()],  // College basketball only
-        "nba" => vec!["nba".to_string()],      // NBA only
-        "ncaaf" => vec!["ncaaf".to_string()],  // College football only
-        "nfl" => vec!["nfl".to_string()],      // NFL only
+        "ncaab" => vec!["ncaab".to_string()], // College basketball only
+        "nba" => vec!["nba".to_string()],     // NBA only
+        "ncaaf" => vec!["ncaaf".to_string()], // College football only
+        "nfl" => vec!["nfl".to_string()],     // NFL only
         "nhl" => vec!["nhl".to_string()],
         other => vec![other.to_string()],
     };
@@ -354,13 +372,19 @@ async fn discover_for_game(
                 markets
             } else {
                 // Refresh
-                let fetched = poly_client.search_markets("", &tag_key).await.unwrap_or_default();
+                let fetched = poly_client
+                    .search_markets("", &tag_key)
+                    .await
+                    .unwrap_or_default();
                 let mut guard = poly_cache.write().await;
                 guard.insert(tag_key.clone(), (Instant::now(), fetched.clone()));
                 fetched
             }
         } else {
-            let fetched = poly_client.search_markets("", &tag_key).await.unwrap_or_default();
+            let fetched = poly_client
+                .search_markets("", &tag_key)
+                .await
+                .unwrap_or_default();
             let mut guard = poly_cache.write().await;
             guard.insert(tag_key.clone(), (Instant::now(), fetched.clone()));
             fetched
@@ -431,12 +455,10 @@ async fn discover_for_game(
 }
 
 /// Heartbeat loop - publishes periodic health status to Redis
-async fn heartbeat_loop(
-    client: redis::Client,
-    started_at: String,
-) -> anyhow::Result<()> {
+async fn heartbeat_loop(client: redis::Client, started_at: String) -> anyhow::Result<()> {
     let mut con = client.get_async_connection().await?;
-    let instance_id = env::var("HOSTNAME").unwrap_or_else(|_| "market-discovery-rust-1".to_string());
+    let instance_id =
+        env::var("HOSTNAME").unwrap_or_else(|_| "market-discovery-rust-1".to_string());
     let version = env::var("BUILD_VERSION").ok();
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
 
@@ -463,7 +485,10 @@ async fn heartbeat_loop(
         };
 
         let payload = serde_json::to_string(&heartbeat)?;
-        let key = format!("{}:market_discovery_rust:{}", HEARTBEAT_KEY_PREFIX, instance_id);
+        let key = format!(
+            "{}:market_discovery_rust:{}",
+            HEARTBEAT_KEY_PREFIX, instance_id
+        );
 
         // SETEX for liveness
         let _: () = con.set_ex(&key, &payload, HEARTBEAT_TTL_SECS).await?;

@@ -85,7 +85,9 @@ async def test_execution_engine():
 async def test_market_discovery():
     """Test market discovery service initialization."""
     try:
-        from services.market_discovery import MarketDiscoveryService
+        # NOTE: MarketDiscoveryService is now handled by Rust service
+        # from services.market_discovery import MarketDiscoveryService
+        MarketDiscoveryService = None  # Rust service handles this now
         
         # Check team cache exists
         from pathlib import Path

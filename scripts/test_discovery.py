@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger("TestDiscovery")
 
 from markets.polymarket.client import PolymarketClient
-from services.market_discovery.parser import parse_market, MarketType
+# NOTE: Market parsing is now handled by the Rust market_discovery_rust service
 
 # Mock aliases for testing
 TEST_ALIASES = {
@@ -55,10 +55,6 @@ async def main():
             mid = m.get("condition_id") or m.get("id")
             
             print(f"\n  Market: {title} (ID: {mid})")
-            
-            # Parse
-            parsed = parse_market(title, platform="polymarket")
-            print(f"    Parsed: {parsed}")
             
             # Check Team Match
             home_aliases = TEST_ALIASES.get(home_team.lower(), [home_team.lower()])
