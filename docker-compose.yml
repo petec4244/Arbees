@@ -65,13 +65,15 @@ services:
   orchestrator:
     build:
       context: .
-      dockerfile: services/orchestrator/Dockerfile
+      dockerfile: services/orchestrator_rust/Dockerfile
     container_name: arbees-orchestrator
     depends_on:
       timescaledb:
         condition: service_healthy
       redis:
         condition: service_healthy
+      market-discovery-rust:
+        condition: service_started
     env_file:
       - .env
     environment:
@@ -80,6 +82,8 @@ services:
       LOG_LEVEL: DEBUG
       # Phase 4: Always use Rust discovery in production
       MARKET_DISCOVERY_MODE: "rust"
+      # Unified team matching configuration
+      TEAM_MATCH_MIN_CONFIDENCE: "0.7"
       # Supervisor (container health monitoring + auto-restart)
       SUPERVISOR_ENABLED: ${SUPERVISOR_ENABLED:-true}
       MAX_RESTART_ATTEMPTS: ${MAX_RESTART_ATTEMPTS:-3}
@@ -90,18 +94,18 @@ services:
       # Heartbeat settings (all services use these)
       HEARTBEAT_INTERVAL_SECS: ${HEARTBEAT_INTERVAL_SECS:-10}
       HEARTBEAT_TTL_SECS: ${HEARTBEAT_TTL_SECS:-35}
-    volumes:
-      - ./:/app
-      # Mount Docker socket for supervisor to restart containers
-      - /var/run/docker.sock:/var/run/docker.sock
+    # NOTE: No volume mount for Rust orchestrator - binary is compiled in image
+    # Mount Docker socket only if supervisor functionality is needed
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock
     profiles:
       - full
 
   game_shard:
     build:
       context: .
-      dockerfile: services/game_shard/Dockerfile
-    container_name: arbees-game-shard-1
+      dockerfile: services/game_shard_rust/Dockerfile
+    container_name: arbees-game-shard-rust
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -158,19 +162,21 @@ services:
   signal_processor:
     build:
       context: .
-      dockerfile: services/signal_processor/Dockerfile
-    container_name: arbees-signal-processor
+      dockerfile: services/signal_processor_rust/Dockerfile
+    container_name: arbees-signal-processor-rust
     depends_on:
       timescaledb:
         condition: service_healthy
       redis:
         condition: service_healthy
+      market-discovery-rust:
+        condition: service_started
     env_file:
       - .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
+      RUST_LOG: info
       # Risk management limits
       MAX_DAILY_LOSS: "500.0"
       MAX_GAME_EXPOSURE: "100.0"
@@ -185,18 +191,16 @@ services:
       # Cooldown timers
       WIN_COOLDOWN_SECONDS: "180"
       LOSS_COOLDOWN_SECONDS: "300"
-      # Team matching (emergency debug hardening)
+      # Unified team matching configuration
       TEAM_MATCH_MIN_CONFIDENCE: "0.7"
-    volumes:
-      - ./:/app
     profiles:
       - full
 
   execution_service:
     build:
       context: .
-      dockerfile: services/execution_service/Dockerfile
-    container_name: arbees-execution-service
+      dockerfile: services/execution_service_rust/Dockerfile
+    container_name: arbees-execution-service-rust
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -208,7 +212,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: INFO
-      PAPER_TRADING: "1"  # Set to "0" for real trading
+      PAPER_TRADING: "1" # Set to "0" for real trading
       INITIAL_BANKROLL: "1000"
       MIN_EDGE_PCT: "2.0"
       KELLY_FRACTION: "0.25"
@@ -222,35 +226,28 @@ services:
   position_tracker:
     build:
       context: .
-      dockerfile: services/position_tracker/Dockerfile
-    container_name: arbees-position-tracker
+      dockerfile: services/position_tracker_rust/Dockerfile
+    container_name: arbees-position-tracker-rust
     depends_on:
       timescaledb:
         condition: service_healthy
       redis:
         condition: service_healthy
+      market-discovery-rust:
+        condition: service_started
     env_file:
       - .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
+      RUST_LOG: info
       INITIAL_BANKROLL: "1000"
       # Exit monitoring parameters
       TAKE_PROFIT_PCT: "3.0"
       DEFAULT_STOP_LOSS_PCT: "5.0"
-      EXIT_CHECK_INTERVAL: "1.0"
-      # Sport-specific stop-loss thresholds
-      STOP_LOSS_NBA: "3.0"
-      STOP_LOSS_NCAAB: "3.0"
-      STOP_LOSS_NFL: "5.0"
-      STOP_LOSS_NHL: "7.0"
-      STOP_LOSS_MLB: "6.0"
-      STOP_LOSS_SOCCER: "7.0"
-      # Team matching (emergency debug hardening)
+      EXIT_CHECK_INTERVAL_SECS: "1.0"
+      # Unified team matching configuration
       EXIT_TEAM_MATCH_MIN_CONFIDENCE: "0.7"
-    volumes:
-      - ./:/app
     profiles:
       - full
 
@@ -292,8 +289,8 @@ services:
       STOP_LOSS_MLB: "6.0"
       STOP_LOSS_SOCCER: "7.0"
       # Cooldown timers (prevent rapid re-entry on same game)
-      WIN_COOLDOWN_SECONDS: "180"   # 3 minutes after a win
-      LOSS_COOLDOWN_SECONDS: "300"  # 5 minutes after a loss
+      WIN_COOLDOWN_SECONDS: "180" # 3 minutes after a win
+      LOSS_COOLDOWN_SECONDS: "300" # 5 minutes after a loss
     volumes:
       - ./:/app
     profiles:
@@ -464,7 +461,7 @@ services:
   # ==========================================================================
   # Phase 3: VPN + Polymarket Price Shard (geo-bypass for Polymarket CLOB/WS)
   # ==========================================================================
-  # 
+  #
   # VPN SCOPE (minimal blast radius):
   # - ONLY polymarket_monitor needs VPN (CLOB/WebSocket are geo-blocked)
   # - market-discovery-rust does NOT need VPN (Gamma API is public)

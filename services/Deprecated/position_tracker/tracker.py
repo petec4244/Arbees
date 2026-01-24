@@ -30,7 +30,7 @@ from arbees_shared.models.execution import (
 from arbees_shared.health.heartbeat import HeartbeatPublisher
 from arbees_shared.models.health import ServiceStatus
 from arbees_shared.utils.trace_logger import trace_log, TraceContext
-from arbees_shared.utils.team_validator import TeamValidator, TeamMatchResult
+from arbees_shared.team_matching import TeamMatchingClient, TeamMatchResult
 from markets.paper.engine import PaperTradingEngine
 
 logger = logging.getLogger(__name__)
@@ -83,8 +83,8 @@ class PositionTracker:
         self.debounce_exit_checks = debounce_exit_checks
         self.exit_team_match_min_confidence = exit_team_match_min_confidence
 
-        # Team name validator for exit price selection
-        self.team_validator = TeamValidator()
+        # Unified team matching client (Rust-based via Redis RPC)
+        self.team_matching: Optional[TeamMatchingClient] = None
 
         # Track consecutive exit triggers per trade for debounce
         self._exit_trigger_counts: dict[str, int] = {}
@@ -116,6 +116,11 @@ class PositionTracker:
         # Connect to Redis
         self.redis = RedisBus()
         await self.redis.connect()
+
+        # Connect to unified team matching service (Rust-based via Redis RPC)
+        self.team_matching = TeamMatchingClient()
+        await self.team_matching.connect()
+        logger.info("Connected to unified team matching service")
 
         # Initialize paper engine for position management
         self.paper_engine = PaperTradingEngine(
@@ -173,6 +178,9 @@ class PositionTracker:
 
         if self.paper_engine:
             await self._save_bankroll()
+
+        if self.team_matching:
+            await self.team_matching.disconnect()
 
         if self.redis:
             await self.redis.disconnect()
@@ -812,15 +820,47 @@ class PositionTracker:
                 trade.market_id,
             )
 
-            # Score each candidate
+            # Score each candidate using unified team matching client
             best_match: Optional[dict] = None
             best_confidence = 0.0
             best_result: Optional[TeamMatchResult] = None
             candidates_scored: list[dict] = []
 
+            # Determine sport for matching
+            sport_value = (trade.sport.value if trade.sport else "nba").lower()
+
             for row in rows:
                 contract_team = row["contract_team"]
-                match_result = self.team_validator.validate_match(entry_team, contract_team)
+
+                # Use unified team matching client (Rust-based)
+                if self.team_matching:
+                    match_result = await self.team_matching.match_teams(
+                        target_team=entry_team,
+                        candidate_team=contract_team,
+                        sport=sport_value,
+                        timeout=2.0,
+                    )
+                else:
+                    # Fallback: no match client - skip exit
+                    match_result = None
+
+                # Handle timeout/error (fail-closed: skip exit)
+                if match_result is None:
+                    candidates_scored.append({
+                        "contract_team": contract_team,
+                        "confidence": 0.0,
+                        "method": "rpc_timeout",
+                        "is_match": False,
+                    })
+                    trace_log(
+                        service="position_tracker",
+                        event="exit_match_rpc_timeout",
+                        trade_id=trade.trade_id,
+                        game_id=trade.game_id,
+                        entry_team=entry_team,
+                        contract_team=contract_team,
+                    )
+                    continue
 
                 candidates_scored.append({
                     "contract_team": contract_team,

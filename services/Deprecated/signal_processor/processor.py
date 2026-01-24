@@ -29,7 +29,7 @@ from arbees_shared.risk import RiskController
 from arbees_shared.health.heartbeat import HeartbeatPublisher
 from arbees_shared.models.health import ServiceStatus
 from arbees_shared.utils.trace_logger import TraceContext
-from arbees_shared.utils.team_validator import TeamValidator, TeamMatchResult
+from arbees_shared.team_matching import TeamMatchingClient, TeamMatchResult
 
 from .rule_evaluator import RuleEvaluator, RuleDecisionType
 
@@ -94,8 +94,8 @@ class SignalProcessor:
         self.initial_bankroll = initial_bankroll
         self.team_match_min_confidence = team_match_min_confidence
 
-        # Team name validator for entry price selection
-        self.team_validator = TeamValidator()
+        # Unified team matching client (Rust-based via Redis RPC)
+        self.team_matching: Optional[TeamMatchingClient] = None
 
         # Connections
         self.db: Optional[DatabaseClient] = None
@@ -149,6 +149,11 @@ class SignalProcessor:
         self.redis = RedisBus()
         await self.redis.connect()
 
+        # Connect to unified team matching service (Rust-based via Redis RPC)
+        self.team_matching = TeamMatchingClient()
+        await self.team_matching.connect()
+        logger.info("Connected to unified team matching service")
+
         # Initialize rule evaluator for feedback loop
         self.rule_evaluator = RuleEvaluator(redis=self.redis, load_from_db=True)
         await self.rule_evaluator.start()
@@ -190,6 +195,8 @@ class SignalProcessor:
             await self.rule_evaluator.stop()
         if self._heartbeat_publisher:
             await self._heartbeat_publisher.stop()
+        if self.team_matching:
+            await self.team_matching.disconnect()
         if self.redis:
             await self.redis.disconnect()
         logger.info("SignalProcessor stopped")
@@ -516,7 +523,35 @@ class SignalProcessor:
 
             for row in rows:
                 contract_team = row["contract_team"]
-                match_result = self.team_validator.validate_match(target_team, contract_team)
+                sport_value = signal.sport.value.lower() if signal.sport else "nba"
+
+                # Use unified team matching client (Rust-based)
+                if self.team_matching:
+                    match_result = await self.team_matching.match_teams(
+                        target_team=target_team,
+                        candidate_team=contract_team,
+                        sport=sport_value,
+                        timeout=2.0,
+                    )
+                else:
+                    # Fallback: no match client - reject entry
+                    match_result = None
+
+                # Handle timeout/error (fail-closed: reject entry)
+                if match_result is None:
+                    candidates_scored.append({
+                        "contract_team": contract_team,
+                        "confidence": 0.0,
+                        "method": "rpc_timeout",
+                        "is_match": False,
+                    })
+                    if trace:
+                        trace.log(
+                            "market_lookup_rpc_timeout",
+                            target_team=target_team,
+                            contract_team=contract_team,
+                        )
+                    continue
 
                 candidates_scored.append({
                     "contract_team": contract_team,

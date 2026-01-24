@@ -54,6 +54,7 @@ data/models/nfl/*.pkl
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Logs
 *.log

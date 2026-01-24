@@ -521,29 +521,29 @@ All services guaranteed to use same logic
 
 ### **Saturday (4-5 hours)**
 
-**Morning (2-3 hours):**
-- [ ] Extract Rust matching service from market_discovery_rust
-- [ ] Add Redis RPC handlers (request/response)
-- [ ] Test matching service standalone
-- [ ] Deploy as new container
+**Morning (2 hours):**
+- [x] Extract Rust matching service from market_discovery_rust
+- [x] Add Redis RPC handlers (request/response)
+- [x] Test matching service standalone
+- [x] Deploy as new container
 
 **Afternoon (2 hours):**
-- [ ] Create Python client library
-- [ ] Test client→service RPC
-- [ ] Add to arbees_shared module
+- [x] Create Python client library
+- [x] Test client→service RPC
+- [x] Add to arbees_shared module
 
 ### **Sunday (3-4 hours)**
 
 **Morning (2 hours):**
-- [ ] Migrate Orchestrator to use client
-- [ ] Test Kalshi market discovery still works
-- [ ] Deploy and monitor
+- [x] Migrate Orchestrator to use client
+- [x] Test Kalshi market discovery still works
+- [x] Deploy and monitor
 
 **Afternoon (2 hours):**
-- [ ] Migrate SignalProcessor to use client
-- [ ] Migrate PositionTracker to use client
-- [ ] Remove old TeamValidator class
-- [ ] Test end-to-end with paper trading
+- [x] Migrate SignalProcessor to use client
+- [x] Migrate PositionTracker to use client
+- [x] Remove old TeamValidator class
+- [x] Test end-to-end with paper trading
 
 ---
 

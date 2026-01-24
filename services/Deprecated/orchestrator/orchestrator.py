@@ -26,6 +26,7 @@ from arbees_shared.models.market import Platform
 from arbees_shared.models.market_types import MarketType
 from arbees_shared.health.heartbeat import HeartbeatPublisher
 from arbees_shared.models.health import ServiceStatus
+from arbees_shared.team_matching import TeamMatchingClient
 from data_providers.espn.client import ESPNClient
 from markets.kalshi.client import KalshiClient
 from markets.polymarket.client import PolymarketClient
@@ -166,6 +167,12 @@ class Orchestrator:
         self._supervisor: Optional[Supervisor] = None
         self._supervisor_enabled = os.environ.get("SUPERVISOR_ENABLED", "true").lower() == "true"
 
+        # Team matching client (unified Rust-based matching)
+        self._team_matching: Optional[TeamMatchingClient] = None
+        self._team_match_min_confidence = float(
+            os.environ.get("TEAM_MATCH_MIN_CONFIDENCE", "0.7")
+        )
+
     async def start(self) -> None:
         """Start the orchestrator."""
         logger.info("Starting Orchestrator")
@@ -220,6 +227,11 @@ class Orchestrator:
             self._discovery_pubsub_task = asyncio.create_task(self._listen_discovery_results())
         else:
             logger.info("Using legacy Python market discovery")
+
+        # Connect to unified team matching service (Rust-based via Redis RPC)
+        self._team_matching = TeamMatchingClient()
+        await self._team_matching.connect()
+        logger.info("Connected to unified team matching service")
 
         # Start background tasks
         self._discovery_task = asyncio.create_task(self._discovery_loop())
@@ -376,6 +388,10 @@ class Orchestrator:
             await self.redis.disconnect()
         if self._discovery_client:
             await self._discovery_client.close()
+
+        # Disconnect team matching client
+        if self._team_matching:
+            await self._team_matching.disconnect()
 
         logger.info("Orchestrator stopped")
 
@@ -1172,7 +1188,10 @@ class Orchestrator:
         return aliases
 
     def _match_team_in_text(self, text: str, team_name: str, sport: Sport) -> bool:
-        """Check if market text contains team (with win context)."""
+        """Check if market text contains team (with win context).
+
+        DEPRECATED: Use _match_team_in_text_unified for unified Rust-based matching.
+        """
         text_lower = text.lower()
         aliases = self._get_team_aliases(team_name, sport)
 
@@ -1189,6 +1208,50 @@ class Orchestrator:
                 return True
 
         return False
+
+    async def _match_team_in_text_unified(
+        self, text: str, team_name: str, sport: Sport
+    ) -> bool:
+        """Check if market text contains team using unified Rust matching service.
+
+        Uses the shared TeamMatchingClient for consistent matching across all services.
+        Returns False on RPC timeout (fail-closed).
+
+        Args:
+            text: The market title/text to check
+            team_name: The team to look for
+            sport: The sport (for sport-specific matching rules)
+
+        Returns:
+            True if team matches with sufficient confidence, False otherwise
+        """
+        if not self._team_matching:
+            logger.warning("Team matching client not connected, falling back to legacy")
+            return self._match_team_in_text(text, team_name, sport)
+
+        result = await self._team_matching.match_teams(
+            target_team=team_name,
+            candidate_team=text,
+            sport=sport.value.lower(),
+            timeout=2.0,
+        )
+
+        if result is None:
+            # RPC timeout - fail closed
+            logger.warning(
+                f"Team match RPC timeout: '{team_name}' vs '{text[:50]}...' (sport: {sport.value})"
+            )
+            return False
+
+        is_match = result.is_match and result.confidence >= self._team_match_min_confidence
+
+        if is_match:
+            logger.debug(
+                f"Team match (unified): '{team_name}' in '{text[:50]}...' "
+                f"(confidence={result.confidence:.0%}, method={result.method})"
+            )
+
+        return is_match
 
     def _is_single_game_market(self, ticker: str) -> bool:
         """Check if ticker is a single-game market (not a parlay/multi-game).
@@ -1291,13 +1354,13 @@ class Orchestrator:
 
                 combined = f"{title} {ticker}"
 
-                # Check for home team match
-                if self._match_team_in_text(combined, game.home_team, game.sport):
+                # Check for home team match using unified Rust matching
+                if await self._match_team_in_text_unified(combined, game.home_team, game.sport):
                     home_market = ticker
-                    logger.info(f"Kalshi single-game match: {game.home_team} -> {ticker}")
+                    logger.info(f"Kalshi single-game match (unified): {game.home_team} -> {ticker}")
 
-                # Check for away team match
-                if self._match_team_in_text(combined, game.away_team, game.sport):
+                # Check for away team match using unified Rust matching
+                if await self._match_team_in_text_unified(combined, game.away_team, game.sport):
                     away_market = ticker
 
                 # If we found both, we can stop
@@ -1422,19 +1485,14 @@ class Orchestrator:
                 if detected_type != market_type:
                     continue
 
-                # Must match one of the teams
-                combined = f"{title} {ticker}".lower()
-                home_aliases = self._get_team_aliases(game.home_team, game.sport)
-                away_aliases = self._get_team_aliases(game.away_team, game.sport)
-                
-                home_match = any(alias in combined for alias in home_aliases)
-                away_match = any(alias in combined for alias in away_aliases)
+                # Must match one of the teams using unified Rust matching
+                combined = f"{title} {ticker}"
+                home_match = await self._match_team_in_text_unified(combined, game.home_team, game.sport)
+                away_match = await self._match_team_in_text_unified(combined, game.away_team, game.sport)
 
                 if home_match or away_match:
-                    logger.debug(f"Kalshi {market_type.value} match: {title}")
+                    logger.debug(f"Kalshi {market_type.value} match (unified): {title}")
                     return ticker
-                # else:
-                #    logger.debug(f"No match for {game.home_team} vs {game.away_team} in {title}")
 
         except Exception as e:
             logger.debug(f"Error finding Kalshi {market_type.value} market: {e}")
@@ -1500,22 +1558,17 @@ class Orchestrator:
                     if detected_type != market_type:
                         continue
 
-                    # Strict match: Check BOTH teams are in title
-                    title_lower = title.lower()
-                    
-                    home_aliases = self._get_team_aliases(game.home_team, game.sport)
-                    away_aliases = self._get_team_aliases(game.away_team, game.sport)
-
-                    home_match = any(a in title_lower for a in home_aliases)
-                    away_match = any(a in title_lower for a in away_aliases)
+                    # Strict match: Check BOTH teams are in title using unified Rust matching
+                    home_match = await self._match_team_in_text_unified(title, game.home_team, game.sport)
+                    away_match = await self._match_team_in_text_unified(title, game.away_team, game.sport)
 
                     if home_match and away_match:
-                        logger.debug(f"Polymarket {market_type.value} match: {title}")
+                        logger.debug(f"Polymarket {market_type.value} match (unified): {title}")
                         # IMPORTANT: Return the Gamma market id (numeric string).
                         # The Polymarket monitor resolves token_ids itself for WS subscriptions.
                         return market.get("id")
                     else:
-                        logger.debug(f"Title {title} missing teams. Home: {home_match} ({home_aliases}), Away: {away_match} ({away_aliases})")
+                        logger.debug(f"Title '{title[:50]}...' missing teams. Home: {home_match}, Away: {away_match}")
                 
                 # If we found nothing in this query, try the next one (unless it was the last one)
 

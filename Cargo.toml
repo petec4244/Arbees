@@ -1,5 +1,14 @@
 [workspace]
-members = ["rust_core", "services/market_discovery_rust"]
+members = [
+    "rust_core",
+    "services/arbees_rust_core",
+    "services/game_shard_rust",
+    "services/market_discovery_rust",
+    "services/orchestrator_rust",
+    "services/execution_service_rust",
+    "services/signal_processor_rust",
+    "services/position_tracker_rust",
+]
 resolver = "2"
 
 [workspace.package]
@@ -15,10 +24,27 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.8"
 thiserror = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
+redis = { version = "0.24", features = ["tokio-comp", "json"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+anyhow = "1.0"
+dotenv = "0.15"
+futures-util = "0.3"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+strsim = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+env_logger = "0.10"
+hostname = "0.4"
+async-trait = "0.1"
 # New dependencies for terauss integration
 rustc-hash = "2.0"           # Fast hashing for GlobalState lookups
 parking_lot = "0.12"         # Faster RwLock than std
 wide = "0.7"                 # SIMD support
+# Pin home to version that doesn't require edition 2024
+home = "=0.5.9"
 
 [profile.release]
 lto = true

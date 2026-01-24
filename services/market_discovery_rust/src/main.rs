@@ -1,12 +1,16 @@
-mod matching;
-mod providers;
-
+use arbees_rust_core::clients::{
+    espn::EspnClient,
+    kalshi::{KalshiClient, KalshiMarket},
+    polymarket::{Market as PolyMarket, PolymarketClient},
+};
+use arbees_rust_core::utils::matching::{
+    is_non_moneyline_market, match_game_in_text, match_team_in_text,
+    match_teams_with_context, GameContext, MarketContext,
+};
 use chrono::Utc;
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
-use matching::{is_non_moneyline_market, match_game_in_text};
-use providers::{kalshi::KalshiClient, polymarket::PolymarketClient};
 use redis::aio::PubSub;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -22,6 +26,10 @@ const DISCOVERY_RESULTS_CH: &str = "discovery:results";
 const CACHE_TTL_SECS: u64 = 60;
 const DISCOVERY_GAME_KEY_PREFIX: &str = "discovery:game:";
 const DISCOVERY_GAME_KEY_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+// Team matching RPC channels
+const TEAM_MATCH_REQUEST_CH: &str = "team:match:request";
+const TEAM_MATCH_RESPONSE_PREFIX: &str = "team:match:response:";
 
 // Heartbeat constants
 const HEARTBEAT_KEY_PREFIX: &str = "health:hb";
@@ -64,6 +72,39 @@ struct DiscoveryResult {
     kalshi_moneyline: Option<String>, // Kalshi ticker (currently not populated; Orchestrator handles Kalshi)
 }
 
+// Team matching RPC types
+#[derive(Debug, Deserialize)]
+struct TeamMatchRequest {
+    request_id: String,
+    target_team: String,
+    candidate_team: String,
+    sport: String,
+    // NEW: Optional context fields (backward compatible)
+    #[serde(default)]
+    game_context: Option<GameContext>,
+    #[serde(default)]
+    market_context: Option<MarketContext>,
+    /// Whether target_team is the home team (for opponent validation)
+    #[serde(default)]
+    target_is_home: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamMatchResponse {
+    request_id: String,
+    is_match: bool,
+    confidence: f64,
+    method: String,
+    reason: String,
+    // NEW: Additional context validation fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sport_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opponent_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score_correlation: Option<f64>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -80,10 +121,15 @@ async fn main() -> anyhow::Result<()> {
     let pubsub_con = client.get_async_connection().await?;
     let mut pubsub = pubsub_con.into_pubsub();
     pubsub.subscribe(DISCOVERY_REQUESTS_CH).await?;
+    pubsub.subscribe(TEAM_MATCH_REQUEST_CH).await?;
+    info!(
+        "Subscribed to channels: {}, {}",
+        DISCOVERY_REQUESTS_CH, TEAM_MATCH_REQUEST_CH
+    );
 
     let poly_client = PolymarketClient::new();
     let kalshi_client = KalshiClient::new();
-    let espn_client = providers::espn::EspnClient::new();
+    let espn_client = EspnClient::new();
 
     // Optional: background polling cycle (can be disabled for lowest latency / least load)
     let poll_espn = env::var("DISCOVERY_POLL_ESPN")
@@ -100,11 +146,10 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     // Spawn request/response listener (lowest-latency path)
-    let poly_cache: Arc<RwLock<HashMap<String, (Instant, Vec<providers::polymarket::Market>)>>> =
+    let poly_cache: Arc<RwLock<HashMap<String, (Instant, Vec<PolyMarket>)>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    let kalshi_cache: Arc<
-        RwLock<HashMap<String, (Instant, Vec<providers::kalshi::KalshiMarket>)>>,
-    > = Arc::new(RwLock::new(HashMap::new()));
+    let kalshi_cache: Arc<RwLock<HashMap<String, (Instant, Vec<KalshiMarket>)>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     let poly_client_req = poly_client.clone();
     let kalshi_client_req = kalshi_client.clone();
@@ -228,103 +273,237 @@ async fn request_listener(
     redis_client: redis::Client,
     poly_client: PolymarketClient,
     kalshi_client: KalshiClient,
-    poly_cache: Arc<RwLock<HashMap<String, (Instant, Vec<providers::polymarket::Market>)>>>,
-    kalshi_cache: Arc<RwLock<HashMap<String, (Instant, Vec<providers::kalshi::KalshiMarket>)>>>,
+    poly_cache: Arc<RwLock<HashMap<String, (Instant, Vec<PolyMarket>)>>>,
+    kalshi_cache: Arc<RwLock<HashMap<String, (Instant, Vec<KalshiMarket>)>>>,
 ) -> anyhow::Result<()> {
     info!(
-        "Listening for discovery requests on {}",
-        DISCOVERY_REQUESTS_CH
+        "Listening for requests on {} and {}",
+        DISCOVERY_REQUESTS_CH, TEAM_MATCH_REQUEST_CH
     );
 
     let mut stream = pubsub.on_message();
     while let Some(msg) = stream.next().await {
+        let channel: String = msg.get_channel_name().to_string();
         let payload: Vec<u8> = match msg.get_payload() {
             Ok(p) => p,
             Err(e) => {
-                warn!("Discovery request: failed to read payload: {}", e);
+                warn!("Request listener: failed to read payload: {}", e);
                 continue;
             }
         };
 
-        let req: DiscoveryRequest = match serde_json::from_slice(&payload) {
-            Ok(r) => r,
-            Err(e) => {
-                // IMPORTANT: Never crash the listener due to one bad message.
-                // PubSub has no retry; crashing here would stop all discovery.
-                let preview = String::from_utf8_lossy(&payload);
-                warn!(
-                    "Discovery request: invalid JSON ({}). payload='{}'",
-                    e,
-                    preview.chars().take(400).collect::<String>()
-                );
-                continue;
-            }
-        };
-
-        let (poly_id, kalshi_id) = match discover_for_game(
-            &poly_client,
-            &kalshi_client,
-            &req.game_id,
-            &req.sport,
-            &req.home_team,
-            &req.away_team,
-            &req.home_abbr,
-            &req.away_abbr,
-            &poly_cache,
-            &kalshi_cache,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Discovery request: error discovering markets for game {}: {}",
-                    req.game_id, e
-                );
-                (None, None)
-            }
-        };
-
-        let result = DiscoveryResult {
-            game_id: req.game_id.clone(),
-            sport: req.sport.clone(),
-            home_team: req.home_team.clone(),
-            away_team: req.away_team.clone(),
-            home_abbr: req.home_abbr.clone(),
-            away_abbr: req.away_abbr.clone(),
-            polymarket_moneyline: poly_id,
-            kalshi_moneyline: kalshi_id,
-        };
-
-        let encoded = serde_json::to_vec(&result)?;
-        let json_str = String::from_utf8_lossy(&encoded).to_string();
-        let key = format!("{}{}", DISCOVERY_GAME_KEY_PREFIX, req.game_id);
-
-        // NOTE: Keep the listener alive even if Redis has transient errors.
-        let mut con = match redis_client.get_async_connection().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Discovery request: Redis connection error: {}", e);
-                continue;
-            }
-        };
-        // Publish for consumers needing low latency
-        if let Err(e) = con
-            .publish::<&str, Vec<u8>, i64>(DISCOVERY_RESULTS_CH, encoded)
-            .await
-        {
-            warn!("Discovery request: Redis publish error: {}", e);
-        }
-        // Persist for pregame lookups / restarts
-        if let Err(e) = con
-            .set_ex::<String, String, ()>(key, json_str, DISCOVERY_GAME_KEY_TTL_SECS)
-            .await
-        {
-            warn!("Discovery request: Redis set_ex error: {}", e);
+        // Route by channel
+        if channel == TEAM_MATCH_REQUEST_CH {
+            // Handle team matching RPC
+            handle_team_match_request(&redis_client, &payload).await;
+        } else if channel == DISCOVERY_REQUESTS_CH {
+            // Handle discovery request (existing logic)
+            handle_discovery_request(
+                &redis_client,
+                &poly_client,
+                &kalshi_client,
+                &poly_cache,
+                &kalshi_cache,
+                &payload,
+            )
+            .await;
+        } else {
+            warn!("Unknown channel: {}", channel);
         }
     }
 
     Ok(())
+}
+
+/// Handle team matching RPC request
+async fn handle_team_match_request(redis_client: &redis::Client, payload: &[u8]) {
+    let req: TeamMatchRequest = match serde_json::from_slice(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            let preview = String::from_utf8_lossy(payload);
+            warn!(
+                "Team match request: invalid JSON ({}). payload='{}'",
+                e,
+                preview.chars().take(200).collect::<String>()
+            );
+            return;
+        }
+    };
+
+    let has_context = req.game_context.is_some() || req.market_context.is_some();
+
+    debug!(
+        "Team match request: '{}' vs '{}' (sport: {}, has_context: {})",
+        req.target_team, req.candidate_team, req.sport, has_context
+    );
+
+    // Use context-aware matching if context provided, otherwise fall back to name-only
+    let response = if has_context {
+        // Context-enhanced matching
+        let ctx_result = match_teams_with_context(
+            &req.target_team,
+            &req.candidate_team,
+            &req.sport,
+            req.game_context.as_ref(),
+            req.market_context.as_ref(),
+            req.target_is_home,
+        );
+
+        TeamMatchResponse {
+            request_id: req.request_id.clone(),
+            is_match: ctx_result.final_confidence >= 0.5 && ctx_result.name_match.is_match,
+            confidence: ctx_result.final_confidence,
+            method: ctx_result.name_match.confidence_level.clone(),
+            reason: ctx_result.rejection_reason.unwrap_or_else(|| {
+                format!(
+                    "{} (opponent: {:.2}, score_corr: {:?})",
+                    ctx_result.name_match.reason,
+                    ctx_result.opponent_score,
+                    ctx_result.score_correlation
+                )
+            }),
+            sport_valid: Some(ctx_result.sport_valid),
+            opponent_score: Some(ctx_result.opponent_score),
+            score_correlation: ctx_result.score_correlation,
+        }
+    } else {
+        // Backward compatible: name-only matching
+        let result = match_team_in_text(&req.target_team, &req.candidate_team, &req.sport);
+
+        TeamMatchResponse {
+            request_id: req.request_id.clone(),
+            is_match: result.is_match(),
+            confidence: result.score,
+            method: format!("{:?}", result.confidence),
+            reason: result.reason.clone(),
+            sport_valid: None,
+            opponent_score: None,
+            score_correlation: None,
+        }
+    };
+
+    // Publish response to specific channel
+    let response_channel = format!("{}{}", TEAM_MATCH_RESPONSE_PREFIX, req.request_id);
+
+    let mut con = match redis_client.get_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Team match request: Redis connection error: {}", e);
+            return;
+        }
+    };
+
+    let response_json = match serde_json::to_string(&response) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Team match request: JSON serialization error: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = con
+        .publish::<&str, &str, i64>(&response_channel, &response_json)
+        .await
+    {
+        warn!("Team match request: Redis publish error: {}", e);
+    } else {
+        debug!(
+            "Team match response: match={}, confidence={:.2}, method={}, has_context={} -> {}",
+            response.is_match, response.confidence, response.method, has_context, response_channel
+        );
+    }
+}
+
+/// Handle discovery request (refactored from inline code)
+async fn handle_discovery_request(
+    redis_client: &redis::Client,
+    poly_client: &PolymarketClient,
+    kalshi_client: &KalshiClient,
+    poly_cache: &Arc<RwLock<HashMap<String, (Instant, Vec<PolyMarket>)>>>,
+    kalshi_cache: &Arc<RwLock<HashMap<String, (Instant, Vec<KalshiMarket>)>>>,
+    payload: &[u8],
+) {
+    let req: DiscoveryRequest = match serde_json::from_slice(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            // IMPORTANT: Never crash the listener due to one bad message.
+            let preview = String::from_utf8_lossy(payload);
+            warn!(
+                "Discovery request: invalid JSON ({}). payload='{}'",
+                e,
+                preview.chars().take(400).collect::<String>()
+            );
+            return;
+        }
+    };
+
+    let (poly_id, kalshi_id) = match discover_for_game(
+        poly_client,
+        kalshi_client,
+        &req.game_id,
+        &req.sport,
+        &req.home_team,
+        &req.away_team,
+        &req.home_abbr,
+        &req.away_abbr,
+        poly_cache,
+        kalshi_cache,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Discovery request: error discovering markets for game {}: {}",
+                req.game_id, e
+            );
+            (None, None)
+        }
+    };
+
+    let result = DiscoveryResult {
+        game_id: req.game_id.clone(),
+        sport: req.sport.clone(),
+        home_team: req.home_team.clone(),
+        away_team: req.away_team.clone(),
+        home_abbr: req.home_abbr.clone(),
+        away_abbr: req.away_abbr.clone(),
+        polymarket_moneyline: poly_id,
+        kalshi_moneyline: kalshi_id,
+    };
+
+    let encoded = match serde_json::to_vec(&result) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("Discovery request: JSON serialization error: {}", e);
+            return;
+        }
+    };
+    let json_str = String::from_utf8_lossy(&encoded).to_string();
+    let key = format!("{}{}", DISCOVERY_GAME_KEY_PREFIX, req.game_id);
+
+    // NOTE: Keep the listener alive even if Redis has transient errors.
+    let mut con = match redis_client.get_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Discovery request: Redis connection error: {}", e);
+            return;
+        }
+    };
+    // Publish for consumers needing low latency
+    if let Err(e) = con
+        .publish::<&str, Vec<u8>, i64>(DISCOVERY_RESULTS_CH, encoded)
+        .await
+    {
+        warn!("Discovery request: Redis publish error: {}", e);
+    }
+    // Persist for pregame lookups / restarts
+    if let Err(e) = con
+        .set_ex::<String, String, ()>(key, json_str, DISCOVERY_GAME_KEY_TTL_SECS)
+        .await
+    {
+        warn!("Discovery request: Redis set_ex error: {}", e);
+    }
 }
 
 async fn discover_for_game(
@@ -336,8 +515,8 @@ async fn discover_for_game(
     away_team: &str,
     home_abbr: &str,
     away_abbr: &str,
-    poly_cache: &Arc<RwLock<HashMap<String, (Instant, Vec<providers::polymarket::Market>)>>>,
-    kalshi_cache: &Arc<RwLock<HashMap<String, (Instant, Vec<providers::kalshi::KalshiMarket>)>>>,
+    poly_cache: &Arc<RwLock<HashMap<String, (Instant, Vec<PolyMarket>)>>>,
+    kalshi_cache: &Arc<RwLock<HashMap<String, (Instant, Vec<KalshiMarket>)>>>,
 ) -> anyhow::Result<(Option<String>, Option<String>)> {
     // Strategy:
     // 1) Fetch by sport tag(s) - use SPECIFIC tags to avoid cross-league matches
@@ -356,7 +535,7 @@ async fn discover_for_game(
     };
 
     // Pull Polymarket markets from cache (fetch on miss/expiry)
-    let mut poly_markets: Vec<providers::polymarket::Market> = Vec::new();
+    let mut poly_markets: Vec<PolyMarket> = Vec::new();
     for tag in poly_tags.iter() {
         let tag_key = tag.clone();
         let now = Instant::now();

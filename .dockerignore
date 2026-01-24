@@ -18,6 +18,7 @@ env
 # Rust build artifacts
 target
 rust_core/target
+services/*/target
 
 # Node
 frontend/node_modules

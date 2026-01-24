@@ -1,24 +1,22 @@
 [package]
-name = "market_discovery_rust"
+name = "orchestrator_rust"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 arbees_rust_core = { path = "../arbees_rust_core" }
 tokio = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-redis = { workspace = true }
-strsim = { workspace = true } # For fuzzy matching
-log = { workspace = true }
-env_logger = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 anyhow = { workspace = true }
 dotenv = { workspace = true }
 futures-util = { workspace = true }
-chrono = { workspace = true }
-hostname = { workspace = true }
-
-[[bin]]
-name = "market_discovery"
-path = "src/main.rs"
+strsim = { workspace = true } # For team matching fallback or similarity
+log = { workspace = true }
