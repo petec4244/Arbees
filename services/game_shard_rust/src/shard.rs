@@ -493,6 +493,12 @@ async fn monitor_game(
                 continue;
             }
 
+            // Skip signal generation if game is in overtime (too volatile)
+            if is_overtime(sport_enum, game.period) {
+                debug!("OVERTIME: Skipping signals for {} (period {})", game_id, game.period);
+                continue;
+            }
+
             // Get market prices for this game
             let prices = market_prices.read().await;
             if let Some(game_prices) = prices.get(&game_id) {
@@ -751,6 +757,22 @@ fn parse_sport(sport: &str) -> Option<Sport> {
         "tennis" => Some(Sport::Tennis),
         "mma" => Some(Sport::MMA),
         _ => None,
+    }
+}
+
+/// Check if a game is in overtime based on sport and period
+/// Returns true if the game has exceeded regular periods/innings
+fn is_overtime(sport: Sport, period: u8) -> bool {
+    match sport {
+        Sport::NHL => period > 3,       // Regular NHL: 3 periods
+        Sport::NBA => period > 4,       // Regular NBA: 4 quarters
+        Sport::NFL => period > 4,       // Regular NFL: 4 quarters
+        Sport::NCAAF => period > 4,     // Regular NCAAF: 4 quarters
+        Sport::NCAAB => period > 2,     // Regular NCAAB: 2 halves
+        Sport::MLB => period > 9,       // Regular MLB: 9 innings
+        Sport::MLS | Sport::Soccer => period > 2, // Regular soccer: 2 halves
+        Sport::Tennis => false,         // Tennis doesn't have overtime
+        Sport::MMA => false,            // MMA doesn't have overtime
     }
 }
 
