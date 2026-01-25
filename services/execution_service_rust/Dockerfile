@@ -1,8 +1,8 @@
 FROM rustlang/rust:nightly as builder
 
-WORKDIR /usr/src/app
+WORKDIR /app
 
-# Copy workspace definition
+# Copy workspace files first
 COPY Cargo.toml Cargo.lock ./
 
 # Copy ALL workspace members (Cargo needs to resolve entire workspace)
@@ -16,12 +16,12 @@ COPY services/position_tracker_rust ./services/position_tracker_rust
 COPY services/notification_service_rust ./services/notification_service_rust
 
 # Build specific member
-RUN cargo build --release --bin execution_service_rust
+RUN cargo build --release --package execution_service_rust
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates libssl-dev && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/src/app/target/release/execution_service_rust /usr/local/bin/execution_service_rust
+COPY --from=builder /app/target/release/execution_service_rust /usr/local/bin/execution_service_rust
 
 CMD ["execution_service_rust"]
