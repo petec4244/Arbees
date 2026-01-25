@@ -6,7 +6,9 @@
 //! - Position resolution on market settlement
 
 use parking_lot::RwLock;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyDict;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -204,7 +206,10 @@ impl PositionTracker {
 
         pos.total_fees += fees;
 
-        match (platform.to_lowercase().as_str(), side.to_lowercase().as_str()) {
+        match (
+            platform.to_lowercase().as_str(),
+            side.to_lowercase().as_str(),
+        ) {
             ("kalshi", "yes") => pos.kalshi_yes.add(contracts, price),
             ("kalshi", "no") => pos.kalshi_no.add(contracts, price),
             ("polymarket" | "poly", "yes") => pos.poly_yes.add(contracts, price),
@@ -329,79 +334,82 @@ pub struct PositionSummary {
 // ============================================================================
 
 /// Python wrapper for ArbPosition
-#[pyclass(name = "ArbPosition")]
+#[cfg_attr(feature = "python", pyclass(name = "ArbPosition"))]
 #[derive(Clone)]
 pub struct PyArbPosition {
     inner: ArbPosition,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyArbPosition {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     fn new(market_id: String, description: String) -> Self {
         Self {
             inner: ArbPosition::new(&market_id, &description),
         }
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn market_id(&self) -> &str {
         &self.inner.market_id
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn description(&self) -> &str {
         &self.inner.description
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn status(&self) -> &str {
         &self.inner.status
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn total_contracts(&self) -> f64 {
         self.inner.total_contracts()
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn total_cost(&self) -> f64 {
         self.inner.total_cost()
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn guaranteed_profit(&self) -> f64 {
         self.inner.guaranteed_profit()
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn matched_contracts(&self) -> f64 {
         self.inner.matched_contracts()
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn unmatched_exposure(&self) -> f64 {
         self.inner.unmatched_exposure()
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn realized_pnl(&self) -> Option<f64> {
         self.inner.realized_pnl
     }
 
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     fn total_fees(&self) -> f64 {
         self.inner.total_fees
     }
 
+    #[cfg(feature = "python")]
     fn to_dict(&self, py: Python) -> PyObject {
         let dict = PyDict::new(py);
         dict.set_item("market_id", &self.inner.market_id).unwrap();
-        dict.set_item("description", &self.inner.description).unwrap();
+        dict.set_item("description", &self.inner.description)
+            .unwrap();
         dict.set_item("status", &self.inner.status).unwrap();
         dict.set_item("total_contracts", self.inner.total_contracts())
             .unwrap();
-        dict.set_item("total_cost", self.inner.total_cost()).unwrap();
+        dict.set_item("total_cost", self.inner.total_cost())
+            .unwrap();
         dict.set_item("guaranteed_profit", self.inner.guaranteed_profit())
             .unwrap();
         dict.set_item("unmatched_exposure", self.inner.unmatched_exposure())
@@ -414,27 +422,28 @@ impl PyArbPosition {
 }
 
 /// Python wrapper for PositionTracker
-#[pyclass(name = "PositionTracker")]
+#[cfg_attr(feature = "python", pyclass(name = "PositionTracker"))]
 pub struct PyPositionTracker {
     inner: Arc<RwLock<PositionTracker>>,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyPositionTracker {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(PositionTracker::new())),
         }
     }
 
-    #[staticmethod]
+    #[cfg_attr(feature = "python", staticmethod)]
     fn load(path: Option<&str>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PositionTracker::load(path))),
         }
     }
 
+    #[cfg(feature = "python")]
     fn save(&self, path: Option<&str>) -> PyResult<()> {
         self.inner
             .read()
@@ -452,21 +461,29 @@ impl PyPositionTracker {
         price: f64,
         fees: f64,
     ) {
-        self.inner
-            .write()
-            .record_fill(market_id, description, platform, side, contracts, price, fees);
+        self.inner.write().record_fill(
+            market_id,
+            description,
+            platform,
+            side,
+            contracts,
+            price,
+            fees,
+        );
     }
 
     fn get_position(&self, market_id: &str) -> Option<PyArbPosition> {
-        self.inner.read().get_position(market_id).map(|p| PyArbPosition {
-            inner: p.clone(),
-        })
+        self.inner
+            .read()
+            .get_position(market_id)
+            .map(|p| PyArbPosition { inner: p.clone() })
     }
 
     fn resolve_position(&self, market_id: &str, yes_won: bool) -> Option<f64> {
         self.inner.write().resolve_position(market_id, yes_won)
     }
 
+    #[cfg(feature = "python")]
     fn summary(&self, py: Python) -> PyObject {
         let summary = self.inner.read().summary();
         let dict = PyDict::new(py);
@@ -500,7 +517,9 @@ impl PyPositionTracker {
             .read()
             .open_positions()
             .iter()
-            .map(|p| PyArbPosition { inner: (*p).clone() })
+            .map(|p| PyArbPosition {
+                inner: (*p).clone(),
+            })
             .collect()
     }
 }

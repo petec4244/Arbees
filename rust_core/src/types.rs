@@ -1,11 +1,14 @@
 //! Native Rust types with PyO3 bindings for zero-copy Python interop.
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+
 use serde::{Deserialize, Serialize};
 
 /// Supported sports
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Sport {
     NFL,
     NBA,
@@ -14,47 +17,49 @@ pub enum Sport {
     NCAAF,
     NCAAB,
     MLS,
+    #[serde(rename = "SOCCER")]
     Soccer,
     Tennis,
     MMA,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl Sport {
     /// Get total regulation time in seconds
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     pub fn total_seconds(&self) -> u32 {
         match self {
-            Sport::NFL | Sport::NCAAF => 3600,      // 60 min (4 x 15 min quarters)
-            Sport::NBA => 2880,                      // 48 min (4 x 12 min quarters)
-            Sport::NCAAB => 2400,                    // 40 min (2 x 20 min halves)
-            Sport::NHL => 3600,                      // 60 min (3 x 20 min periods)
-            Sport::MLB => 10800,                     // ~3 hours avg (9 innings)
-            Sport::MLS | Sport::Soccer => 5400,     // 90 min (2 x 45 min halves)
-            Sport::Tennis => 7200,                   // ~2 hours avg
-            Sport::MMA => 1500,                      // 25 min (5 x 5 min rounds)
+            Sport::NFL | Sport::NCAAF => 3600,  // 60 min (4 x 15 min quarters)
+            Sport::NBA => 2880,                 // 48 min (4 x 12 min quarters)
+            Sport::NCAAB => 2400,               // 40 min (2 x 20 min halves)
+            Sport::NHL => 3600,                 // 60 min (3 x 20 min periods)
+            Sport::MLB => 10800,                // ~3 hours avg (9 innings)
+            Sport::MLS | Sport::Soccer => 5400, // 90 min (2 x 45 min halves)
+            Sport::Tennis => 7200,              // ~2 hours avg
+            Sport::MMA => 1500,                 // 25 min (5 x 5 min rounds)
         }
     }
 
     /// Get number of periods
-    #[getter]
+    #[cfg_attr(feature = "python", getter)]
     pub fn periods(&self) -> u8 {
         match self {
-            Sport::NFL | Sport::NCAAF => 4,          // 4 quarters
-            Sport::NBA => 4,                          // 4 quarters
-            Sport::NCAAB => 2,                        // 2 halves
-            Sport::NHL => 3,                          // 3 periods
-            Sport::MLB => 9,                          // 9 innings
-            Sport::MLS | Sport::Soccer => 2,         // 2 halves
-            Sport::Tennis => 3,                       // Best of 3 or 5 sets
-            Sport::MMA => 5,                          // Max 5 rounds
+            Sport::NFL | Sport::NCAAF => 4,  // 4 quarters
+            Sport::NBA => 4,                 // 4 quarters
+            Sport::NCAAB => 2,               // 2 halves
+            Sport::NHL => 3,                 // 3 periods
+            Sport::MLB => 9,                 // 9 innings
+            Sport::MLS | Sport::Soccer => 2, // 2 halves
+            Sport::Tennis => 3,              // Best of 3 or 5 sets
+            Sport::MMA => 5,                 // Max 5 rounds
         }
     }
 }
 
 /// Platform identifier
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Platform {
     Kalshi,
     Polymarket,
@@ -63,41 +68,41 @@ pub enum Platform {
 }
 
 /// Current game state
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GameState {
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub game_id: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub sport: Sport,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub home_team: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub away_team: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub home_score: u16,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub away_score: u16,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub period: u8,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub time_remaining_seconds: u32,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub possession: Option<String>,
     // NFL/NCAAF specific
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub down: Option<u8>,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub yards_to_go: Option<u8>,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub yard_line: Option<u8>,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub is_redzone: bool,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl GameState {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         game_id: String,
@@ -150,28 +155,28 @@ impl GameState {
 }
 
 /// Market price snapshot
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MarketPrice {
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub platform: Platform,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub market_id: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub yes_bid: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub yes_ask: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub volume: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub liquidity: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub timestamp_ms: i64,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl MarketPrice {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     pub fn new(
         platform: Platform,
         market_id: String,
@@ -214,44 +219,44 @@ impl MarketPrice {
 }
 
 /// Arbitrage opportunity
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArbitrageOpportunity {
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub opportunity_type: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub platform_buy: Platform,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub platform_sell: Platform,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub event_id: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub sport: Sport,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub market_title: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub edge_pct: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub buy_price: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub sell_price: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub implied_profit: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub liquidity_buy: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub liquidity_sell: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub is_risk_free: bool,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub description: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub model_probability: Option<f64>,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl ArbitrageOpportunity {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         opportunity_type: String,
@@ -303,36 +308,36 @@ impl ArbitrageOpportunity {
 }
 
 /// Trading signal generated from analysis
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TradingSignal {
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub signal_type: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub game_id: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub sport: Sport,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub team: String,
-    #[pyo3(get, set)]
-    pub direction: String,  // "BUY" or "SELL"
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
+    pub direction: String, // "BUY" or "SELL"
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub model_prob: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub market_prob: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub edge_pct: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub confidence: f64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub reason: String,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub timestamp_ms: i64,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl TradingSignal {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         signal_type: String,

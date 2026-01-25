@@ -6,7 +6,9 @@
 //! - Kalshi fee calculation
 
 use parking_lot::RwLock;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyDict;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,8 +92,10 @@ impl AtomicOrderbook {
     /// Store new orderbook values atomically.
     #[inline]
     pub fn store(&self, yes_ask: u16, no_ask: u16, yes_size: u16, no_size: u16) {
-        self.packed
-            .store(pack_orderbook(yes_ask, no_ask, yes_size, no_size), Ordering::SeqCst);
+        self.packed.store(
+            pack_orderbook(yes_ask, no_ask, yes_size, no_size),
+            Ordering::SeqCst,
+        );
     }
 
     /// Update only the YES side (ask and size).
@@ -191,7 +195,8 @@ impl GlobalState {
     pub fn new() -> Self {
         // Initialize 1024 AtomicMarketState instances
         let markets: Vec<AtomicMarketState> = (0..1024).map(|_| AtomicMarketState::new()).collect();
-        let markets_array: Box<[AtomicMarketState; 1024]> = markets.into_boxed_slice().try_into().unwrap();
+        let markets_array: Box<[AtomicMarketState; 1024]> =
+            markets.into_boxed_slice().try_into().unwrap();
 
         let mut metadata_vec = Vec::with_capacity(1024);
         metadata_vec.resize_with(1024, || None);
@@ -258,7 +263,14 @@ impl GlobalState {
     }
 
     /// Update Kalshi orderbook for a market.
-    pub fn update_kalshi(&self, market_id: u16, yes_ask: u16, no_ask: u16, yes_size: u16, no_size: u16) {
+    pub fn update_kalshi(
+        &self,
+        market_id: u16,
+        yes_ask: u16,
+        no_ask: u16,
+        yes_size: u16,
+        no_size: u16,
+    ) {
         if market_id < 1024 {
             self.markets[market_id as usize]
                 .kalshi
@@ -267,7 +279,14 @@ impl GlobalState {
     }
 
     /// Update Polymarket orderbook for a market.
-    pub fn update_poly(&self, market_id: u16, yes_ask: u16, no_ask: u16, yes_size: u16, no_size: u16) {
+    pub fn update_poly(
+        &self,
+        market_id: u16,
+        yes_ask: u16,
+        no_ask: u16,
+        yes_size: u16,
+        no_size: u16,
+    ) {
         if market_id < 1024 {
             self.markets[market_id as usize]
                 .poly
@@ -298,14 +317,14 @@ impl GlobalState {
 // ============================================================================
 
 /// Python wrapper for AtomicOrderbook.
-#[pyclass(name = "AtomicOrderbook")]
+#[cfg_attr(feature = "python", pyclass(name = "AtomicOrderbook"))]
 pub struct PyAtomicOrderbook {
     inner: AtomicOrderbook,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyAtomicOrderbook {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     fn new() -> Self {
         Self {
             inner: AtomicOrderbook::new(),
@@ -334,14 +353,14 @@ impl PyAtomicOrderbook {
 }
 
 /// Python wrapper for GlobalState.
-#[pyclass(name = "GlobalState")]
+#[cfg_attr(feature = "python", pyclass(name = "GlobalState"))]
 pub struct PyGlobalState {
     inner: Arc<GlobalState>,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyGlobalState {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     fn new() -> Self {
         Self {
             inner: Arc::new(GlobalState::new()),
@@ -376,11 +395,13 @@ impl PyGlobalState {
     }
 
     /// Get metadata for a market as a dict.
+    #[cfg(feature = "python")]
     fn get_metadata(&self, py: Python, market_id: u16) -> Option<PyObject> {
         self.inner.get_metadata(market_id).map(|m| {
             let dict = PyDict::new(py);
             dict.set_item("kalshi_ticker", &m.kalshi_ticker).unwrap();
-            dict.set_item("poly_condition_id", &m.poly_condition_id).unwrap();
+            dict.set_item("poly_condition_id", &m.poly_condition_id)
+                .unwrap();
             dict.set_item("description", &m.description).unwrap();
             dict.set_item("league", &m.league).unwrap();
             dict.into()
@@ -388,13 +409,22 @@ impl PyGlobalState {
     }
 
     /// Update Kalshi orderbook.
-    fn update_kalshi(&self, market_id: u16, yes_ask: u16, no_ask: u16, yes_size: u16, no_size: u16) {
-        self.inner.update_kalshi(market_id, yes_ask, no_ask, yes_size, no_size);
+    fn update_kalshi(
+        &self,
+        market_id: u16,
+        yes_ask: u16,
+        no_ask: u16,
+        yes_size: u16,
+        no_size: u16,
+    ) {
+        self.inner
+            .update_kalshi(market_id, yes_ask, no_ask, yes_size, no_size);
     }
 
     /// Update Polymarket orderbook.
     fn update_poly(&self, market_id: u16, yes_ask: u16, no_ask: u16, yes_size: u16, no_size: u16) {
-        self.inner.update_poly(market_id, yes_ask, no_ask, yes_size, no_size);
+        self.inner
+            .update_poly(market_id, yes_ask, no_ask, yes_size, no_size);
     }
 
     /// Get both orderbooks as ((k_yes, k_no, k_yes_sz, k_no_sz), (p_yes, p_no, p_yes_sz, p_no_sz))
@@ -409,7 +439,7 @@ impl PyGlobalState {
 }
 
 /// Calculate Kalshi fee for a price (Python function).
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn py_kalshi_fee_cents(price: u16) -> u16 {
     kalshi_fee_cents(price)
 }

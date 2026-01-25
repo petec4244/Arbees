@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.75-bullseye as builder
+FROM rustlang/rust:nightly as builder
 
 WORKDIR /app
 
@@ -7,18 +7,23 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY rust_core ./rust_core
 COPY services/arbees_rust_core ./services/arbees_rust_core
+COPY services/game_shard_rust ./services/game_shard_rust
+COPY services/market_discovery_rust ./services/market_discovery_rust
+COPY services/orchestrator_rust ./services/orchestrator_rust
+COPY services/execution_service_rust ./services/execution_service_rust
 COPY services/signal_processor_rust ./services/signal_processor_rust
+COPY services/position_tracker_rust ./services/position_tracker_rust
 
 # Build
 RUN cargo build --release --package signal_processor_rust
 
 # Runtime stage
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl1.1 \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

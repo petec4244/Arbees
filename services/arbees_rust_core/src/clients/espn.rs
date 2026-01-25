@@ -7,7 +7,7 @@ pub struct EspnClient {
     client: Client,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Game {
     pub id: String,
     pub name: String,
@@ -17,6 +17,18 @@ pub struct Game {
     pub away_team: String,
     pub home_abbr: String,
     pub away_abbr: String,
+    // Game state
+    pub home_score: u16,
+    pub away_score: u16,
+    pub period: u8,
+    pub time_remaining_seconds: u32,
+    pub status: String,
+    pub possession: Option<String>,
+    // Football-specific
+    pub down: Option<u8>,
+    pub yards_to_go: Option<u8>,
+    pub yard_line: Option<u8>,
+    pub is_redzone: bool,
 }
 
 impl EspnClient {
@@ -30,8 +42,11 @@ impl EspnClient {
     }
 
     pub async fn get_games(&self, sport: &str, league: &str) -> Result<Vec<Game>> {
-        let url = format!("http://site.api.espn.com/apis/site/v2/sports/{}/{}/scoreboard", sport, league);
-        
+        let url = format!(
+            "http://site.api.espn.com/apis/site/v2/sports/{}/{}/scoreboard",
+            sport, league
+        );
+
         let resp = self.client.get(&url).send().await?;
         let data: serde_json::Value = resp.json().await?;
 
@@ -46,27 +61,61 @@ impl EspnClient {
 
                 let competitions = &event["competitions"][0];
                 let competitors = competitions["competitors"].as_array();
-                
+                let situation = &competitions["situation"];
+                let status_obj = &event["status"];
+
                 let mut home_team = String::new();
                 let mut away_team = String::new();
                 let mut home_abbr = String::new();
                 let mut away_abbr = String::new();
+                let mut home_score: u16 = 0;
+                let mut away_score: u16 = 0;
+                let mut possession: Option<String> = None;
 
                 if let Some(comps) = competitors {
                     for comp in comps {
                         let team = &comp["team"];
                         let team_name = team["displayName"].as_str().unwrap_or_default().to_string();
-                        let team_abbr = team["abbreviation"].as_str().unwrap_or_default().to_string();
-                        
+                        let team_abbr =
+                            team["abbreviation"].as_str().unwrap_or_default().to_string();
+                        let score = comp["score"]
+                            .as_str()
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .unwrap_or(0);
+                        let has_possession = comp["possession"].as_bool().unwrap_or(false);
+
                         if comp["homeAway"].as_str() == Some("home") {
-                            home_team = team_name;
+                            home_team = team_name.clone();
                             home_abbr = team_abbr;
+                            home_score = score;
+                            if has_possession {
+                                possession = Some(team_name);
+                            }
                         } else {
-                            away_team = team_name;
+                            away_team = team_name.clone();
                             away_abbr = team_abbr;
+                            away_score = score;
+                            if has_possession {
+                                possession = Some(team_name);
+                            }
                         }
                     }
                 }
+
+                // Parse period and time
+                let period = status_obj["period"].as_u64().unwrap_or(1) as u8;
+                let clock_str = status_obj["displayClock"].as_str().unwrap_or("0:00");
+                let time_remaining_seconds = parse_clock(clock_str);
+                let status = status_obj["type"]["name"]
+                    .as_str()
+                    .unwrap_or("scheduled")
+                    .to_string();
+
+                // Football-specific situation
+                let down = situation["down"].as_u64().map(|d| d as u8);
+                let yards_to_go = situation["distance"].as_u64().map(|d| d as u8);
+                let yard_line = situation["yardLine"].as_u64().map(|y| y as u8);
+                let is_redzone = situation["isRedZone"].as_bool().unwrap_or(false);
 
                 games.push(Game {
                     id,
@@ -77,10 +126,34 @@ impl EspnClient {
                     away_team,
                     home_abbr,
                     away_abbr,
+                    home_score,
+                    away_score,
+                    period,
+                    time_remaining_seconds,
+                    status,
+                    possession,
+                    down,
+                    yards_to_go,
+                    yard_line,
+                    is_redzone,
                 });
             }
         }
 
         Ok(games)
+    }
+}
+
+/// Parse clock string like "12:34" or "5:00" into seconds
+fn parse_clock(clock: &str) -> u32 {
+    let parts: Vec<&str> = clock.split(':').collect();
+    match parts.len() {
+        2 => {
+            let mins = parts[0].parse::<u32>().unwrap_or(0);
+            let secs = parts[1].parse::<u32>().unwrap_or(0);
+            mins * 60 + secs
+        }
+        1 => parts[0].parse::<u32>().unwrap_or(0),
+        _ => 0,
     }
 }

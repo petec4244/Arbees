@@ -291,6 +291,54 @@ impl PositionTrackerState {
 
             self.open_positions.push(position);
 
+            // INSERT into paper_trades
+            let sport_str = match result.sport {
+                Sport::NBA => "nba",
+                Sport::NCAAB => "ncaab",
+                Sport::NFL => "nfl",
+                Sport::NCAAF => "ncaaf",
+                Sport::NHL => "nhl",
+                Sport::MLB => "mlb",
+                Sport::MLS => "mls",
+                Sport::Soccer => "soccer",
+                Sport::Tennis => "tennis",
+                Sport::MMA => "mma",
+            };
+            let platform_str = match result.platform {
+                Platform::Kalshi => "kalshi",
+                Platform::Polymarket => "polymarket",
+                Platform::Paper => "paper",
+            };
+            let side_str = match side {
+                TradeSide::Buy => "buy",
+                TradeSide::Sell => "sell",
+            };
+
+            if let Err(e) = sqlx::query(
+                r#"
+                INSERT INTO paper_trades (trade_id, signal_id, game_id, sport, platform, market_id, market_title, side, entry_price, size, time, entry_time, status)
+                VALUES ($1, $2, $3, $4::sport_enum, $5::platform_enum, $6, $7, $8::trade_side_enum, $9, $10, $11, $11, 'open')
+                "#,
+            )
+            .bind(&trade_id)
+            .bind(&result.signal_id)
+            .bind(&result.game_id)
+            .bind(sport_str)
+            .bind(platform_str)
+            .bind(&result.market_id)
+            .bind(result.contract_team.as_deref().unwrap_or(""))
+            .bind(side_str)
+            .bind(result.avg_price)
+            .bind(result.filled_qty)
+            .bind(result.executed_at)
+            .execute(&self.pool)
+            .await
+            {
+                error!("Failed to insert paper_trade: {}", e);
+            } else {
+                info!("Inserted paper_trade {} into database", trade_id);
+            }
+
             // Emit position update
             let update = PositionUpdate {
                 position_id: Uuid::new_v4().to_string(),
@@ -625,7 +673,7 @@ impl PositionTrackerState {
             r#"
             SELECT market_id, yes_bid, yes_ask, time
             FROM market_prices
-            WHERE market_id = $1 AND platform = $2
+            WHERE market_id = $1 AND platform = $2::platform_enum
             ORDER BY time DESC
             LIMIT 1
             "#,

@@ -6,6 +6,7 @@
 //! - High-precision timing
 
 use crate::atomic_orderbook::kalshi_fee_cents;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -151,9 +152,9 @@ impl ArbType {
 #[derive(Debug, Clone)]
 pub struct FastExecutionRequest {
     pub market_id: u16,
-    pub yes_price: u16,   // Price in cents
+    pub yes_price: u16, // Price in cents
     pub no_price: u16,
-    pub yes_size: u16,    // Size in cents (dollar amount × 100)
+    pub yes_size: u16, // Size in cents (dollar amount × 100)
     pub no_size: u16,
     pub arb_type: ArbType,
     pub detected_ns: u64, // Timestamp when arb was detected
@@ -239,14 +240,14 @@ impl FastExecutionRequest {
 // ============================================================================
 
 /// Python wrapper for ExecutionTracker.
-#[pyclass(name = "ExecutionTracker")]
+#[cfg_attr(feature = "python", pyclass(name = "ExecutionTracker"))]
 pub struct PyExecutionTracker {
     inner: ExecutionTracker,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyExecutionTracker {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     fn new() -> Self {
         Self {
             inner: ExecutionTracker::new(),
@@ -290,29 +291,29 @@ impl PyExecutionTracker {
 }
 
 /// Python wrapper for FastExecutionRequest.
-#[pyclass(name = "FastExecutionRequest")]
+#[cfg_attr(feature = "python", pyclass(name = "FastExecutionRequest"))]
 #[derive(Clone)]
 pub struct PyFastExecutionRequest {
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub market_id: u16,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub yes_price: u16,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub no_price: u16,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub yes_size: u16,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub no_size: u16,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub arb_type: u8,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub detected_ns: u64,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyFastExecutionRequest {
-    #[new]
-    #[pyo3(signature = (market_id, yes_price, no_price, yes_size, no_size, arb_type, detected_ns = 0))]
+    #[cfg_attr(feature = "python", new)]
+    #[cfg_attr(feature = "python", pyo3(signature = (market_id, yes_price, no_price, yes_size, no_size, arb_type, detected_ns = 0)))]
     fn new(
         market_id: u16,
         yes_price: u16,
@@ -446,8 +447,6 @@ mod tests {
 
     #[test]
     fn test_concurrent_acquire() {
-        use std::sync::atomic::AtomicU64;
-
         let tracker = Arc::new(ExecutionTracker::new());
         let acquired = Arc::new(AtomicU64::new(0));
 
@@ -488,8 +487,8 @@ mod tests {
         // PolyYes=40, KalshiNo=55, fee=2 -> cost=97, profit=3
         let req = FastExecutionRequest::new(
             0,
-            40,  // yes_price
-            55,  // no_price
+            40,   // yes_price
+            55,   // no_price
             1000, // yes_size
             800,  // no_size
             ArbType::PolyYesKalshiNo,
@@ -504,15 +503,7 @@ mod tests {
     #[test]
     fn test_kalshi_yes_poly_no_profit() {
         // KalshiYes=40 (fee~2), PolyNo=55 -> cost=97, profit=3
-        let req = FastExecutionRequest::new(
-            0,
-            40,
-            55,
-            1000,
-            800,
-            ArbType::KalshiYesPolyNo,
-            0,
-        );
+        let req = FastExecutionRequest::new(0, 40, 55, 1000, 800, ArbType::KalshiYesPolyNo, 0);
 
         assert_eq!(req.profit_cents(), 3);
     }
@@ -520,15 +511,7 @@ mod tests {
     #[test]
     fn test_poly_only_profit() {
         // PolyYes=45, PolyNo=50 -> cost=95, profit=5 (no fees)
-        let req = FastExecutionRequest::new(
-            0,
-            45,
-            50,
-            1000,
-            1000,
-            ArbType::PolyOnly,
-            0,
-        );
+        let req = FastExecutionRequest::new(0, 45, 50, 1000, 1000, ArbType::PolyOnly, 0);
 
         assert_eq!(req.profit_cents(), 5);
         assert_eq!(req.estimated_fee_cents(), 0);
@@ -537,15 +520,7 @@ mod tests {
     #[test]
     fn test_kalshi_only_profit() {
         // KalshiYes=40 (fee~2), KalshiNo=50 (fee~2) -> cost=94, profit=6
-        let req = FastExecutionRequest::new(
-            0,
-            40,
-            50,
-            1000,
-            1000,
-            ArbType::KalshiOnly,
-            0,
-        );
+        let req = FastExecutionRequest::new(0, 40, 50, 1000, 1000, ArbType::KalshiOnly, 0);
 
         // fee(40) = ceil(7*40*60/10000) = ceil(1.68) = 2
         // fee(50) = ceil(7*50*50/10000) = ceil(1.75) = 2

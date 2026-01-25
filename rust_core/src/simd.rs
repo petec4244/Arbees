@@ -12,6 +12,7 @@
 //! - Bit 3: KalshiOnly (buy YES + NO on Kalshi)
 
 use crate::atomic_orderbook::kalshi_fee_cents;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 #[cfg(feature = "simd")]
@@ -138,10 +139,7 @@ pub fn check_arbs_scalar(
 /// Markets with mask == 0 are filtered out.
 ///
 /// Input format: Vec<(kalshi_yes, kalshi_no, poly_yes, poly_no)>
-pub fn batch_scan_arbs(
-    markets: &[(u16, u16, u16, u16)],
-    threshold_cents: u16,
-) -> Vec<(usize, u8)> {
+pub fn batch_scan_arbs(markets: &[(u16, u16, u16, u16)], threshold_cents: u16) -> Vec<(usize, u8)> {
     markets
         .iter()
         .enumerate()
@@ -204,8 +202,8 @@ pub fn decode_arb_mask(mask: u8) -> Vec<&'static str> {
 // ============================================================================
 
 /// Check for arbs on a single market (Python function).
-#[pyfunction]
-#[pyo3(name = "simd_check_arbs")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "simd_check_arbs"))]
 pub fn py_simd_check_arbs(
     kalshi_yes: u16,
     kalshi_no: u16,
@@ -217,8 +215,8 @@ pub fn py_simd_check_arbs(
 }
 
 /// Batch scan multiple markets (Python function).
-#[pyfunction]
-#[pyo3(name = "simd_batch_scan")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "simd_batch_scan"))]
 pub fn py_simd_batch_scan(
     markets: Vec<(u16, u16, u16, u16)>,
     threshold_cents: u16,
@@ -227,8 +225,8 @@ pub fn py_simd_batch_scan(
 }
 
 /// Calculate profit for a specific arb type (Python function).
-#[pyfunction]
-#[pyo3(name = "simd_calculate_profit")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "simd_calculate_profit"))]
 pub fn py_simd_calculate_profit(
     kalshi_yes: u16,
     kalshi_no: u16,
@@ -240,10 +238,13 @@ pub fn py_simd_calculate_profit(
 }
 
 /// Decode arb mask to list of strings (Python function).
-#[pyfunction]
-#[pyo3(name = "simd_decode_mask")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "simd_decode_mask"))]
 pub fn py_simd_decode_mask(mask: u8) -> Vec<String> {
-    decode_arb_mask(mask).into_iter().map(String::from).collect()
+    decode_arb_mask(mask)
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 // ============================================================================

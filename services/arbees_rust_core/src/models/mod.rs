@@ -52,6 +52,68 @@ impl Sport {
             Sport::MMA => "MMA",
         }
     }
+
+    /// Total game duration in seconds (regulation time)
+    pub fn total_seconds(&self) -> u32 {
+        match self {
+            Sport::NFL | Sport::NCAAF => 3600,      // 60 minutes
+            Sport::NBA => 2880,                      // 48 minutes
+            Sport::NCAAB => 2400,                    // 40 minutes
+            Sport::NHL => 3600,                      // 60 minutes
+            Sport::MLB => 32400,                     // ~9 innings (estimate)
+            Sport::MLS | Sport::Soccer => 5400,     // 90 minutes
+            Sport::Tennis => 7200,                   // Varies, ~2 hours avg
+            Sport::MMA => 900,                       // 3x5 minute rounds
+        }
+    }
+}
+
+// ============================================================================
+// Game State (for win probability calculation)
+// ============================================================================
+
+/// Game state for win probability calculation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameState {
+    pub game_id: String,
+    pub sport: Sport,
+    pub home_team: String,
+    pub away_team: String,
+    pub home_score: u16,
+    pub away_score: u16,
+    pub period: u8,
+    pub time_remaining_seconds: u32,
+    pub possession: Option<String>,
+    pub down: Option<u8>,
+    pub yards_to_go: Option<u8>,
+    pub yard_line: Option<u8>,
+    pub is_redzone: bool,
+}
+
+impl GameState {
+    /// Calculate total time remaining in the game (in seconds)
+    pub fn total_time_remaining(&self) -> u32 {
+        let period_seconds = match self.sport {
+            Sport::NFL | Sport::NCAAF => 900,   // 15 minutes per quarter
+            Sport::NBA => 720,                   // 12 minutes per quarter
+            Sport::NCAAB => 1200,                // 20 minutes per half
+            Sport::NHL => 1200,                  // 20 minutes per period
+            Sport::MLB => 0,                     // Innings-based
+            Sport::MLS | Sport::Soccer => 2700, // 45 minutes per half
+            Sport::Tennis => 0,                  // Sets-based
+            Sport::MMA => 300,                   // 5 minutes per round
+        };
+
+        let periods_remaining = match self.sport {
+            Sport::NFL | Sport::NCAAF | Sport::NBA => 4u32.saturating_sub(self.period as u32),
+            Sport::NCAAB | Sport::MLS | Sport::Soccer => 2u32.saturating_sub(self.period as u32),
+            Sport::NHL => 3u32.saturating_sub(self.period as u32),
+            Sport::MMA => 3u32.saturating_sub(self.period as u32),
+            Sport::MLB | Sport::Tennis => 0,
+        };
+
+        self.time_remaining_seconds + (periods_remaining * period_seconds)
+    }
 }
 
 // ============================================================================

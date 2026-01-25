@@ -117,7 +117,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
       SHARD_ID: shard-1
-      LOG_LEVEL: INFO
+      RUST_LOG: info
       POLL_INTERVAL: ${POLL_INTERVAL:-1.0}
       CRUNCH_TIME_INTERVAL: ${CRUNCH_TIME_INTERVAL:-0.5}
       HALFTIME_INTERVAL: ${HALFTIME_INTERVAL:-30.0}
@@ -211,7 +211,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
+      RUST_LOG: info
       PAPER_TRADING: "1" # Set to "0" for real trading
       INITIAL_BANKROLL: "1000"
       MIN_EDGE_PCT: "2.0"

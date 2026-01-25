@@ -17,14 +17,16 @@ mod win_prob;
 
 // New modules from terauss integration
 pub mod atomic_orderbook;
-pub mod simd;
 pub mod circuit_breaker;
 pub mod execution;
-pub mod position_tracker;
-pub mod team_cache;
 pub mod league_config;
+pub mod position_tracker;
+pub mod simd;
+pub mod team_cache;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -40,7 +42,7 @@ pub use win_prob::*;
 /// At expiry, exactly ONE side pays $1.00, guaranteeing profit.
 ///
 /// Returns a list of `ArbitrageOpportunity` objects.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 fn find_cross_market_arbitrage(
     market_a: &MarketPrice,
     market_b: &MarketPrice,
@@ -59,7 +61,7 @@ fn find_cross_market_arbitrage(
     if total_cost_1 < 1.0 {
         let profit = 1.0 - total_cost_1;
         let edge_pct = profit * 100.0;
-        
+
         let mut opp = ArbitrageOpportunity::new(
             "cross_platform_arb".to_string(),
             market_a.platform,
@@ -68,17 +70,15 @@ fn find_cross_market_arbitrage(
             sport,
             market_title.clone(),
             edge_pct,
-            market_a.yes_ask,   // Buy YES at ask
-            no_ask_b,           // Buy NO at ask
+            market_a.yes_ask, // Buy YES at ask
+            no_ask_b,         // Buy NO at ask
             market_a.liquidity,
             market_b.liquidity,
             true,
         );
         opp.description = format!(
             "Buy YES {:?} @ {:.3} + Buy NO {:?} @ {:.3} = {:.3} < 1.00 (profit: {:.3})",
-            market_a.platform, market_a.yes_ask,
-            market_b.platform, no_ask_b,
-            total_cost_1, profit
+            market_a.platform, market_a.yes_ask, market_b.platform, no_ask_b, total_cost_1, profit
         );
         opportunities.push(opp);
     }
@@ -88,7 +88,7 @@ fn find_cross_market_arbitrage(
     if total_cost_2 < 1.0 {
         let profit = 1.0 - total_cost_2;
         let edge_pct = profit * 100.0;
-        
+
         let mut opp = ArbitrageOpportunity::new(
             "cross_platform_arb".to_string(),
             market_b.platform,
@@ -97,17 +97,15 @@ fn find_cross_market_arbitrage(
             sport,
             market_title.clone(),
             edge_pct,
-            market_b.yes_ask,   // Buy YES at ask
-            no_ask_a,           // Buy NO at ask
+            market_b.yes_ask, // Buy YES at ask
+            no_ask_a,         // Buy NO at ask
             market_b.liquidity,
             market_a.liquidity,
             true,
         );
         opp.description = format!(
             "Buy YES {:?} @ {:.3} + Buy NO {:?} @ {:.3} = {:.3} < 1.00 (profit: {:.3})",
-            market_b.platform, market_b.yes_ask,
-            market_a.platform, no_ask_a,
-            total_cost_2, profit
+            market_b.platform, market_b.yes_ask, market_a.platform, no_ask_a, total_cost_2, profit
         );
         opportunities.push(opp);
     }
@@ -121,7 +119,7 @@ fn find_cross_market_arbitrage(
 /// Buy BOTH YES and NO, guaranteed $1.00 payout at expiry.
 ///
 /// This is rare but happens during market inefficiencies.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 fn find_same_platform_arbitrage(
     market: &MarketPrice,
     event_id: String,
@@ -130,11 +128,11 @@ fn find_same_platform_arbitrage(
 ) -> Option<ArbitrageOpportunity> {
     let no_ask = 1.0 - market.yes_bid;
     let total_cost = market.yes_ask + no_ask;
-    
+
     if total_cost < 1.0 {
         let profit = 1.0 - total_cost;
         let edge_pct = profit * 100.0;
-        
+
         let mut opp = ArbitrageOpportunity::new(
             "same_platform_arb".to_string(),
             market.platform,
@@ -155,14 +153,14 @@ fn find_same_platform_arbitrage(
         );
         return Some(opp);
     }
-    
+
     None
 }
 
 /// Find model edge opportunities comparing model probability to market prices.
 ///
 /// Generates signals when model probability significantly differs from market prices.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 fn find_model_edges(
     market: &MarketPrice,
     model_prob: f64,
@@ -182,13 +180,13 @@ fn find_model_edges(
             let mut opp = ArbitrageOpportunity::new(
                 "model_edge_yes".to_string(),
                 market.platform,
-                Platform::Sportsbook,  // Represents model
+                Platform::Sportsbook, // Represents model
                 event_id.clone(),
                 sport,
                 market_title.clone(),
                 edge_pct,
-                market.yes_ask,  // Buy at ask
-                model_prob,      // "Sell" to model at fair value
+                market.yes_ask, // Buy at ask
+                model_prob,     // "Sell" to model at fair value
                 market.liquidity,
                 0.0,
                 false,
@@ -239,7 +237,7 @@ fn find_model_edges(
 }
 
 /// Detect lagging/stale markets that haven't updated recently.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 fn detect_lagging_market(
     market: &MarketPrice,
     current_time_ms: i64,
@@ -279,8 +277,8 @@ fn detect_lagging_market(
 /// Calculate win probability for a team.
 ///
 /// Returns probability (0.0 to 1.0) that the specified team wins.
-#[pyfunction]
-#[pyo3(name = "calculate_win_probability")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "calculate_win_probability"))]
 fn py_calculate_win_probability(state: &GameState, for_home: bool) -> f64 {
     win_prob::calculate_win_probability(state, for_home)
 }
@@ -288,15 +286,15 @@ fn py_calculate_win_probability(state: &GameState, for_home: bool) -> f64 {
 /// Batch calculate win probabilities for multiple game states.
 ///
 /// Uses parallel processing for optimal performance.
-#[pyfunction]
-#[pyo3(name = "batch_calculate_win_probs")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "batch_calculate_win_probs"))]
 fn py_batch_calculate_win_probs(states: Vec<GameState>, for_home: bool) -> Vec<f64> {
     win_prob::batch_calculate_win_probs(&states, for_home)
 }
 
 /// Calculate win probability change from a play.
-#[pyfunction]
-#[pyo3(name = "calculate_win_prob_delta")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "calculate_win_prob_delta"))]
 fn py_calculate_win_prob_delta(
     old_state: &GameState,
     new_state: &GameState,
@@ -306,14 +304,14 @@ fn py_calculate_win_prob_delta(
 }
 
 /// Calculate expected points from NFL field position.
-#[pyfunction]
-#[pyo3(name = "expected_points")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "expected_points"))]
 fn py_expected_points(yard_line: u8, down: u8, yards_to_go: u8) -> f64 {
     win_prob::expected_points_from_field_position(yard_line, down, yards_to_go)
 }
 
 /// Generate trading signal from win probability change.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 fn generate_signal_from_prob_change(
     game_id: String,
     sport: Sport,
@@ -334,7 +332,11 @@ fn generate_signal_from_prob_change(
         return None;
     }
 
-    let direction = if new_prob > market_prob { "BUY" } else { "SELL" };
+    let direction = if new_prob > market_prob {
+        "BUY"
+    } else {
+        "SELL"
+    };
     let confidence = (prob_change.abs() * 50.0).min(1.0); // Scale to 0-1
 
     let reason = format!(
@@ -360,7 +362,7 @@ fn generate_signal_from_prob_change(
 }
 
 /// Scan multiple market pairs for arbitrage opportunities in parallel.
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 fn batch_scan_arbitrage(
     markets: HashMap<String, Vec<MarketPrice>>,
     sport: Sport,
@@ -369,7 +371,7 @@ fn batch_scan_arbitrage(
         .par_iter()
         .flat_map(|(event_id, prices)| {
             let mut opps = Vec::new();
-            
+
             // Cross-platform arbitrage (all pairs)
             for i in 0..prices.len() {
                 for j in (i + 1)..prices.len() {
@@ -382,7 +384,7 @@ fn batch_scan_arbitrage(
                     ));
                 }
             }
-            
+
             // Same-platform arbitrage (each market individually)
             for price in prices {
                 if let Some(opp) = find_same_platform_arbitrage(
@@ -394,13 +396,14 @@ fn batch_scan_arbitrage(
                     opps.push(opp);
                 }
             }
-            
+
             opps
         })
         .collect()
 }
 
 /// Python module definition
+#[cfg(feature = "python")]
 #[pymodule]
 fn arbees_core(_py: Python, m: &PyModule) -> PyResult<()> {
     // ============================================================================
@@ -520,7 +523,7 @@ mod tests {
         let opp = &opps[0];
         assert_eq!(opp.platform_buy, Platform::Kalshi);
         assert_eq!(opp.platform_sell, Platform::Polymarket);
-        assert!((opp.edge_pct - 4.0).abs() < 0.1);  // 4% profit
+        assert!((opp.edge_pct - 4.0).abs() < 0.1); // 4% profit
     }
 
     #[test]
@@ -541,7 +544,7 @@ mod tests {
         let opp = opp.unwrap();
         assert_eq!(opp.platform_buy, Platform::Kalshi);
         assert_eq!(opp.platform_sell, Platform::Kalshi);
-        assert!((opp.edge_pct - 2.0).abs() < 0.1);  // 2% profit
+        assert!((opp.edge_pct - 2.0).abs() < 0.1); // 2% profit
     }
 
     #[test]

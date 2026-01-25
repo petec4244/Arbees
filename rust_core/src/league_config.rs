@@ -4,6 +4,7 @@
 //! - Static configuration for all supported leagues
 //! - Market series mappings for Kalshi/Polymarket
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 /// Configuration for a single league.
@@ -159,20 +160,20 @@ pub fn get_all_league_codes() -> Vec<&'static str> {
 // ============================================================================
 
 /// Python wrapper for LeagueConfig
-#[pyclass(name = "LeagueConfig")]
+#[cfg_attr(feature = "python", pyclass(name = "LeagueConfig"))]
 #[derive(Clone)]
 pub struct PyLeagueConfig {
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub league_code: String,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub poly_prefix: String,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub kalshi_series_game: String,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub kalshi_series_spread: Option<String>,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub kalshi_series_total: Option<String>,
-    #[pyo3(get)]
+    #[cfg_attr(feature = "python", pyo3(get))]
     pub kalshi_series_btts: Option<String>,
 }
 
@@ -190,24 +191,27 @@ impl From<&LeagueConfig> for PyLeagueConfig {
 }
 
 /// Get all league configurations (Python function).
-#[pyfunction]
-#[pyo3(name = "get_league_configs")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "get_league_configs"))]
 pub fn py_get_league_configs() -> Vec<PyLeagueConfig> {
     LEAGUE_CONFIGS.iter().map(|c| c.into()).collect()
 }
 
 /// Get league configuration by code (Python function).
-#[pyfunction]
-#[pyo3(name = "get_league_config")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "get_league_config"))]
 pub fn py_get_league_config(league: &str) -> Option<PyLeagueConfig> {
     get_league_config(league).map(|c| c.into())
 }
 
 /// Get all league codes (Python function).
-#[pyfunction]
-#[pyo3(name = "get_league_codes")]
+#[cfg_attr(feature = "python", pyfunction)]
+#[cfg_attr(feature = "python", pyo3(name = "get_league_codes"))]
 pub fn py_get_league_codes() -> Vec<String> {
-    get_all_league_codes().iter().map(|s| s.to_string()).collect()
+    get_all_league_codes()
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 // ============================================================================

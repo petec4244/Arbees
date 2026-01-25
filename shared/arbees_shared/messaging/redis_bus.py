@@ -84,8 +84,13 @@ def serialize(data: Any) -> bytes:
 
 
 def deserialize(data: bytes) -> dict:
-    """Deserialize msgpack bytes to dict."""
-    return msgpack.unpackb(data, raw=False, timestamp=3)
+    """Deserialize msgpack or JSON bytes to dict."""
+    try:
+        return msgpack.unpackb(data, raw=False, timestamp=3)
+    except Exception:
+        # Fallback to JSON for Rust services that publish JSON
+        import json
+        return json.loads(data.decode("utf-8"))
 
 
 def _default_encoder(obj: Any) -> Any:

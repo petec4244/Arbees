@@ -7,7 +7,9 @@
 //! - Cooldown periods
 
 use parking_lot::RwLock;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -108,9 +110,9 @@ pub struct CircuitBreakerConfig {
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            max_position_per_market: 50_000,  // 500 contracts (size in cents)
-            max_total_position: 100_000,      // 1000 contracts total
-            max_daily_loss_cents: 50_000,     // $500 max loss
+            max_position_per_market: 50_000, // 500 contracts (size in cents)
+            max_total_position: 100_000,     // 1000 contracts total
+            max_daily_loss_cents: 50_000,    // $500 max loss
             max_consecutive_errors: 5,
             cooldown_duration: Duration::from_secs(300), // 5 minutes
             enabled: true,
@@ -189,10 +191,7 @@ impl CircuitBreaker {
         let positions = self.positions.read();
 
         // Check per-market limit
-        let current_position = positions
-            .get(market_id)
-            .map(|p| p.total())
-            .unwrap_or(0);
+        let current_position = positions.get(market_id).map(|p| p.total()).unwrap_or(0);
 
         if current_position + contracts.abs() > self.config.max_position_per_market {
             let reason = TripReason::MaxPositionPerMarket {
@@ -345,34 +344,34 @@ pub struct CircuitBreakerStatus {
 // ============================================================================
 
 /// Python wrapper for circuit breaker configuration
-#[pyclass(name = "CircuitBreakerConfig")]
+#[cfg_attr(feature = "python", pyclass(name = "CircuitBreakerConfig"))]
 #[derive(Clone)]
 pub struct PyCircuitBreakerConfig {
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub max_position_per_market: i64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub max_total_position: i64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub max_daily_loss: f64, // Dollars (converted to cents internally)
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub max_consecutive_errors: u32,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub cooldown_secs: u64,
-    #[pyo3(get, set)]
+    #[cfg_attr(feature = "python", pyo3(get, set))]
     pub enabled: bool,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyCircuitBreakerConfig {
-    #[new]
-    #[pyo3(signature = (
+    #[cfg_attr(feature = "python", new)]
+    #[cfg_attr(feature = "python", pyo3(signature = (
         max_position_per_market = 50000,
         max_total_position = 100000,
         max_daily_loss = 500.0,
         max_consecutive_errors = 5,
         cooldown_secs = 300,
         enabled = true
-    ))]
+    )))]
     fn new(
         max_position_per_market: i64,
         max_total_position: i64,
@@ -406,14 +405,14 @@ impl From<PyCircuitBreakerConfig> for CircuitBreakerConfig {
 }
 
 /// Python wrapper for circuit breaker
-#[pyclass(name = "CircuitBreaker")]
+#[cfg_attr(feature = "python", pyclass(name = "CircuitBreaker"))]
 pub struct PyCircuitBreaker {
     inner: Arc<CircuitBreaker>,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyCircuitBreaker {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     fn new(config: PyCircuitBreakerConfig) -> Self {
         Self {
             inner: Arc::new(CircuitBreaker::new(config.into())),
@@ -427,12 +426,11 @@ impl PyCircuitBreaker {
 
     /// Check if a specific execution is allowed
     /// Raises RuntimeError with reason if not allowed
+    #[cfg(feature = "python")]
     fn can_execute(&self, market_id: &str, contracts: i64) -> PyResult<()> {
         self.inner
             .can_execute(market_id, contracts)
-            .map_err(|reason| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(reason.to_string())
-            })
+            .map_err(|reason| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(reason.to_string()))
     }
 
     /// Record a successful execution
@@ -487,6 +485,7 @@ impl PyCircuitBreaker {
     }
 
     /// Get current status as a dict
+    #[cfg(feature = "python")]
     fn status(&self, py: Python) -> PyObject {
         let status = self.inner.status();
         let dict = PyDict::new(py);
@@ -641,7 +640,7 @@ mod tests {
 
         cb.record_pnl(1000); // +$10
         cb.record_pnl(-500); // -$5
-        cb.record_pnl(200);  // +$2
+        cb.record_pnl(200); // +$2
 
         assert_eq!(cb.get_daily_pnl_cents(), 700); // +$7
 

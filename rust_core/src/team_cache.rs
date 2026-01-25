@@ -5,6 +5,7 @@
 //! - League-scoped mappings
 //! - JSON persistence
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::fs;
@@ -141,27 +142,28 @@ impl TeamCache {
 // ============================================================================
 
 /// Python wrapper for TeamCache
-#[pyclass(name = "TeamCache")]
+#[cfg_attr(feature = "python", pyclass(name = "TeamCache"))]
 pub struct PyTeamCache {
     inner: TeamCache,
 }
 
-#[pymethods]
+#[cfg_attr(feature = "python", pymethods)]
 impl PyTeamCache {
-    #[new]
+    #[cfg_attr(feature = "python", new)]
     fn new() -> Self {
         Self {
             inner: TeamCache::new(),
         }
     }
 
-    #[staticmethod]
+    #[cfg_attr(feature = "python", staticmethod)]
     fn load(path: Option<&str>) -> Self {
         Self {
             inner: TeamCache::load(path),
         }
     }
 
+    #[cfg(feature = "python")]
     fn save(&self, path: Option<&str>) -> PyResult<()> {
         self.inner
             .save(path)
@@ -169,11 +171,15 @@ impl PyTeamCache {
     }
 
     fn poly_to_kalshi(&self, league: &str, poly_code: &str) -> Option<String> {
-        self.inner.poly_to_kalshi(league, poly_code).map(|s| s.to_string())
+        self.inner
+            .poly_to_kalshi(league, poly_code)
+            .map(|s| s.to_string())
     }
 
     fn kalshi_to_poly(&self, league: &str, kalshi_code: &str) -> Option<String> {
-        self.inner.kalshi_to_poly(league, kalshi_code).map(|s| s.to_string())
+        self.inner
+            .kalshi_to_poly(league, kalshi_code)
+            .map(|s| s.to_string())
     }
 
     fn insert(&mut self, league: &str, poly_code: &str, kalshi_code: &str) {

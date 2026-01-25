@@ -44,6 +44,9 @@ data/models
 # Logs
 *.log
 
+# Windows oddities / reserved names
+nul
+
 # Environment
 .env
 .env.local

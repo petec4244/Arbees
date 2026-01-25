@@ -87,7 +87,7 @@ impl GameManager {
         let q = sqlx::query(
             r#"
             INSERT INTO games (game_id, sport, home_team, away_team, scheduled_time, home_team_abbrev, away_team_abbrev, venue, broadcast, status, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            VALUES ($1, $2::sport_enum, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
             ON CONFLICT (game_id) DO UPDATE SET
                 scheduled_time = EXCLUDED.scheduled_time,
                 status = CASE WHEN games.status = 'scheduled' THEN EXCLUDED.status ELSE games.status END,
@@ -328,7 +328,7 @@ impl GameManager {
             let _ = conn.publish::<_, _, ()>(channel, command.to_string()).await;
 
             // Publish market assignment for monitors
-            let _ = conn.publish::<_, _, ()>("market:assignments", serde_json::json!({
+            let _ = conn.publish::<_, _, ()>("orchestrator:market_assignments", serde_json::json!({
                 "type": "polymarket_assign", 
                 "game_id": game.game_id,
                 "sport": game.sport.as_str(),

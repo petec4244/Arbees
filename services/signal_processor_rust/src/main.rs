@@ -368,7 +368,8 @@ impl SignalProcessorState {
     async fn get_open_position_for_game(&self, game_id: &str) -> Result<Option<OpenPositionRow>> {
         let row = sqlx::query(
             r#"
-            SELECT trade_id, game_id, side, entry_price, size
+            SELECT trade_id, game_id, side::text as side,
+                   entry_price::float8 as entry_price, size::float8 as size
             FROM paper_trades
             WHERE game_id = $1 AND status = 'open'
             ORDER BY time DESC
