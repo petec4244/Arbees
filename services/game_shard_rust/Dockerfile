@@ -11,6 +11,8 @@ COPY services/market_discovery_rust market_discovery_rust
 COPY services/orchestrator_rust orchestrator_rust
 COPY services/game_shard_rust game_shard_rust
 COPY services/execution_service_rust execution_service_rust
+COPY services/signal_processor_rust signal_processor_rust
+COPY services/position_tracker_rust position_tracker_rust
 
 # Build specific member
 RUN cargo build --release --bin game_shard_rust

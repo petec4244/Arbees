@@ -15,7 +15,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -419,6 +419,13 @@ async fn monitor_game(
         }
     };
 
+    // Signal debouncing: (team, direction) -> last_signal_time
+    let mut last_signal_times: HashMap<(String, String), Instant> = HashMap::new();
+    let signal_debounce_secs: u64 = env::var("SIGNAL_DEBOUNCE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
     loop {
         // Fetch game state from ESPN
         if let Some((game, state)) = fetch_game_state(&espn, &game_id, &sport).await {
@@ -491,33 +498,83 @@ async fn monitor_game(
             if let Some(game_prices) = prices.get(&game_id) {
                 // Check home team
                 if let Some(home_price) = find_team_price(game_prices, &game.home_team) {
-                    check_and_emit_signal(
-                        &redis,
-                        &game_id,
-                        sport_enum,
-                        &game.home_team,
-                        home_win_prob,
-                        home_price,
-                        old_prob,
-                        min_edge_pct,
-                    )
-                    .await;
+                    // Pre-calculate direction for debounce check
+                    let home_edge = (home_win_prob - home_price.mid_price) * 100.0;
+                    let home_direction = if home_edge > 0.0 { "buy" } else { "sell" };
+                    let home_key = (game.home_team.clone(), home_direction.to_string());
+
+                    // Check debounce
+                    let should_emit_home = match last_signal_times.get(&home_key) {
+                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
+                        None => true,
+                    };
+
+                    if should_emit_home && home_edge.abs() >= min_edge_pct {
+                        if check_and_emit_signal(
+                            &redis,
+                            &game_id,
+                            sport_enum,
+                            &game.home_team,
+                            home_win_prob,
+                            home_price,
+                            old_prob,
+                            min_edge_pct,
+                        )
+                        .await
+                        {
+                            last_signal_times.insert(home_key, Instant::now());
+                        }
+                    } else if !should_emit_home && home_edge.abs() >= min_edge_pct {
+                        debug!(
+                            "DEBOUNCE: {} {} - {}s remaining",
+                            game.home_team,
+                            home_direction,
+                            signal_debounce_secs.saturating_sub(
+                                last_signal_times.get(&home_key).map(|t| t.elapsed().as_secs()).unwrap_or(0)
+                            )
+                        );
+                    }
                 }
 
                 // Check away team
                 let away_win_prob = 1.0 - home_win_prob;
                 if let Some(away_price) = find_team_price(game_prices, &game.away_team) {
-                    check_and_emit_signal(
-                        &redis,
-                        &game_id,
-                        sport_enum,
-                        &game.away_team,
-                        away_win_prob,
-                        away_price,
-                        old_prob.map(|p| 1.0 - p),
-                        min_edge_pct,
-                    )
-                    .await;
+                    // Pre-calculate direction for debounce check
+                    let away_edge = (away_win_prob - away_price.mid_price) * 100.0;
+                    let away_direction = if away_edge > 0.0 { "buy" } else { "sell" };
+                    let away_key = (game.away_team.clone(), away_direction.to_string());
+
+                    // Check debounce
+                    let should_emit_away = match last_signal_times.get(&away_key) {
+                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
+                        None => true,
+                    };
+
+                    if should_emit_away && away_edge.abs() >= min_edge_pct {
+                        if check_and_emit_signal(
+                            &redis,
+                            &game_id,
+                            sport_enum,
+                            &game.away_team,
+                            away_win_prob,
+                            away_price,
+                            old_prob.map(|p| 1.0 - p),
+                            min_edge_pct,
+                        )
+                        .await
+                        {
+                            last_signal_times.insert(away_key, Instant::now());
+                        }
+                    } else if !should_emit_away && away_edge.abs() >= min_edge_pct {
+                        debug!(
+                            "DEBOUNCE: {} {} - {}s remaining",
+                            game.away_team,
+                            away_direction,
+                            signal_debounce_secs.saturating_sub(
+                                last_signal_times.get(&away_key).map(|t| t.elapsed().as_secs()).unwrap_or(0)
+                            )
+                        );
+                    }
                 }
             }
         }
@@ -544,6 +601,7 @@ fn find_team_price<'a>(
     None
 }
 
+/// Returns true if a signal was emitted, false otherwise
 async fn check_and_emit_signal(
     redis: &RedisBus,
     game_id: &str,
@@ -553,7 +611,7 @@ async fn check_and_emit_signal(
     market_price: &MarketPriceData,
     _old_prob: Option<f64>,
     min_edge_pct: f64,
-) {
+) -> bool {
     let market_prob = market_price.mid_price;
 
     // Calculate edge: model_prob - market_prob (as percentage)
@@ -561,7 +619,7 @@ async fn check_and_emit_signal(
 
     // Skip if edge is too small
     if edge_pct.abs() < min_edge_pct {
-        return;
+        return false;
     }
 
     // Determine direction
@@ -573,7 +631,7 @@ async fn check_and_emit_signal(
                 team,
                 model_prob * 100.0
             );
-            return;
+            return false;
         }
         (SignalDirection::Buy, SignalType::ModelEdgeYes)
     } else {
@@ -584,7 +642,7 @@ async fn check_and_emit_signal(
                 team,
                 model_prob * 100.0
             );
-            return;
+            return false;
         }
         (SignalDirection::Sell, SignalType::ModelEdgeNo)
     };
@@ -617,19 +675,28 @@ async fn check_and_emit_signal(
         play_id: None,
     };
 
+    // Format direction as "to win" / "to lose" for clarity
+    let direction_str = match direction {
+        SignalDirection::Buy => "to win",
+        SignalDirection::Sell => "to lose",
+        SignalDirection::Hold => "hold",
+    };
     info!(
-        "SIGNAL: {:?} {} {} - model={:.1}% market={:.1}% edge={:.1}%",
-        direction,
+        "SIGNAL: {} {} - model={:.1}% market={:.1}% edge={:.1}%",
         team,
-        game_id,
+        direction_str,
         model_prob * 100.0,
         market_prob * 100.0,
         edge_pct.abs()
     );
 
     // Publish signal
-    if let Err(e) = redis.publish(channels::SIGNALS_NEW, &signal).await {
-        error!("Failed to publish signal: {}", e);
+    match redis.publish(channels::SIGNALS_NEW, &signal).await {
+        Ok(_) => true,
+        Err(e) => {
+            error!("Failed to publish signal: {}", e);
+            false
+        }
     }
 }
 

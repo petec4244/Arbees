@@ -27,3 +27,4 @@ log = { workspace = true }
 env_logger = { workspace = true }
 hostname = { workspace = true }
 async-trait = { workspace = true }
+rmp-serde = "1.1"

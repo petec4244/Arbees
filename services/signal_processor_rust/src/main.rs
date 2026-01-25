@@ -281,6 +281,153 @@ impl SignalProcessorState {
         Ok(())
     }
 
+    // ========================================================================
+    // Risk Check Database Queries
+    // ========================================================================
+
+    /// Get current available balance from bankroll table
+    async fn get_available_balance(&self) -> Result<f64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(current_balance, 0.0)::float8 as current_balance
+            FROM bankroll
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.get::<f64, _>("current_balance")).unwrap_or(self.config.initial_bankroll))
+    }
+
+    /// Get total exposure for a specific game (open OR recently closed within 60s cooldown)
+    async fn get_game_exposure(&self, game_id: &str) -> Result<f64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(size::float8), 0.0) as exposure
+            FROM paper_trades
+            WHERE game_id = $1
+              AND (status = 'open' OR (status = 'closed' AND exit_time > NOW() - INTERVAL '60 seconds'))
+            "#,
+        )
+        .bind(game_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<f64, _>("exposure"))
+    }
+
+    /// Get total exposure for a sport (sum of open position sizes)
+    async fn get_sport_exposure(&self, sport: Sport) -> Result<f64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(size::float8), 0.0) as exposure
+            FROM paper_trades
+            WHERE sport = $1::text::sport_enum AND status = 'open'
+            "#,
+        )
+        .bind(sport.as_str().to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<f64, _>("exposure"))
+    }
+
+    /// Get total realized losses for today
+    async fn get_daily_loss(&self) -> Result<f64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(ABS(pnl::float8)), 0.0) as daily_loss
+            FROM paper_trades
+            WHERE status = 'closed'
+              AND DATE(time) = CURRENT_DATE
+              AND pnl < 0
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<f64, _>("daily_loss"))
+    }
+
+    /// Count positions for a specific game (open OR closed within last 60 seconds)
+    async fn count_game_positions(&self, game_id: &str) -> Result<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM paper_trades
+            WHERE game_id = $1
+              AND (status = 'open' OR (status = 'closed' AND exit_time > NOW() - INTERVAL '60 seconds'))
+            "#,
+        )
+        .bind(game_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    /// Master risk check - returns None if approved, Some(reason) if rejected
+    async fn check_risk_limits(&self, signal: &TradingSignal, proposed_size: f64) -> Result<Option<String>> {
+        // 1. Check bankroll sufficiency
+        let balance = self.get_available_balance().await?;
+        if proposed_size > balance {
+            return Ok(Some(format!(
+                "Insufficient balance: proposed ${:.2} > available ${:.2}",
+                proposed_size, balance
+            )));
+        }
+
+        // 2. Check daily loss limit
+        let daily_loss = self.get_daily_loss().await?;
+        if daily_loss >= self.config.max_daily_loss {
+            return Ok(Some(format!(
+                "Daily loss limit reached: ${:.2} >= ${:.2}",
+                daily_loss, self.config.max_daily_loss
+            )));
+        }
+
+        // 3. Check game exposure limit
+        let game_exposure = self.get_game_exposure(&signal.game_id).await?;
+        if game_exposure + proposed_size > self.config.max_game_exposure {
+            return Ok(Some(format!(
+                "Game exposure limit: ${:.2} + ${:.2} > ${:.2}",
+                game_exposure, proposed_size, self.config.max_game_exposure
+            )));
+        }
+
+        // 4. Check sport exposure limit
+        let sport_exposure = self.get_sport_exposure(signal.sport).await?;
+        if sport_exposure + proposed_size > self.config.max_sport_exposure {
+            return Ok(Some(format!(
+                "Sport exposure limit: ${:.2} + ${:.2} > ${:.2}",
+                sport_exposure, proposed_size, self.config.max_sport_exposure
+            )));
+        }
+
+        // 5. Check position count per game (max 2)
+        let position_count = self.count_game_positions(&signal.game_id).await?;
+        if position_count >= 2 {
+            return Ok(Some(format!(
+                "Max positions per game: {} >= 2",
+                position_count
+            )));
+        }
+
+        // All checks passed - format direction for clarity
+        let direction_str = match signal.direction {
+            SignalDirection::Buy => "to win",
+            SignalDirection::Sell => "to lose",
+            SignalDirection::Hold => "hold",
+        };
+        info!(
+            "OPEN: {} {} - ${:.2} (balance=${:.2}, game_exp=${:.2})",
+            signal.team, direction_str, proposed_size, balance, game_exposure
+        );
+        Ok(None)
+    }
+
     fn evaluate_rules(&self, signal: &TradingSignal) -> RuleDecision {
         let mut best_override: Option<f64> = None;
         let mut override_rule_id: Option<String> = None;
@@ -480,12 +627,15 @@ impl SignalProcessorState {
         }))
     }
 
-    fn estimate_position_size(&self, signal: &TradingSignal) -> f64 {
+    async fn estimate_position_size(&self, signal: &TradingSignal) -> Result<f64> {
+        // Use current balance from database, not initial_bankroll
+        let current_balance = self.get_available_balance().await?;
+
         let kelly = signal.kelly_fraction();
         let fractional_kelly = kelly * self.config.kelly_fraction;
         let position_pct = (fractional_kelly * 100.0).min(self.config.max_position_pct);
-        let position_size = self.config.initial_bankroll * (position_pct / 100.0);
-        position_size.max(1.0)
+        let position_size = current_balance * (position_pct / 100.0);
+        Ok(position_size.max(1.0))
     }
 
     fn create_execution_request(
@@ -510,9 +660,16 @@ impl SignalProcessorState {
             _ => Platform::Paper,
         };
 
+        // Use game_id + team + direction for idempotency (NOT signal_id which is unique per signal)
+        let direction_str = match signal.direction {
+            SignalDirection::Buy => "buy",
+            SignalDirection::Sell => "sell",
+            SignalDirection::Hold => "hold",
+        };
+
         ExecutionRequest {
             request_id: Uuid::new_v4().to_string(),
-            idempotency_key: format!("{}_{}_{}", signal.signal_id, signal.game_id, signal.team),
+            idempotency_key: format!("{}_{}_{}", signal.game_id, signal.team, direction_str),
             game_id: signal.game_id.clone(),
             sport: signal.sport,
             platform,
@@ -608,9 +765,15 @@ impl SignalProcessorState {
     async fn handle_signal(&mut self, signal: TradingSignal) -> Result<()> {
         self.signal_count += 1;
 
+        // Format direction as "to win" / "to lose" for clarity
+        let direction_str = match signal.direction {
+            SignalDirection::Buy => "to win",
+            SignalDirection::Sell => "to lose",
+            SignalDirection::Hold => "hold",
+        };
         info!(
-            "Received signal: {:?} {:?} {} (edge: {:.1}%)",
-            signal.signal_type, signal.direction, signal.team, signal.edge_pct
+            "Received signal: {} {} (edge: {:.1}%)",
+            signal.team, direction_str, signal.edge_pct
         );
 
         // Pre-trade filtering
@@ -650,7 +813,17 @@ impl SignalProcessorState {
         };
 
         // Estimate position size
-        let proposed_size = self.estimate_position_size(&signal);
+        let proposed_size = self.estimate_position_size(&signal).await?;
+
+        // Risk check - MUST pass before execution
+        if let Some(rejection) = self.check_risk_limits(&signal, proposed_size).await? {
+            *self
+                .rejected_counts
+                .entry("risk".to_string())
+                .or_insert(0) += 1;
+            warn!("RISK REJECTED: {} {} - {}", signal.game_id, signal.team, rejection);
+            return Ok(());
+        }
 
         // Create execution request
         let exec_request = self.create_execution_request(&signal, &market, proposed_size);

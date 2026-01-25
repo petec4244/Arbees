@@ -5,7 +5,9 @@ members = [
     "orchestrator_rust",
     "arbees_rust_core",
     "game_shard_rust",
-    "execution_service_rust"
+    "execution_service_rust",
+    "signal_processor_rust",
+    "position_tracker_rust"
 ]
 
 [workspace.package]

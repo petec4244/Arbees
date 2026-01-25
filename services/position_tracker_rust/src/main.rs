@@ -130,10 +130,21 @@ struct PositionTrackerState {
     // Bankroll state
     current_balance: f64,
     piggybank_balance: f64,
+
+    // Cached market prices from Redis: game_id -> (team -> price_data)
+    price_cache: Arc<RwLock<HashMap<String, HashMap<String, CachedPrice>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPrice {
+    yes_bid: f64,
+    yes_ask: f64,
+    mid_price: f64,
+    updated_at: DateTime<Utc>,
 }
 
 impl PositionTrackerState {
-    async fn new(config: Config, pool: PgPool, redis: RedisBus) -> Result<Self> {
+    async fn new(config: Config, pool: PgPool, redis: RedisBus, price_cache: Arc<RwLock<HashMap<String, HashMap<String, CachedPrice>>>>) -> Result<Self> {
         let initial_bankroll = config.initial_bankroll;
 
         let mut state = Self {
@@ -147,6 +158,7 @@ impl PositionTrackerState {
             game_cooldowns: HashMap::new(),
             current_balance: initial_bankroll,
             piggybank_balance: 0.0,
+            price_cache,
         };
 
         // Load bankroll from DB
@@ -161,7 +173,7 @@ impl PositionTrackerState {
     async fn load_bankroll(&mut self) -> Result<()> {
         let row = sqlx::query(
             r#"
-            SELECT initial_balance, current_balance, piggybank_balance, peak_balance, trough_balance
+            SELECT current_balance::float8, piggybank_balance::float8
             FROM bankroll
             WHERE account_name = 'default'
             "#,
@@ -174,22 +186,29 @@ impl PositionTrackerState {
                 .try_get::<f64, _>("current_balance")
                 .unwrap_or(self.config.initial_bankroll);
             self.piggybank_balance = row.try_get::<f64, _>("piggybank_balance").unwrap_or(0.0);
-            info!("Loaded bankroll: ${:.2}", self.current_balance);
+            info!("Loaded bankroll: ${:.2} (piggybank: ${:.2})", self.current_balance, self.piggybank_balance);
         }
 
         Ok(())
     }
 
     async fn save_bankroll(&self) -> Result<()> {
+        // Update bankroll, also update peak if we hit a new high
+        let total_balance = self.current_balance + self.piggybank_balance;
         sqlx::query(
             r#"
             UPDATE bankroll
-            SET current_balance = $1, piggybank_balance = $2, updated_at = NOW()
+            SET current_balance = $1,
+                piggybank_balance = $2,
+                peak_balance = GREATEST(peak_balance, $3),
+                trough_balance = LEAST(trough_balance, $1),
+                updated_at = NOW()
             WHERE account_name = 'default'
             "#,
         )
         .bind(self.current_balance)
         .bind(self.piggybank_balance)
+        .bind(total_balance)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -198,8 +217,8 @@ impl PositionTrackerState {
     async fn load_open_positions(&mut self) -> Result<()> {
         let rows = sqlx::query(
             r#"
-            SELECT trade_id, signal_id, game_id, sport, platform, market_id, market_title,
-                   side, entry_price, size, time as entry_time
+            SELECT trade_id, signal_id, game_id, sport::text, platform::text, market_id, market_title,
+                   side::text, entry_price::float8, size::float8, time as entry_time
             FROM paper_trades
             WHERE status = 'open'
             "#,
@@ -210,18 +229,18 @@ impl PositionTrackerState {
         for row in rows {
             let sport_str: Option<String> = row.try_get("sport").ok();
             let sport = match sport_str.as_deref() {
-                Some("NBA") => Sport::NBA,
-                Some("NCAAB") => Sport::NCAAB,
-                Some("NFL") => Sport::NFL,
-                Some("NCAAF") => Sport::NCAAF,
-                Some("NHL") => Sport::NHL,
-                Some("MLB") => Sport::MLB,
-                Some("MLS") => Sport::MLS,
-                Some("SOCCER") => Sport::Soccer,
+                Some("nba") | Some("NBA") => Sport::NBA,
+                Some("ncaab") | Some("NCAAB") => Sport::NCAAB,
+                Some("nfl") | Some("NFL") => Sport::NFL,
+                Some("ncaaf") | Some("NCAAF") => Sport::NCAAF,
+                Some("nhl") | Some("NHL") => Sport::NHL,
+                Some("mlb") | Some("MLB") => Sport::MLB,
+                Some("mls") | Some("MLS") => Sport::MLS,
+                Some("soccer") | Some("SOCCER") => Sport::Soccer,
                 _ => Sport::NBA,
             };
 
-            let platform_str: String = row.get("platform");
+            let platform_str: String = row.try_get("platform").unwrap_or_default();
             let platform = match platform_str.as_str() {
                 "kalshi" => Platform::Kalshi,
                 "polymarket" => Platform::Polymarket,
@@ -369,9 +388,15 @@ impl PositionTrackerState {
                 .publish(channels::POSITION_UPDATES, &update)
                 .await?;
 
+            // Format direction as "to win" / "to lose" for clarity
+            let direction_str = match update.side {
+                ExecutionSide::Yes => "to win",
+                ExecutionSide::No => "to lose",
+            };
+            let team_name = update.contract_team.as_deref().unwrap_or(&update.game_id);
             info!(
-                "Position opened: {} @ {:.3} x ${:.2}",
-                update.game_id, result.avg_price, result.filled_qty
+                "OPEN: {} {} @ {:.3} x ${:.2}",
+                team_name, direction_str, update.entry_price, update.size
             );
         }
 
@@ -479,17 +504,29 @@ impl PositionTrackerState {
             self.current_balance += gross_pnl;
         }
 
-        // Update trade in DB
+        // Update trade in DB with PnL
         let outcome = if was_win { "win" } else { "loss" };
+        let pnl_pct = match position.side {
+            TradeSide::Buy => (exit_price - position.entry_price) / position.entry_price * 100.0,
+            TradeSide::Sell => (position.entry_price - exit_price) / position.entry_price * 100.0,
+        };
+
         sqlx::query(
             r#"
             UPDATE paper_trades
-            SET status = 'closed', exit_price = $1, exit_time = NOW(), outcome = $2
-            WHERE trade_id = $3
+            SET status = 'closed',
+                exit_price = $1,
+                exit_time = NOW(),
+                outcome = $2::trade_outcome_enum,
+                pnl = $3,
+                pnl_pct = $4
+            WHERE trade_id = $5
             "#,
         )
         .bind(exit_price)
         .bind(outcome)
+        .bind(gross_pnl)
+        .bind(pnl_pct)
         .bind(&position.trade_id)
         .execute(&self.pool)
         .await?;
@@ -534,9 +571,15 @@ impl PositionTrackerState {
             .publish(channels::POSITION_UPDATES, &update)
             .await?;
 
+        // Format direction as "to win" / "to lose" for clarity
+        let direction_str = match position.side {
+            TradeSide::Buy => "to win",
+            TradeSide::Sell => "to lose",
+        };
+        let pnl_sign = if gross_pnl >= 0.0 { "+" } else { "" };
         info!(
-            "Position closed: {} entry={:.3} exit={:.3} pnl=${:.2} reason={}",
-            position.trade_id, position.entry_price, exit_price, gross_pnl, exit_reason
+            "CLOSE: {} {} - entry={:.3} exit={:.3} pnl={}{:.2} ({})",
+            position.market_title, direction_str, position.entry_price, exit_price, pnl_sign, gross_pnl, exit_reason
         );
 
         Ok(())
@@ -663,6 +706,35 @@ impl PositionTrackerState {
     }
 
     async fn get_current_price(&self, position: &OpenPosition) -> Result<Option<MarketPriceRow>> {
+        // Try to get price from Redis cache first (by game_id + team)
+        let cache = self.price_cache.read().await;
+
+        if let Some(game_prices) = cache.get(&position.game_id) {
+            // Try exact match on market_title (team name)
+            if let Some(cached) = game_prices.get(&position.market_title) {
+                return Ok(Some(MarketPriceRow {
+                    market_id: position.market_id.clone(),
+                    yes_bid: cached.yes_bid,
+                    yes_ask: cached.yes_ask,
+                    time: cached.updated_at,
+                }));
+            }
+
+            // Try fuzzy match on team name
+            for (team, cached) in game_prices.iter() {
+                if self.teams_match(team, &position.market_title) {
+                    return Ok(Some(MarketPriceRow {
+                        market_id: position.market_id.clone(),
+                        yes_bid: cached.yes_bid,
+                        yes_ask: cached.yes_ask,
+                        time: cached.updated_at,
+                    }));
+                }
+            }
+        }
+        drop(cache);
+
+        // Fallback to DB query (legacy, may be stale)
         let platform_str = match position.platform {
             Platform::Kalshi => "kalshi",
             Platform::Polymarket => "polymarket",
@@ -863,6 +935,98 @@ async fn heartbeat_loop(
 }
 
 // ============================================================================
+// Price Listener
+// ============================================================================
+
+/// Incoming market price message from polymarket_monitor (same format as game_shard)
+#[derive(Debug, Deserialize)]
+struct MarketPriceMessage {
+    #[serde(default)]
+    game_id: String,
+    #[serde(default)]
+    contract_team: Option<String>,
+    #[serde(default)]
+    yes_bid: f64,
+    #[serde(default)]
+    yes_ask: f64,
+    #[serde(default)]
+    mid_price: Option<f64>,
+    #[serde(default)]
+    implied_probability: Option<f64>,
+}
+
+async fn price_listener_loop(
+    redis: RedisBus,
+    price_cache: Arc<RwLock<HashMap<String, HashMap<String, CachedPrice>>>>,
+) -> Result<()> {
+    // Subscribe to game:*:price pattern
+    let mut pubsub = redis.psubscribe("game:*:price").await?;
+    info!("Subscribed to game:*:price pattern for exit monitoring");
+
+    let mut stream = pubsub.on_message();
+    while let Some(msg) = stream.next().await {
+        let channel: String = match msg.get_channel::<String>() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Extract game_id from channel: game:{game_id}:price
+        let game_id = channel
+            .strip_prefix("game:")
+            .and_then(|s| s.strip_suffix(":price"))
+            .map(|s| s.to_string());
+
+        let game_id = match game_id {
+            Some(gid) => gid,
+            None => continue,
+        };
+
+        // Get raw bytes for msgpack
+        let payload: Vec<u8> = match msg.get_payload::<Vec<u8>>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Try msgpack first, then JSON
+        let price: MarketPriceMessage = match rmp_serde::from_slice(&payload) {
+            Ok(p) => p,
+            Err(_) => match serde_json::from_slice(&payload) {
+                Ok(p) => p,
+                Err(_) => continue,
+            },
+        };
+
+        // Get team name
+        let team = match &price.contract_team {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => continue,
+        };
+
+        // Calculate mid price
+        let mid = price
+            .mid_price
+            .or(price.implied_probability)
+            .unwrap_or((price.yes_bid + price.yes_ask) / 2.0);
+
+        // Update cache
+        let cached = CachedPrice {
+            yes_bid: price.yes_bid,
+            yes_ask: price.yes_ask,
+            mid_price: mid,
+            updated_at: Utc::now(),
+        };
+
+        let mut cache = price_cache.write().await;
+        cache
+            .entry(game_id)
+            .or_insert_with(HashMap::new)
+            .insert(team, cached);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -892,10 +1056,23 @@ async fn main() -> Result<()> {
         config.take_profit_pct, config.default_stop_loss_pct, config.exit_check_interval_secs
     );
 
+    // Shared price cache
+    let price_cache: Arc<RwLock<HashMap<String, HashMap<String, CachedPrice>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // Initialize state
     let state = Arc::new(RwLock::new(
-        PositionTrackerState::new(config.clone(), pool, redis.clone()).await?,
+        PositionTrackerState::new(config.clone(), pool, redis.clone(), price_cache.clone()).await?,
     ));
+
+    // Price listener - subscribe to game:*:price and cache prices
+    let redis_price = redis.clone();
+    let price_cache_listener = price_cache.clone();
+    tokio::spawn(async move {
+        if let Err(e) = price_listener_loop(redis_price, price_cache_listener).await {
+            error!("Price listener error: {}", e);
+        }
+    });
 
     // Subscribe to execution results
     let mut pubsub_exec = redis.subscribe(channels::EXECUTION_RESULTS).await?;

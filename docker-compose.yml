@@ -123,6 +123,8 @@ services:
       HALFTIME_INTERVAL: ${HALFTIME_INTERVAL:-30.0}
       MARKET_DATA_TTL: ${MARKET_DATA_TTL:-4.0}
       SYNC_DELTA_TOLERANCE: ${SYNC_DELTA_TOLERANCE:-2.0}
+      # Signal debouncing (prevents signal spam)
+      SIGNAL_DEBOUNCE_SECS: "30"
       # Phase 3: Always use Redis for Polymarket prices (via polymarket_monitor)
       POLYMARKET_VIA_REDIS: "true"
     ports:
@@ -177,14 +179,14 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
-      # Risk management limits
-      MAX_DAILY_LOSS: "500.0"
-      MAX_GAME_EXPOSURE: "100.0"
-      MAX_SPORT_EXPOSURE: "800.0"
-      # Trading parameters
-      MIN_EDGE_PCT: "2.0"
-      KELLY_FRACTION: "0.25"
-      MAX_POSITION_PCT: "10.0"
+      # Risk management limits (tightened after 26x leverage incident)
+      MAX_DAILY_LOSS: "100.0"
+      MAX_GAME_EXPOSURE: "50.0"
+      MAX_SPORT_EXPOSURE: "200.0"
+      # Trading parameters (more conservative)
+      MIN_EDGE_PCT: "3.0"
+      KELLY_FRACTION: "0.15"
+      MAX_POSITION_PCT: "5.0"
       MAX_BUY_PROB: "0.95"
       MIN_SELL_PROB: "0.05"
       INITIAL_BANKROLL: "1000"
@@ -243,9 +245,11 @@ services:
       RUST_LOG: info
       INITIAL_BANKROLL: "1000"
       # Exit monitoring parameters
-      TAKE_PROFIT_PCT: "3.0"
+      TAKE_PROFIT_PCT: "5.0"
       DEFAULT_STOP_LOSS_PCT: "5.0"
       EXIT_CHECK_INTERVAL_SECS: "1.0"
+      # Minimum hold time before considering exits (prevents churning)
+      MIN_HOLD_SECONDS: "30"
       # Unified team matching configuration
       EXIT_TEAM_MATCH_MIN_CONFIDENCE: "0.7"
     profiles:
