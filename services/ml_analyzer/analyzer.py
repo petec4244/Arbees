@@ -580,10 +580,10 @@ class MLAnalyzer:
             insights.worst_sport.win_rate if insights.worst_sport else None,
             insights.signals_generated,
             insights.signals_executed,
-            insights.missed_reasons,  # JSONB
-            recommendations_json,  # JSONB
+            json.dumps(insights.missed_reasons) if insights.missed_reasons else None,  # JSONB
+            json.dumps(recommendations_json) if recommendations_json else None,  # JSONB
             insights.model_accuracy,
-            insights.feature_importance,  # JSONB
+            json.dumps(insights.feature_importance) if insights.feature_importance else None,  # JSONB
             report_md,
             report_html,
         )

@@ -284,20 +284,21 @@ class PatternDetector:
         hours = lookback_hours or self.lookback_hours
         cutoff = datetime.utcnow() - timedelta(hours=hours)
 
+        # Query archived_trades which has game_period_at_entry column
         rows = await pool.fetch(
             """
             SELECT
-                game_period,
+                game_period_at_entry as game_period,
                 COUNT(*) as trades,
                 SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
                 AVG(CASE WHEN outcome = 'win' THEN 1.0 ELSE 0.0 END) as win_rate,
                 SUM(pnl) as total_pnl
-            FROM paper_trades
+            FROM archived_trades
             WHERE status = 'closed'
-              AND time > $1
+              AND opened_at > $1
               AND outcome IN ('win', 'loss')
-              AND game_period IS NOT NULL
-            GROUP BY game_period
+              AND game_period_at_entry IS NOT NULL
+            GROUP BY game_period_at_entry
             HAVING COUNT(*) >= $2
             """,
             cutoff,

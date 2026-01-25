@@ -345,6 +345,10 @@ services:
       ML_SMTP_PASSWORD: "${ML_SMTP_PASSWORD:-}"
       ML_EMAIL_FROM: "${ML_EMAIL_FROM:-}"
       ML_EMAIL_TO: "${ML_EMAIL_TO:-}"
+      # Feedback service configuration
+      FEEDBACK_MODE: "learning"
+      PATTERN_CHECK_INTERVAL: "300"
+      FEEDBACK_LOOKBACK_HOURS: "24"
     volumes:
       - ./:/app
       - ./reports:/app/reports
