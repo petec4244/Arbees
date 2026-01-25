@@ -9,7 +9,7 @@ COPY Cargo.toml /build/
 COPY Cargo.lock /build/
 
 # Copy workspace members
-COPY rust_core /build/rust_core
+COPY services/Cargo.toml /build/services/Cargo.toml
 COPY services/arbees_rust_core /build/services/arbees_rust_core
 COPY services/game_shard_rust /build/services/game_shard_rust
 COPY services/market_discovery_rust /build/services/market_discovery_rust

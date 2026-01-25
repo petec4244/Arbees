@@ -405,10 +405,10 @@ function PositionCard({ position }: { position: any }) {
             {position.sport}
           </span>
           <span className={`px-2 py-0.5 rounded text-xs font-medium ${position.side === 'buy'
-            ? 'bg-blue-900/50 text-blue-300'
-            : 'bg-orange-900/50 text-orange-300'
+            ? 'bg-green-900/50 text-green-300'
+            : 'bg-red-900/50 text-red-300'
             }`}>
-            {position.side === 'buy' ? 'YES' : 'NO'}
+            {position.side === 'buy' ? 'YES WIN' : 'NO LOSE'}
           </span>
         </div>
         <span className="text-xs text-gray-500">
@@ -517,10 +517,10 @@ function TradeHistoryRow({ trade }: { trade: any }) {
         </td>
         <td className="px-4 py-3 whitespace-nowrap">
           <span className={`px-2 py-1 rounded text-xs font-medium ${trade.side === 'buy'
-            ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
-            : 'bg-orange-900/50 text-orange-300 border border-orange-700'
+            ? 'bg-green-900/50 text-green-300 border border-green-700'
+            : 'bg-red-900/50 text-red-300 border border-red-700'
             }`}>
-            {trade.side === 'buy' ? 'YES' : 'NO'}
+            {trade.side === 'buy' ? 'YES WIN' : 'NO LOSE'}
           </span>
         </td>
         <td className="px-4 py-3 whitespace-nowrap text-sm font-mono">

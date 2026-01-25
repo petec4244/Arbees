@@ -235,8 +235,8 @@ export default function Dashboard() {
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="text-xs bg-gray-600 px-1.5 py-0.5 rounded text-gray-300">{pos.sport}</span>
-                      <span className={`text-xs font-bold ${pos.side === 'buy' ? 'text-blue-400' : 'text-orange-400'}`}>
-                        {pos.side === 'buy' ? 'YES' : 'NO'}
+                      <span className={`text-xs font-bold ${pos.side === 'buy' ? 'text-green-400' : 'text-red-400'}`}>
+                        {pos.side === 'buy' ? 'YES WIN' : 'NO LOSE'}
                       </span>
                     </div>
                     <div className="text-sm font-medium mt-1">

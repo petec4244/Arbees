@@ -335,8 +335,8 @@ impl PositionTrackerState {
 
             if let Err(e) = sqlx::query(
                 r#"
-                INSERT INTO paper_trades (trade_id, signal_id, game_id, sport, platform, market_id, market_title, side, entry_price, size, time, entry_time, status)
-                VALUES ($1, $2, $3, $4::sport_enum, $5::platform_enum, $6, $7, $8::trade_side_enum, $9, $10, $11, $11, 'open')
+                INSERT INTO paper_trades (trade_id, signal_id, game_id, sport, platform, market_id, market_title, side, entry_price, size, time, entry_time, status, edge_at_entry)
+                VALUES ($1, $2, $3, $4::sport_enum, $5::platform_enum, $6, $7, $8::trade_side_enum, $9, $10, $11, $11, 'open', $12)
                 "#,
             )
             .bind(&trade_id)
@@ -350,6 +350,7 @@ impl PositionTrackerState {
             .bind(result.avg_price)
             .bind(result.filled_qty)
             .bind(result.executed_at)
+            .bind(result.edge_pct)
             .execute(&self.pool)
             .await
             {

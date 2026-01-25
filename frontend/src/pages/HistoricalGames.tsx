@@ -622,10 +622,10 @@ function TradesTable({ trades }: { trades: ArchivedTrade[] }) {
             <td className="px-4 py-2 whitespace-nowrap">
               <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                 trade.side === 'buy'
-                  ? 'bg-blue-900/50 text-blue-300'
-                  : 'bg-orange-900/50 text-orange-300'
+                  ? 'bg-green-900/50 text-green-300'
+                  : 'bg-red-900/50 text-red-300'
               }`}>
-                {trade.side === 'buy' ? 'YES' : 'NO'}
+                {trade.side === 'buy' ? 'YES WIN' : 'NO LOSE'}
               </span>
             </td>
             <td className="px-4 py-2 whitespace-nowrap text-xs font-mono">

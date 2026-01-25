@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Copy workspace files first
 COPY Cargo.toml Cargo.lock ./
-COPY rust_core ./rust_core
+COPY services/Cargo.toml ./services/Cargo.toml
 COPY services/arbees_rust_core ./services/arbees_rust_core
 COPY services/game_shard_rust ./services/game_shard_rust
 COPY services/market_discovery_rust ./services/market_discovery_rust

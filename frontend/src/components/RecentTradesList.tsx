@@ -48,9 +48,9 @@ export default function RecentTradesList({
           >
             <div className="flex items-center gap-2">
               {trade.side === 'buy' ? (
-                <ArrowUpRight className="w-4 h-4 text-blue-400" />
+                <ArrowUpRight className="w-4 h-4 text-green-400" />
               ) : (
-                <ArrowDownRight className="w-4 h-4 text-orange-400" />
+                <ArrowDownRight className="w-4 h-4 text-red-400" />
               )}
               <span className="text-xs text-gray-400">
                 {new Date(trade.entry_time).toLocaleTimeString()}
@@ -86,12 +86,12 @@ export default function RecentTradesList({
         >
           <div className="flex items-center gap-3">
             {trade.side === 'buy' ? (
-              <div className="w-8 h-8 rounded-full bg-blue-900/50 flex items-center justify-center" title="YES">
-                <ArrowUpRight className="w-4 h-4 text-blue-400" />
+              <div className="w-8 h-8 rounded-full bg-green-900/50 flex items-center justify-center" title="YES WIN">
+                <ArrowUpRight className="w-4 h-4 text-green-400" />
               </div>
             ) : (
-              <div className="w-8 h-8 rounded-full bg-orange-900/50 flex items-center justify-center" title="NO">
-                <ArrowDownRight className="w-4 h-4 text-orange-400" />
+              <div className="w-8 h-8 rounded-full bg-red-900/50 flex items-center justify-center" title="NO LOSE">
+                <ArrowDownRight className="w-4 h-4 text-red-400" />
               </div>
             )}
             <div>
