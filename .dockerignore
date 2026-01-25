@@ -17,7 +17,6 @@ env
 
 # Rust build artifacts
 target
-rust_core
 rust_core/target
 services/*/target
 
