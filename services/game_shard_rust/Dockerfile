@@ -1,8 +1,8 @@
 FROM rustlang/rust:nightly as builder
 
-WORKDIR /usr/src/app
+WORKDIR /app
 
-# Copy workspace definition
+# Copy workspace files first
 COPY Cargo.toml Cargo.lock ./
 
 # Copy ALL workspace members (Cargo needs to resolve entire workspace)
@@ -16,12 +16,12 @@ COPY services/position_tracker_rust ./services/position_tracker_rust
 COPY services/notification_service_rust ./services/notification_service_rust
 
 # Build specific member
-RUN cargo build --release --bin game_shard_rust
+RUN cargo build --release --package game_shard_rust
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates libssl-dev && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/src/app/target/release/game_shard_rust /usr/local/bin/game_shard_rust
+COPY --from=builder /app/target/release/game_shard_rust /usr/local/bin/game_shard_rust
 
 CMD ["game_shard_rust"]

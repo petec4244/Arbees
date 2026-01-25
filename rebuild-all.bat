@@ -1,6 +1,10 @@
 @echo off
 setlocal
 
+:: Disable BuildKit to avoid Windows-specific build context issues
+set DOCKER_BUILDKIT=0
+set COMPOSE_DOCKER_CLI_BUILD=0
+
 echo ============================================
 echo Arbees - Full Container Rebuild Script
 echo ============================================
