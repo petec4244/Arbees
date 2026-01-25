@@ -35,6 +35,53 @@ services:
       retries: 5
 
   # ==========================================================================
+  # Notifications (Rust) - Signal via signal-cli-rest-api sidecar
+  # ==========================================================================
+  signal-cli-rest-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: arbees-signal-cli-rest-api
+    environment:
+      - MODE=native
+    ports:
+      - "9922:8080"
+    volumes:
+      - signal_cli_data:/home/.local/share/signal-cli
+    restart: unless-stopped
+    profiles:
+      - full
+
+  notification_service_rust:
+    build:
+      context: .
+      dockerfile: services/notification_service_rust/Dockerfile
+    container_name: arbees-notification-service-rust
+    depends_on:
+      redis:
+        condition: service_healthy
+      signal-cli-rest-api:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      SIGNAL_API_BASE_URL: http://signal-cli-rest-api:8080
+      # Required for notifications to work (service will fail gracefully if not set):
+      SIGNAL_SENDER_NUMBER: ${SIGNAL_SENDER_NUMBER:-}
+      SIGNAL_RECIPIENTS: ${SIGNAL_RECIPIENTS:-}
+      # Quiet hours + rate limiting (defaults exist; override as needed)
+      QUIET_HOURS_ENABLED: ${QUIET_HOURS_ENABLED:-true}
+      QUIET_HOURS_START: ${QUIET_HOURS_START:-22:00}
+      QUIET_HOURS_END: ${QUIET_HOURS_END:-07:00}
+      QUIET_HOURS_TIMEZONE: ${QUIET_HOURS_TIMEZONE:-America/New_York}
+      QUIET_HOURS_MIN_PRIORITY: ${QUIET_HOURS_MIN_PRIORITY:-CRITICAL}
+      RATE_LIMIT_MAX_PER_MINUTE: ${RATE_LIMIT_MAX_PER_MINUTE:-10}
+      RATE_LIMIT_BYPASS_CRITICAL: ${RATE_LIMIT_BYPASS_CRITICAL:-true}
+      RUST_LOG: info
+    restart: unless-stopped
+    profiles:
+      - full
+
+  # ==========================================================================
   # Market Discovery (Rust) - NO VPN needed (Gamma API is public)
   # ==========================================================================
   market-discovery-rust:
@@ -536,6 +583,7 @@ services:
 volumes:
   timescaledb_data:
   redis_data:
+  signal_cli_data:
 
 
 networks:

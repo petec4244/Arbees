@@ -7,6 +7,7 @@ members = [
     "services/execution_service_rust",
     "services/signal_processor_rust",
     "services/position_tracker_rust",
+    "services/notification_service_rust",
 ]
 resolver = "2"
 

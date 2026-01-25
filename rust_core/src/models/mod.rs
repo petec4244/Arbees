@@ -3,6 +3,49 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
+// Notification Events (cross-service alerting)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum NotificationPriority {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+impl NotificationPriority {
+    pub fn rank(&self) -> u8 {
+        match self {
+            NotificationPriority::Info => 0,
+            NotificationPriority::Warning => 1,
+            NotificationPriority::Error => 2,
+            NotificationPriority::Critical => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationType {
+    TradeEntry,
+    TradeExit,
+    RiskRejection,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationEvent {
+    #[serde(rename = "type")]
+    pub event_type: NotificationType,
+    pub priority: NotificationPriority,
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub ts: Option<DateTime<Utc>>,
+}
+
+// ============================================================================
 // Platform & Sport Enums
 // ============================================================================
 
@@ -459,6 +502,7 @@ pub mod channels {
     pub const GAMES_ENDED: &str = "games:ended";
     pub const FEEDBACK_RULES: &str = "feedback:rules";
     pub const HEALTH_HEARTBEATS: &str = "health:heartbeats";
+    pub const NOTIFICATION_EVENTS: &str = "notification:events";
 }
 
 // ============================================================================

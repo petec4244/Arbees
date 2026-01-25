@@ -9,8 +9,9 @@
 
 use anyhow::{Context, Result};
 use arbees_rust_core::models::{
-    channels, get_stop_loss_for_sport, ExecutionResult, ExecutionSide, ExecutionStatus, Platform,
-    PositionState, PositionUpdate, Sport, TradeOutcome, TradeSide, TradeStatus,
+    channels, get_stop_loss_for_sport, ExecutionResult, ExecutionSide, ExecutionStatus,
+    NotificationEvent, NotificationPriority, NotificationType, Platform, PositionState,
+    PositionUpdate, Sport, TradeOutcome, TradeSide, TradeStatus,
 };
 use arbees_rust_core::redis::RedisBus;
 use chrono::{DateTime, Duration, Utc};
@@ -389,6 +390,29 @@ impl PositionTrackerState {
                 .publish(channels::POSITION_UPDATES, &update)
                 .await?;
 
+            // Publish notification (trade entry)
+            let event = NotificationEvent {
+                event_type: NotificationType::TradeEntry,
+                priority: NotificationPriority::Info,
+                data: serde_json::json!({
+                    "game_id": update.game_id,
+                    "sport": serde_json::to_value(update.sport).unwrap_or_else(|_| serde_json::Value::Null),
+                    "team": update.contract_team.clone().unwrap_or_else(|| update.trade_id.clone()),
+                    "side": format!("{:?}", update.side).to_lowercase(),
+                    "price": update.entry_price,
+                    "size": update.size,
+                    "platform": format!("{:?}", update.platform).to_lowercase(),
+                    "market_id": update.market_id,
+                    "edge_pct": result.edge_pct,
+                    "signal_id": result.signal_id,
+                    "request_id": result.request_id,
+                }),
+                ts: Some(Utc::now()),
+            };
+            if let Err(e) = self.redis.publish(channels::NOTIFICATION_EVENTS, &event).await {
+                warn!("Failed to publish trade entry notification: {}", e);
+            }
+
             // Format direction as "to win" / "to lose" for clarity
             let direction_str = match update.side {
                 ExecutionSide::Yes => "to win",
@@ -571,6 +595,35 @@ impl PositionTrackerState {
         self.redis
             .publish(channels::POSITION_UPDATES, &update)
             .await?;
+
+        // Publish notification (trade exit)
+        let duration_minutes = (Utc::now() - position.entry_time).num_minutes().max(0);
+        let event = NotificationEvent {
+            event_type: NotificationType::TradeExit,
+            priority: NotificationPriority::Info,
+            data: serde_json::json!({
+                "trade_id": position.trade_id,
+                "signal_id": position.signal_id,
+                "game_id": position.game_id,
+                "sport": serde_json::to_value(position.sport).unwrap_or_else(|_| serde_json::Value::Null),
+                "team": position.contract_team.clone().unwrap_or_else(|| position.market_title.clone()),
+                "market_title": position.market_title,
+                "platform": format!("{:?}", position.platform).to_lowercase(),
+                "market_id": position.market_id,
+                "side": format!("{:?}", position.side).to_lowercase(),
+                "entry_price": position.entry_price,
+                "exit_price": exit_price,
+                "size": position.size,
+                "pnl": gross_pnl,
+                "pnl_pct": pnl_pct,
+                "duration_minutes": duration_minutes,
+                "exit_reason": exit_reason,
+            }),
+            ts: Some(Utc::now()),
+        };
+        if let Err(e) = self.redis.publish(channels::NOTIFICATION_EVENTS, &event).await {
+            warn!("Failed to publish trade exit notification: {}", e);
+        }
 
         // Format direction as "to win" / "to lose" for clarity
         let direction_str = match position.side {

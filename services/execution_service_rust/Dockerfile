@@ -13,6 +13,7 @@ COPY services/orchestrator_rust ./services/orchestrator_rust
 COPY services/execution_service_rust ./services/execution_service_rust
 COPY services/signal_processor_rust ./services/signal_processor_rust
 COPY services/position_tracker_rust ./services/position_tracker_rust
+COPY services/notification_service_rust ./services/notification_service_rust
 
 # Build specific member
 RUN cargo build --release --bin execution_service_rust

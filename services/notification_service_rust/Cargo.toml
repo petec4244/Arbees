@@ -1,0 +1,27 @@
+[package]
+name = "notification_service_rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "notification_service"
+path = "src/main.rs"
+
+[dependencies]
+arbees_rust_core = { path = "../../rust_core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+redis = { workspace = true }
+anyhow = { workspace = true }
+dotenv = { workspace = true }
+futures-util = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+# Timezone support for quiet hours
+chrono-tz = "0.10"

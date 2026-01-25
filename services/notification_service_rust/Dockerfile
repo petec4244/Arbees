@@ -19,22 +19,24 @@ COPY services/position_tracker_rust /build/services/position_tracker_rust
 COPY services/notification_service_rust /build/services/notification_service_rust
 
 # Build release binary
-RUN cargo build --release --bin orchestrator_rust
+RUN cargo build --release --bin notification_service
 
 # Runtime stage
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/orchestrator_rust /app/orchestrator_rust
+COPY --from=builder /build/target/release/notification_service /app/notification_service
 
 # Set environment
 ENV RUST_LOG=info
 ENV REDIS_URL=redis://redis:6379
 
-CMD ["/app/orchestrator_rust"]
+CMD ["/app/notification_service"]
+

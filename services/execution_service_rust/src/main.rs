@@ -1,7 +1,10 @@
 mod engine;
 
 use anyhow::Result;
-use arbees_rust_core::models::{ExecutionRequest, ExecutionResult, ExecutionStatus};
+use arbees_rust_core::models::{
+    channels, ExecutionRequest, ExecutionResult, ExecutionStatus, NotificationEvent,
+    NotificationPriority, NotificationType,
+};
 use arbees_rust_core::redis::bus::RedisBus;
 use chrono::Utc;
 use dotenv::dotenv;
@@ -17,7 +20,8 @@ async fn main() -> Result<()> {
 
     info!("Starting ExecutionService Rust Service...");
 
-    let paper_trading = env::var("PAPER_TRADING").unwrap_or_else(|_| "true".to_string()) == "true";
+    let paper_trading_val = env::var("PAPER_TRADING").unwrap_or_else(|_| "1".to_string());
+    let paper_trading = matches!(paper_trading_val.to_lowercase().as_str(), "1" | "true" | "yes");
     let engine = ExecutionEngine::new(paper_trading);
     let redis = RedisBus::new().await?;
 
@@ -75,7 +79,24 @@ async fn main() -> Result<()> {
             }
         };
 
-        if let Err(e) = redis.publish("execution:results", &result).await {
+        // Publish notification on execution failure
+        if result.status == ExecutionStatus::Failed {
+            let event = NotificationEvent {
+                event_type: NotificationType::Error,
+                priority: NotificationPriority::Error,
+                data: serde_json::json!({
+                    "service": "execution_service_rust",
+                    "request_id": result.request_id,
+                    "message": result.rejection_reason.clone().unwrap_or_else(|| "execution_failed".to_string()),
+                }),
+                ts: Some(Utc::now()),
+            };
+            if let Err(e) = redis.publish(channels::NOTIFICATION_EVENTS, &event).await {
+                warn!("Failed to publish notification event: {}", e);
+            }
+        }
+
+        if let Err(e) = redis.publish(channels::EXECUTION_RESULTS, &result).await {
             error!("Failed to publish execution result: {}", e);
         }
     }

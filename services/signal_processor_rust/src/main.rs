@@ -8,8 +8,9 @@
 
 use anyhow::{Context, Result};
 use arbees_rust_core::models::{
-    channels, ExecutionRequest, ExecutionSide, Platform, RuleDecision, RuleDecisionType,
-    SignalDirection, Sport, TradingSignal,
+    channels, ExecutionRequest, ExecutionSide, NotificationEvent, NotificationPriority,
+    NotificationType, Platform, RuleDecision, RuleDecisionType, SignalDirection, Sport,
+    TradingSignal,
 };
 use arbees_rust_core::redis::RedisBus;
 use arbees_rust_core::utils::matching::match_team_in_text;
@@ -29,6 +30,15 @@ use uuid::Uuid;
 // ============================================================================
 // Configuration
 // ============================================================================
+
+#[derive(Debug, Clone)]
+struct RiskSnapshot {
+    balance: f64,
+    daily_loss: f64,
+    game_exposure: f64,
+    sport_exposure: f64,
+    position_count: i64,
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -368,51 +378,82 @@ impl SignalProcessorState {
         Ok(row.get::<i64, _>("count"))
     }
 
-    /// Master risk check - returns None if approved, Some(reason) if rejected
-    async fn check_risk_limits(&self, signal: &TradingSignal, proposed_size: f64) -> Result<Option<String>> {
-        // 1. Check bankroll sufficiency
+    /// Master risk check - returns (approved, rejection_reason, snapshot)
+    async fn check_risk_limits(
+        &self,
+        signal: &TradingSignal,
+        proposed_size: f64,
+    ) -> Result<(bool, Option<String>, RiskSnapshot)> {
+        // Precompute the relevant context for both logging and notifications.
         let balance = self.get_available_balance().await?;
+        let daily_loss = self.get_daily_loss().await?;
+        let game_exposure = self.get_game_exposure(&signal.game_id).await?;
+        let sport_exposure = self.get_sport_exposure(signal.sport).await?;
+        let position_count = self.count_game_positions(&signal.game_id).await?;
+
+        let snapshot = RiskSnapshot {
+            balance,
+            daily_loss,
+            game_exposure,
+            sport_exposure,
+            position_count,
+        };
+
+        // 1. Check bankroll sufficiency
         if proposed_size > balance {
-            return Ok(Some(format!(
-                "Insufficient balance: proposed ${:.2} > available ${:.2}",
-                proposed_size, balance
-            )));
+            return Ok((
+                false,
+                Some(format!(
+                    "Insufficient balance: proposed ${:.2} > available ${:.2}",
+                    proposed_size, balance
+                )),
+                snapshot,
+            ));
         }
 
         // 2. Check daily loss limit
-        let daily_loss = self.get_daily_loss().await?;
         if daily_loss >= self.config.max_daily_loss {
-            return Ok(Some(format!(
-                "Daily loss limit reached: ${:.2} >= ${:.2}",
-                daily_loss, self.config.max_daily_loss
-            )));
+            return Ok((
+                false,
+                Some(format!(
+                    "Daily loss limit reached: ${:.2} >= ${:.2}",
+                    daily_loss, self.config.max_daily_loss
+                )),
+                snapshot,
+            ));
         }
 
         // 3. Check game exposure limit
-        let game_exposure = self.get_game_exposure(&signal.game_id).await?;
         if game_exposure + proposed_size > self.config.max_game_exposure {
-            return Ok(Some(format!(
-                "Game exposure limit: ${:.2} + ${:.2} > ${:.2}",
-                game_exposure, proposed_size, self.config.max_game_exposure
-            )));
+            return Ok((
+                false,
+                Some(format!(
+                    "Game exposure limit: ${:.2} + ${:.2} > ${:.2}",
+                    game_exposure, proposed_size, self.config.max_game_exposure
+                )),
+                snapshot,
+            ));
         }
 
         // 4. Check sport exposure limit
-        let sport_exposure = self.get_sport_exposure(signal.sport).await?;
         if sport_exposure + proposed_size > self.config.max_sport_exposure {
-            return Ok(Some(format!(
-                "Sport exposure limit: ${:.2} + ${:.2} > ${:.2}",
-                sport_exposure, proposed_size, self.config.max_sport_exposure
-            )));
+            return Ok((
+                false,
+                Some(format!(
+                    "Sport exposure limit: ${:.2} + ${:.2} > ${:.2}",
+                    sport_exposure, proposed_size, self.config.max_sport_exposure
+                )),
+                snapshot,
+            ));
         }
 
         // 5. Check position count per game (max 2)
-        let position_count = self.count_game_positions(&signal.game_id).await?;
         if position_count >= 2 {
-            return Ok(Some(format!(
-                "Max positions per game: {} >= 2",
-                position_count
-            )));
+            return Ok((
+                false,
+                Some(format!("Max positions per game: {} >= 2", position_count)),
+                snapshot,
+            ));
         }
 
         // All checks passed - format direction for clarity
@@ -425,7 +466,7 @@ impl SignalProcessorState {
             "OPEN: {} {} - ${:.2} (balance=${:.2}, game_exp=${:.2})",
             signal.team, direction_str, proposed_size, balance, game_exposure
         );
-        Ok(None)
+        Ok((true, None, snapshot))
     }
 
     fn evaluate_rules(&self, signal: &TradingSignal) -> RuleDecision {
@@ -816,12 +857,37 @@ impl SignalProcessorState {
         let proposed_size = self.estimate_position_size(&signal).await?;
 
         // Risk check - MUST pass before execution
-        if let Some(rejection) = self.check_risk_limits(&signal, proposed_size).await? {
+        let (approved, rejection, snapshot) = self.check_risk_limits(&signal, proposed_size).await?;
+        if !approved {
             *self
                 .rejected_counts
                 .entry("risk".to_string())
                 .or_insert(0) += 1;
+            let rejection = rejection.unwrap_or_else(|| "risk_rejected".to_string());
             warn!("RISK REJECTED: {} {} - {}", signal.game_id, signal.team, rejection);
+
+            // Publish notification
+            let event = NotificationEvent {
+                event_type: NotificationType::RiskRejection,
+                priority: NotificationPriority::Warning,
+                data: serde_json::json!({
+                    "game_id": signal.game_id,
+                    "sport": serde_json::to_value(signal.sport).unwrap_or_else(|_| serde_json::Value::Null),
+                    "team": signal.team,
+                    "edge_pct": signal.edge_pct,
+                    "size": proposed_size,
+                    "rejection_reason": rejection,
+                    "balance": snapshot.balance,
+                    "daily_loss": snapshot.daily_loss,
+                    "game_exposure": snapshot.game_exposure,
+                    "sport_exposure": snapshot.sport_exposure,
+                    "position_count": snapshot.position_count,
+                }),
+                ts: Some(Utc::now()),
+            };
+            if let Err(e) = self.redis.publish(channels::NOTIFICATION_EVENTS, &event).await {
+                warn!("Failed to publish risk rejection notification: {}", e);
+            }
             return Ok(());
         }
 
