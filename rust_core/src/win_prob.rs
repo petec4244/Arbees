@@ -220,6 +220,17 @@ pub fn calculate_win_prob_delta(
     new_prob - old_prob
 }
 
+/// Batch calculate win probabilities for multiple game states.
+///
+/// Uses parallel processing for optimal performance.
+pub fn batch_calculate_win_probs(states: &[GameState], for_home: bool) -> Vec<f64> {
+    use rayon::prelude::*;
+    states
+        .par_iter()
+        .map(|state| calculate_win_probability(state, for_home))
+        .collect()
+}
+
 /// Estimate expected points from current field position (NFL/NCAAF)
 ///
 /// Based on historical expected points models.

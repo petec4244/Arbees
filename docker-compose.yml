@@ -41,7 +41,7 @@ services:
     image: bbernhard/signal-cli-rest-api:latest
     container_name: arbees-signal-cli-rest-api
     environment:
-      - MODE=native
+      - MODE=json-rpc
     ports:
       - "9922:8080"
     volumes:
