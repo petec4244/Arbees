@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Arbees Report - 2026-01-24</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        h1, h2, h3 { color: #4ade80; }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 15px 0;
+        }
+        th, td {
+            border: 1px solid #444;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        th { background: #2d2d44; }
+        tr:nth-child(even) { background: #242438; }
+        .positive { color: #4ade80; }
+        .negative { color: #f87171; }
+        code { background: #2d2d44; padding: 2px 6px; border-radius: 4px; }
+        hr { border: none; border-top: 1px solid #444; margin: 30px 0; }
+    </style>
+</head>
+<body>
+<h1>Arbees Trading Report - January 24, 2026</h1>
+<h2>Executive Summary</h2>
+<ul>
+<li><strong>Daily P&amp;L:</strong> $-299.03 </li>
+<li><strong>Win Rate:</strong> 31.0% (13 wins / 42 trades)</li>
+<li><strong>Avg Edge:</strong> 2461.25%</li>
+<li><strong>Signal Capture:</strong> 42/238 (18%)</li>
+</ul>
+<hr />
+<h2>What Went Well</h2>
+<ul>
+<li>Consistent performance across all categories</li>
+</ul>
+<h2>What Needs Improvement</h2>
+<ol>
+<li><strong>NBA underperformed:</strong> 30% win rate ($-44.01 loss)</li>
+<li><strong>Missed 196 signals</strong> (82% not captured)</li>
+<li><strong>Win Prob Shift</strong> signals struggling (31% win rate)</li>
+</ol>
+<hr />
+<h2>Losing Trades Analysis</h2>
+<p><strong>Total Losses:</strong> $377.44 (29 trades)</p>
+<p><strong>Top Losses:</strong>
+1. NBA - 1st Period ($-87.20) - Edge was 3793.7%
+2. NBA - 1st Period ($-83.31) - Edge was 2546.6%
+3. NBA - 1st Period ($-81.32) - Edge was 9013.4%</p>
+<hr />
+<h2>Recommended Changes</h2>
+<ol>
+<li><strong>Reduce NBA Exposure</strong> [medium confidence]</li>
+<li>Current: <code>unrestricted</code></li>
+<li>Recommended: <code>max 50% of NBA positions</code></li>
+<li>Impact: Reduce exposure to sport with 30% win rate</li>
+<li>
+<p>Rationale: NBA has 30% win rate over 20 trades</p>
+</li>
+<li>
+<p><strong>Improve Signal Capture Rate</strong> [high confidence]</p>
+</li>
+<li>Current: <code>18% captured</code></li>
+<li>Recommended: <code>target 70%+ capture rate</code></li>
+<li>Impact: Currently missing 82% of signals</li>
+<li>
+<p>Rationale: Top reason for missed signals: risk_limits (196 signals)</p>
+</li>
+<li>
+<p><strong>Reduce Kelly Fraction</strong> [medium confidence]</p>
+</li>
+<li>Current: <code>0.25</code></li>
+<li>Recommended: <code>0.2</code></li>
+<li>Impact: Reduce drawdown risk with 31% win rate</li>
+<li>
+<p>Rationale: Win rate below 45% suggests reducing position sizing</p>
+</li>
+<li>
+<p><strong>Adjust kelly_fraction</strong> [high confidence]</p>
+</li>
+<li>Current: <code>0.25</code></li>
+<li>Recommended: <code>0.41</code></li>
+<li>Impact: high</li>
+<li>Rationale: Win rate 94%, avg win $5.43, avg loss $10.73. Full Kelly = 0.83, using half-Kelly = 0.41</li>
+</ol>
+<hr />
+<h2>Performance by Category</h2>
+<h3>By Sport</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NCAAB</td>
+<td>1</td>
+<td>0</td>
+<td>0%</td>
+<td>$-35.00</td>
+</tr>
+<tr>
+<td>NBA</td>
+<td>20</td>
+<td>6</td>
+<td>30%</td>
+<td>$-44.01</td>
+</tr>
+<tr>
+<td>NHL</td>
+<td>21</td>
+<td>7</td>
+<td>33%</td>
+<td>$-220.02</td>
+</tr>
+</tbody>
+</table>
+<h3>By Signal Type</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Win Prob Shift</td>
+<td>42</td>
+<td>13</td>
+<td>31%</td>
+<td>$-299.03</td>
+</tr>
+</tbody>
+</table>
+<h3>By Edge Range</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3-5%</td>
+<td>1</td>
+<td>0</td>
+<td>0%</td>
+<td>$-12.09</td>
+</tr>
+<tr>
+<td>5%+</td>
+<td>41</td>
+<td>13</td>
+<td>32%</td>
+<td>$-286.94</td>
+</tr>
+</tbody>
+</table>
+<h3>By Game Period</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1st Period</td>
+<td>42</td>
+<td>13</td>
+<td>31%</td>
+<td>$-299.03</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>Missed Opportunities</h2>
+<p><strong>Signals Generated:</strong> 238
+<strong>Signals Executed:</strong> 42
+<strong>Capture Rate:</strong> 18%</p>
+<p><strong>Reasons for Missed Signals:</strong>
+- Risk Limits: 196</p>
+<hr />
+<p><em>Generated automatically by Arbees ML Analyzer</em></p>
+</body>
+</html>

@@ -69,7 +69,7 @@ async def diagnose():
             warnings.append(f"Rust core error: {e}")
     except ImportError as e:
         print(f"  ✗ Rust core import failed: {e}")
-        errors.append("Rust core not built. Run: cd rust_core && maturin develop --release")
+        errors.append("Rust core not built. Run: cd arbees_core && maturin develop --release")
     
     print()
     

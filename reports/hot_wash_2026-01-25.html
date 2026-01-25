@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Arbees Report - 2026-01-25</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        h1, h2, h3 { color: #4ade80; }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 15px 0;
+        }
+        th, td {
+            border: 1px solid #444;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        th { background: #2d2d44; }
+        tr:nth-child(even) { background: #242438; }
+        .positive { color: #4ade80; }
+        .negative { color: #f87171; }
+        code { background: #2d2d44; padding: 2px 6px; border-radius: 4px; }
+        hr { border: none; border-top: 1px solid #444; margin: 30px 0; }
+    </style>
+</head>
+<body>
+<h1>Arbees Trading Report - January 25, 2026</h1>
+<h2>Executive Summary</h2>
+<ul>
+<li><strong>Daily P&amp;L:</strong> $5,470.38 </li>
+<li><strong>Win Rate:</strong> 96.6% (1071 wins / 1109 trades)</li>
+<li><strong>Avg Edge:</strong> 0.00%</li>
+<li><strong>Signal Capture:</strong> 1109/0 (0%)</li>
+</ul>
+<hr />
+<h2>What Went Well</h2>
+<ol>
+<li><strong>NBA performed well:</strong> 97% win rate (398/410 trades, $4092.31 P&amp;L)</li>
+<li><strong>Edge range 0-1%</strong> achieved 97% win rate</li>
+<li><strong>Unknown (-1)</strong> signals had 97% success rate</li>
+<li><strong>Overall win rate above 55%</strong> - strategy is profitable</li>
+</ol>
+<h2>What Needs Improvement</h2>
+<ul>
+<li>No major issues identified today</li>
+</ul>
+<hr />
+<h2>Losing Trades Analysis</h2>
+<p><strong>Total Losses:</strong> $79.34 (38 trades)</p>
+<p><strong>Top Losses:</strong>
+1. NHL - 1st Period ($-16.49) - Edge was 0.0%
+2. NHL - 1st Period ($-16.49) - Edge was 0.0%
+3. NHL - 1st Period ($-15.97) - Edge was 0.0%</p>
+<hr />
+<h2>Recommended Changes</h2>
+<ol>
+<li><strong>Consider Increasing Kelly Fraction</strong> [low confidence]</li>
+<li>Current: <code>0.25</code></li>
+<li>Recommended: <code>0.3</code></li>
+<li>Impact: Capitalize on 97% win rate</li>
+<li>
+<p>Rationale: Win rate above 55% suggests conservative sizing may leave money on table</p>
+</li>
+<li>
+<p><strong>Adjust kelly_fraction</strong> [high confidence]</p>
+</li>
+<li>Current: <code>0.25</code></li>
+<li>Recommended: <code>0.41</code></li>
+<li>Impact: high</li>
+<li>Rationale: Win rate 94%, avg win $5.43, avg loss $10.73. Full Kelly = 0.83, using half-Kelly = 0.41</li>
+</ol>
+<hr />
+<h2>Performance by Category</h2>
+<h3>By Sport</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NBA</td>
+<td>410</td>
+<td>398</td>
+<td>97%</td>
+<td>+$4,092.31</td>
+</tr>
+<tr>
+<td>NHL</td>
+<td>699</td>
+<td>673</td>
+<td>96%</td>
+<td>+$1,378.08</td>
+</tr>
+</tbody>
+</table>
+<h3>By Signal Type</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unknown (-1)</td>
+<td>1109</td>
+<td>1071</td>
+<td>97%</td>
+<td>+$5,470.38</td>
+</tr>
+</tbody>
+</table>
+<h3>By Edge Range</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0-1%</td>
+<td>1109</td>
+<td>1071</td>
+<td>97%</td>
+<td>+$5,470.38</td>
+</tr>
+</tbody>
+</table>
+<h3>By Game Period</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1st Period</td>
+<td>1109</td>
+<td>1071</td>
+<td>97%</td>
+<td>+$5,470.38</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>Missed Opportunities</h2>
+<p>All signals were captured!</p>
+<hr />
+<p><em>Generated automatically by Arbees ML Analyzer</em></p>
+</body>
+</html>

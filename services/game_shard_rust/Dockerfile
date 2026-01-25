@@ -2,17 +2,12 @@ FROM rustlang/rust:nightly as builder
 
 WORKDIR /usr/src/app
 
-# Copy workspace definition (from project root via docker-compose or services/ via manual)
-COPY services/Cargo.toml services/Cargo.lock ./
+# Copy workspace definition
+COPY Cargo.toml Cargo.lock ./
 
-# Copy workspace members (only those in Cargo.toml workspace)
-COPY services/arbees_rust_core arbees_rust_core
-COPY services/market_discovery_rust market_discovery_rust
-COPY services/orchestrator_rust orchestrator_rust
-COPY services/game_shard_rust game_shard_rust
-COPY services/execution_service_rust execution_service_rust
-COPY services/signal_processor_rust signal_processor_rust
-COPY services/position_tracker_rust position_tracker_rust
+# Copy workspace members
+COPY rust_core ./rust_core
+COPY services/game_shard_rust ./services/game_shard_rust
 
 # Build specific member
 RUN cargo build --release --bin game_shard_rust

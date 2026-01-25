@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arbees_rust_core = { path = "../arbees_rust_core" }
+arbees_rust_core = { path = "../../rust_core" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

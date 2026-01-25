@@ -8,8 +8,7 @@
 //! - Field position (NFL/NCAAF)
 //! - Historical data-derived coefficients
 
-use crate::types::{GameState, Sport};
-use rayon::prelude::*;
+use crate::models::{GameState, Sport};
 
 /// Logistic function for probability calculation
 #[inline]
@@ -210,15 +209,7 @@ pub fn calculate_win_probability(state: &GameState, for_home: bool) -> f64 {
     }
 }
 
-/// Batch calculate win probabilities for multiple game states (SIMD-optimized via rayon)
-pub fn batch_calculate_win_probs(states: &[GameState], for_home: bool) -> Vec<f64> {
-    states
-        .par_iter()
-        .map(|state| calculate_win_probability(state, for_home))
-        .collect()
-}
-
-/// Calculate win probability change from a play
+/// Calculate win probability change from a state transition
 pub fn calculate_win_prob_delta(
     old_state: &GameState,
     new_state: &GameState,
@@ -259,12 +250,12 @@ pub fn expected_points_from_field_position(yard_line: u8, down: u8, yards_to_go:
 mod tests {
     use super::*;
 
-    fn make_nfl_state(home_score: u16, away_score: u16, period: u8, time_remaining: u32) -> GameState {
+    fn make_nba_state(home_score: u16, away_score: u16, period: u8, time_remaining: u32) -> GameState {
         GameState {
             game_id: "test".to_string(),
-            sport: Sport::NFL,
-            home_team: "KC".to_string(),
-            away_team: "SF".to_string(),
+            sport: Sport::NBA,
+            home_team: "PHI".to_string(),
+            away_team: "NYK".to_string(),
             home_score,
             away_score,
             period,
@@ -279,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_tied_game_start() {
-        let state = make_nfl_state(0, 0, 1, 900);
+        let state = make_nba_state(0, 0, 1, 720);
         let home_prob = calculate_win_probability(&state, true);
         // Tied game at start should be close to 50%
         assert!((home_prob - 0.5).abs() < 0.05);
@@ -287,31 +278,17 @@ mod tests {
 
     #[test]
     fn test_big_lead_late() {
-        let state = make_nfl_state(28, 7, 4, 120);
+        let state = make_nba_state(110, 85, 4, 60);
         let home_prob = calculate_win_probability(&state, true);
-        // 21 point lead with 2 minutes left should be very high
+        // 25 point lead with 1 minute left should be very high
         assert!(home_prob > 0.95);
     }
 
     #[test]
     fn test_close_game_late() {
-        let state = make_nfl_state(21, 20, 4, 60);
+        let state = make_nba_state(95, 93, 4, 60);
         let home_prob = calculate_win_probability(&state, true);
-        // 1 point lead with 1 minute left should favor home but not certain
-        assert!(home_prob > 0.5 && home_prob < 0.9);
-    }
-
-    #[test]
-    fn test_batch_calculation() {
-        let states = vec![
-            make_nfl_state(14, 7, 2, 600),
-            make_nfl_state(21, 21, 3, 450),
-            make_nfl_state(7, 14, 4, 300),
-        ];
-        let probs = batch_calculate_win_probs(&states, true);
-        assert_eq!(probs.len(), 3);
-        assert!(probs[0] > 0.5);  // Leading
-        assert!((probs[1] - 0.5).abs() < 0.1);  // Tied
-        assert!(probs[2] < 0.5);  // Trailing
+        // 2 point lead with 1 minute left should favor home but not certain
+        assert!(home_prob > 0.5 && home_prob < 0.85);
     }
 }

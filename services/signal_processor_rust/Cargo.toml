@@ -10,7 +10,7 @@ name = "signal_processor"
 path = "src/main.rs"
 
 [dependencies]
-arbees_rust_core = { path = "../arbees_rust_core" }
+arbees_rust_core = { path = "../../rust_core" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
