@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Arbees Report - 2026-01-25</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        h1, h2, h3 { color: #4ade80; }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 15px 0;
+        }
+        th, td {
+            border: 1px solid #444;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        th { background: #2d2d44; }
+        tr:nth-child(even) { background: #242438; }
+        .positive { color: #4ade80; }
+        .negative { color: #f87171; }
+        code { background: #2d2d44; padding: 2px 6px; border-radius: 4px; }
+        hr { border: none; border-top: 1px solid #444; margin: 30px 0; }
+    </style>
+</head>
+<body>
+<h1>Arbees Trading Report - January 25, 2026</h1>
+<h2>Executive Summary</h2>
+<ul>
+<li><strong>Daily P&amp;L:</strong> $5.84 </li>
+<li><strong>Win Rate:</strong> 50.0% (9 wins / 18 trades)</li>
+<li><strong>Avg Edge:</strong> 798.89%</li>
+<li><strong>Signal Capture:</strong> 18/0 (0%)</li>
+</ul>
+<hr />
+<h2>What Went Well</h2>
+<ol>
+<li><strong>NBA performed well:</strong> 75% win rate (6/8 trades, $3.95 P&amp;L)</li>
+<li><strong>Edge range 5%+</strong> achieved 56% win rate</li>
+</ol>
+<h2>What Needs Improvement</h2>
+<ol>
+<li><strong>NFL underperformed:</strong> 25% win rate ($3.11 loss)</li>
+</ol>
+<hr />
+<h2>Losing Trades Analysis</h2>
+<p><strong>Total Losses:</strong> $6.70 (9 trades)</p>
+<p><strong>Top Losses:</strong>
+1. NFL - 1st Period ($-2.13) - Edge was 560.7%
+2. NHL - 1st Period ($-1.58) - Edge was 731.6%
+3. NBA - 1st Period ($-1.40) - Edge was 461.8%</p>
+<hr />
+<h2>Recommended Changes</h2>
+<ol>
+<li><strong>Reduce NFL Exposure</strong> [low confidence]</li>
+<li>Current: <code>unrestricted</code></li>
+<li>Recommended: <code>max 50% of NFL positions</code></li>
+<li>Impact: Reduce exposure to sport with 25% win rate</li>
+<li>
+<p>Rationale: NFL has 25% win rate over 4 trades</p>
+</li>
+<li>
+<p><strong>Adjust kelly_fraction</strong> [high confidence]</p>
+</li>
+<li>Current: <code>0.25</code></li>
+<li>Recommended: <code>0.14</code></li>
+<li>Impact: high</li>
+<li>
+<p>Rationale: Win rate 49%, avg win $2.32, avg loss $0.95. Full Kelly = 0.28, using half-Kelly = 0.14</p>
+</li>
+<li>
+<p><strong>Adjust min_edge_pct</strong> [high confidence]</p>
+</li>
+<li>Current: <code>2.0</code></li>
+<li>Recommended: <code>5.0</code></li>
+<li>Impact: medium</li>
+<li>Rationale: Threshold 5.0% has 49% win rate vs 49% at current 2.0%</li>
+</ol>
+<hr />
+<h2>Performance by Category</h2>
+<h3>By Sport</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NBA</td>
+<td>8</td>
+<td>6</td>
+<td>75%</td>
+<td>+$3.95</td>
+</tr>
+<tr>
+<td>NFL</td>
+<td>4</td>
+<td>1</td>
+<td>25%</td>
+<td>+$3.11</td>
+</tr>
+<tr>
+<td>NHL</td>
+<td>6</td>
+<td>2</td>
+<td>33%</td>
+<td>$-1.22</td>
+</tr>
+</tbody>
+</table>
+<h3>By Signal Type</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unknown (-1)</td>
+<td>18</td>
+<td>9</td>
+<td>50%</td>
+<td>+$5.84</td>
+</tr>
+</tbody>
+</table>
+<h3>By Edge Range</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5%+</td>
+<td>16</td>
+<td>9</td>
+<td>56%</td>
+<td>+$7.33</td>
+</tr>
+<tr>
+<td>3-5%</td>
+<td>2</td>
+<td>0</td>
+<td>0%</td>
+<td>$-1.49</td>
+</tr>
+</tbody>
+</table>
+<h3>By Game Period</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Trades</th>
+<th>Wins</th>
+<th>Win Rate</th>
+<th>P&amp;L</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1st Period</td>
+<td>18</td>
+<td>9</td>
+<td>50%</td>
+<td>+$5.84</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>Missed Opportunities</h2>
+<p>All signals were captured!</p>
+<hr />
+<p><em>Generated automatically by Arbees ML Analyzer</em></p>
+</body>
+</html>
