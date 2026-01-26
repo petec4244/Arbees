@@ -34,7 +34,9 @@ pub mod team_cache;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
+#[cfg(feature = "python")]
 use rayon::prelude::*;
+#[cfg(feature = "python")]
 use std::collections::HashMap;
 
 pub use types::*;
@@ -49,6 +51,7 @@ pub use win_prob::*;
 /// At expiry, exactly ONE side pays $1.00, guaranteeing profit.
 ///
 /// Returns a list of `ArbitrageOpportunity` objects.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 fn find_cross_market_arbitrage(
     market_a: &MarketPrice,
@@ -126,6 +129,7 @@ fn find_cross_market_arbitrage(
 /// Buy BOTH YES and NO, guaranteed $1.00 payout at expiry.
 ///
 /// This is rare but happens during market inefficiencies.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 fn find_same_platform_arbitrage(
     market: &MarketPrice,
@@ -167,6 +171,7 @@ fn find_same_platform_arbitrage(
 /// Find model edge opportunities comparing model probability to market prices.
 ///
 /// Generates signals when model probability significantly differs from market prices.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 fn find_model_edges(
     market: &MarketPrice,
@@ -244,6 +249,7 @@ fn find_model_edges(
 }
 
 /// Detect lagging/stale markets that haven't updated recently.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 fn detect_lagging_market(
     market: &MarketPrice,
@@ -282,6 +288,7 @@ fn detect_lagging_market(
 }
 
 // Helper function to convert types::GameState to models::GameState
+#[cfg(feature = "python")]
 fn convert_game_state(state: &GameState) -> models::GameState {
     let sport = match state.sport {
         Sport::NFL => models::Sport::NFL,
@@ -316,6 +323,7 @@ fn convert_game_state(state: &GameState) -> models::GameState {
 /// Calculate win probability for a team.
 ///
 /// Returns probability (0.0 to 1.0) that the specified team wins.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 #[cfg_attr(feature = "python", pyo3(name = "calculate_win_probability"))]
 fn py_calculate_win_probability(state: &GameState, for_home: bool) -> f64 {
@@ -326,6 +334,7 @@ fn py_calculate_win_probability(state: &GameState, for_home: bool) -> f64 {
 /// Batch calculate win probabilities for multiple game states.
 ///
 /// Uses parallel processing for optimal performance.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 #[cfg_attr(feature = "python", pyo3(name = "batch_calculate_win_probs"))]
 fn py_batch_calculate_win_probs(states: Vec<GameState>, for_home: bool) -> Vec<f64> {
@@ -334,6 +343,7 @@ fn py_batch_calculate_win_probs(states: Vec<GameState>, for_home: bool) -> Vec<f
 }
 
 /// Calculate win probability change from a play.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 #[cfg_attr(feature = "python", pyo3(name = "calculate_win_prob_delta"))]
 fn py_calculate_win_prob_delta(
@@ -347,6 +357,7 @@ fn py_calculate_win_prob_delta(
 }
 
 /// Calculate expected points from NFL field position.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 #[cfg_attr(feature = "python", pyo3(name = "expected_points"))]
 fn py_expected_points(yard_line: u8, down: u8, yards_to_go: u8) -> f64 {
@@ -354,6 +365,7 @@ fn py_expected_points(yard_line: u8, down: u8, yards_to_go: u8) -> f64 {
 }
 
 /// Generate trading signal from win probability change.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 fn generate_signal_from_prob_change(
     game_id: String,
@@ -405,6 +417,7 @@ fn generate_signal_from_prob_change(
 }
 
 /// Scan multiple market pairs for arbitrage opportunities in parallel.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyfunction)]
 fn batch_scan_arbitrage(
     markets: HashMap<String, Vec<MarketPrice>>,
@@ -530,7 +543,7 @@ fn arbees_core(_py: Python, m: &PyModule) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "python"))]
 mod tests {
     use super::*;
 

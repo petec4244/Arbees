@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "python"))]
 use std::sync::Arc;
 
 /// Kalshi fee table: fee in basis points (0.01%) for each price from 0-100 cents.
@@ -317,11 +318,13 @@ impl GlobalState {
 // ============================================================================
 
 /// Python wrapper for AtomicOrderbook.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "AtomicOrderbook"))]
 pub struct PyAtomicOrderbook {
     inner: AtomicOrderbook,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyAtomicOrderbook {
     #[cfg_attr(feature = "python", new)]
@@ -353,11 +356,13 @@ impl PyAtomicOrderbook {
 }
 
 /// Python wrapper for GlobalState.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "GlobalState"))]
 pub struct PyGlobalState {
     inner: Arc<GlobalState>,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyGlobalState {
     #[cfg_attr(feature = "python", new)]

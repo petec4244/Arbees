@@ -15,10 +15,6 @@ services:
     container_name: arbees-timescaledb
     env_file:
       - .env
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-arbees}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
-      POSTGRES_DB: ${POSTGRES_DB:-arbees}
     ports:
       - "5432:5432"
     volumes:
@@ -49,8 +45,8 @@ services:
   signal-cli-rest-api:
     image: bbernhard/signal-cli-rest-api:latest
     container_name: arbees-signal-cli-rest-api
-    environment:
-      - MODE=json-rpc
+    env_file:
+      - .env
     ports:
       - "9922:8080"
     volumes:
@@ -71,21 +67,6 @@ services:
         condition: service_started
     env_file:
       - .env
-    environment:
-      REDIS_URL: redis://redis:6379
-      SIGNAL_API_BASE_URL: http://signal-cli-rest-api:8080
-      # Required for notifications to work (service will fail gracefully if not set):
-      SIGNAL_SENDER_NUMBER: ${SIGNAL_SENDER_NUMBER:-}
-      SIGNAL_RECIPIENTS: ${SIGNAL_RECIPIENTS:-}
-      # Quiet hours + rate limiting (defaults exist; override as needed)
-      QUIET_HOURS_ENABLED: ${QUIET_HOURS_ENABLED:-true}
-      QUIET_HOURS_START: ${QUIET_HOURS_START:-22:00}
-      QUIET_HOURS_END: ${QUIET_HOURS_END:-07:00}
-      QUIET_HOURS_TIMEZONE: ${QUIET_HOURS_TIMEZONE:-America/New_York}
-      QUIET_HOURS_MIN_PRIORITY: ${QUIET_HOURS_MIN_PRIORITY:-CRITICAL}
-      RATE_LIMIT_MAX_PER_MINUTE: ${RATE_LIMIT_MAX_PER_MINUTE:-10}
-      RATE_LIMIT_BYPASS_CRITICAL: ${RATE_LIMIT_BYPASS_CRITICAL:-true}
-      RUST_LOG: debug
     restart: unless-stopped
     profiles:
       - full
@@ -104,9 +85,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    environment:
-      REDIS_URL: redis://redis:6379
-      RUST_LOG: info
+    env_file:
+      - .env
     profiles:
       - full
 
@@ -138,26 +118,6 @@ services:
         condition: service_started
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: DEBUG
-      # Phase 4: Always use Rust discovery in production
-      MARKET_DISCOVERY_MODE: "rust"
-      # Unified team matching configuration
-      TEAM_MATCH_MIN_CONFIDENCE: "0.7"
-      # Supervisor (container health monitoring + auto-restart)
-      SUPERVISOR_ENABLED: ${SUPERVISOR_ENABLED:-true}
-      MAX_RESTART_ATTEMPTS: ${MAX_RESTART_ATTEMPTS:-3}
-      RESTART_BACKOFF_SECS: ${RESTART_BACKOFF_SECS:-5,15,45}
-      RESTART_COOLDOWN_SECS: ${RESTART_COOLDOWN_SECS:-600}
-      SUPERVISOR_CHECK_INTERVAL_SECS: ${SUPERVISOR_CHECK_INTERVAL_SECS:-15}
-      HEARTBEAT_MISS_THRESHOLD: ${HEARTBEAT_MISS_THRESHOLD:-3}
-      # Heartbeat settings (all services use these)
-      HEARTBEAT_INTERVAL_SECS: ${HEARTBEAT_INTERVAL_SECS:-10}
-      HEARTBEAT_TTL_SECS: ${HEARTBEAT_TTL_SECS:-35}
-      # Kalshi rate limiting - delay between API requests in milliseconds
-      KALSHI_REQUEST_DELAY_MS: ${KALSHI_REQUEST_DELAY_MS:-250}
     # NOTE: No volume mount for Rust orchestrator - binary is compiled in image
     # Mount Docker socket only if supervisor functionality is needed
     # volumes:
@@ -182,20 +142,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      SHARD_ID: shard-1
-      RUST_LOG: info
-      POLL_INTERVAL: ${POLL_INTERVAL:-1.0}
-      CRUNCH_TIME_INTERVAL: ${CRUNCH_TIME_INTERVAL:-0.5}
-      HALFTIME_INTERVAL: ${HALFTIME_INTERVAL:-30.0}
-      MARKET_DATA_TTL: ${MARKET_DATA_TTL:-4.0}
-      SYNC_DELTA_TOLERANCE: ${SYNC_DELTA_TOLERANCE:-2.0}
-      # Signal debouncing (prevents signal spam)
-      SIGNAL_DEBOUNCE_SECS: "30"
-      # Phase 3: Always use Redis for Polymarket prices (via polymarket_monitor)
-      POLYMARKET_VIA_REDIS: "true"
     ports:
       - "8001:80"
     volumes:
@@ -218,10 +164,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
     ports:
       - "8000:8000"
     volumes:
@@ -250,26 +192,6 @@ services:
         condition: service_started
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      RUST_LOG: info
-      # Risk management limits (tightened after 26x leverage incident)
-      MAX_DAILY_LOSS: "100.0"
-      MAX_GAME_EXPOSURE: "50.0"
-      MAX_SPORT_EXPOSURE: "200.0"
-      # Trading parameters (more conservative)
-      MIN_EDGE_PCT: "3.0"
-      KELLY_FRACTION: "0.15"
-      MAX_POSITION_PCT: "5.0"
-      MAX_BUY_PROB: "0.95"
-      MIN_SELL_PROB: "0.05"
-      INITIAL_BANKROLL: "1000"
-      # Cooldown timers
-      WIN_COOLDOWN_SECONDS: "180"
-      LOSS_COOLDOWN_SECONDS: "300"
-      # Unified team matching configuration
-      TEAM_MATCH_MIN_CONFIDENCE: "0.7"
     profiles:
       - full
 
@@ -288,16 +210,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      RUST_LOG: info
-      PAPER_TRADING: "1" # Set to "0" for real trading
-      INITIAL_BANKROLL: "1000"
-      MIN_EDGE_PCT: "2.0"
-      KELLY_FRACTION: "0.25"
-      MAX_POSITION_PCT: "10.0"
-      SLIPPAGE_BPS: "10.0"
     volumes:
       - ./:/app
     profiles:
@@ -317,19 +229,6 @@ services:
         condition: service_started
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      RUST_LOG: info
-      INITIAL_BANKROLL: "1000"
-      # Exit monitoring parameters
-      TAKE_PROFIT_PCT: "5.0"
-      DEFAULT_STOP_LOSS_PCT: "5.0"
-      EXIT_CHECK_INTERVAL_SECS: "1.0"
-      # Minimum hold time before considering exits (prevents churning)
-      MIN_HOLD_SECONDS: "30"
-      # Unified team matching configuration
-      EXIT_TEAM_MATCH_MIN_CONFIDENCE: "0.7"
     profiles:
       - full
 
@@ -346,33 +245,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
-      # Risk management limits
-      MAX_DAILY_LOSS: "500.0"
-      MAX_GAME_EXPOSURE: "100.0"
-      MAX_SPORT_EXPOSURE: "800.0"
-      # Trading parameters
-      INITIAL_BANKROLL: "1000"
-      MIN_EDGE_PCT: "2.0"
-      KELLY_FRACTION: "0.25"
-      MAX_POSITION_PCT: "10.0"
-      # Exit monitoring parameters
-      TAKE_PROFIT_PCT: "3.0" # Exit when prob moves 3%+ in our favor
-      DEFAULT_STOP_LOSS_PCT: "5.0" # Fallback if sport not configured
-      EXIT_CHECK_INTERVAL: "1.0" # Check positions every 1 second
-      # Sport-specific stop-loss thresholds (override defaults)
-      STOP_LOSS_NBA: "3.0"
-      STOP_LOSS_NCAAB: "3.0"
-      STOP_LOSS_NFL: "5.0"
-      STOP_LOSS_NHL: "7.0"
-      STOP_LOSS_MLB: "6.0"
-      STOP_LOSS_SOCCER: "7.0"
-      # Cooldown timers (prevent rapid re-entry on same game)
-      WIN_COOLDOWN_SECONDS: "180" # 3 minutes after a win
-      LOSS_COOLDOWN_SECONDS: "300" # 5 minutes after a loss
     volumes:
       - ./:/app
     profiles:
@@ -397,39 +269,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
-      # Archiver configuration
-      ARCHIVER_GRACE_PERIOD_MINUTES: "60"
-      ARCHIVER_BATCH_SIZE: "10"
-      ARCHIVER_POLL_INTERVAL: "300"
-      ARCHIVER_CLEANUP_LIVE_DATA: "false"
-      # ML Analyzer configuration
-      ML_ANALYZER_RUN_TIME: "23:00"
-      ML_MIN_TRADES: "100"
-      ML_LOOKBACK_DAYS: "30"
-      ML_RETRAIN_INTERVAL: "7"
-      ML_REPORT_DIR: "/app/reports"
-      # File delivery (always enabled)
-      ML_ENABLE_FILE_DELIVERY: "true"
-      # Slack delivery (optional)
-      ML_SLACK_ENABLED: "${ML_SLACK_ENABLED:-false}"
-      ML_SLACK_WEBHOOK: "${ML_SLACK_WEBHOOK:-}"
-      ML_SLACK_CHANNEL: "${ML_SLACK_CHANNEL:-}"
-      # Email delivery (optional)
-      ML_EMAIL_ENABLED: "${ML_EMAIL_ENABLED:-false}"
-      ML_SMTP_HOST: "${ML_SMTP_HOST:-smtp.gmail.com}"
-      ML_SMTP_PORT: "${ML_SMTP_PORT:-587}"
-      ML_SMTP_USER: "${ML_SMTP_USER:-}"
-      ML_SMTP_PASSWORD: "${ML_SMTP_PASSWORD:-}"
-      ML_EMAIL_FROM: "${ML_EMAIL_FROM:-}"
-      ML_EMAIL_TO: "${ML_EMAIL_TO:-}"
-      # Feedback service configuration
-      FEEDBACK_MODE: "learning"
-      PATTERN_CHECK_INTERVAL: "300"
-      FEEDBACK_LOOKBACK_HOURS: "24"
     volumes:
       - ./:/app
       - ./reports:/app/reports
@@ -449,14 +288,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
-      ARCHIVER_GRACE_PERIOD_MINUTES: "60"
-      ARCHIVER_BATCH_SIZE: "10"
-      ARCHIVER_POLL_INTERVAL: "300"
-      ARCHIVER_CLEANUP_LIVE_DATA: "false"
     volumes:
       - ./:/app
     profiles:
@@ -475,26 +306,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-arbees}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-arbees}
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
-      ML_ANALYZER_RUN_TIME: "23:00"
-      ML_MIN_TRADES: "100"
-      ML_LOOKBACK_DAYS: "30"
-      ML_RETRAIN_INTERVAL: "7"
-      ML_REPORT_DIR: "/app/reports"
-      ML_ENABLE_FILE_DELIVERY: "true"
-      ML_SLACK_ENABLED: "${ML_SLACK_ENABLED:-false}"
-      ML_SLACK_WEBHOOK: "${ML_SLACK_WEBHOOK:-}"
-      ML_SLACK_CHANNEL: "${ML_SLACK_CHANNEL:-}"
-      ML_EMAIL_ENABLED: "${ML_EMAIL_ENABLED:-false}"
-      ML_SMTP_HOST: "${ML_SMTP_HOST:-smtp.gmail.com}"
-      ML_SMTP_PORT: "${ML_SMTP_PORT:-587}"
-      ML_SMTP_USER: "${ML_SMTP_USER:-}"
-      ML_SMTP_PASSWORD: "${ML_SMTP_PASSWORD:-}"
-      ML_EMAIL_FROM: "${ML_EMAIL_FROM:-}"
-      ML_EMAIL_TO: "${ML_EMAIL_TO:-}"
     volumes:
       - ./:/app
       - ./reports:/app/reports
@@ -569,14 +380,8 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
-    environment:
-      - VPN_SERVICE_PROVIDER=nordvpn
-      - OPENVPN_USER=${NORDVPN_USER:?NORDVPN_USER required in .env}
-      - OPENVPN_PASSWORD=${NORDVPN_PASS:?NORDVPN_PASS required in .env}
-      - SERVER_COUNTRIES=${VPN_COUNTRY:-Netherlands}
-      # Allow outbound to Docker networks so monitor can reach Redis
-      - FIREWALL_OUTBOUND_SUBNETS=172.16.0.0/12,10.0.0.0/8,192.168.0.0/16
-      - HEALTH_VPN_DURATION_INITIAL=30s
+    env_file:
+      - .env
     healthcheck:
       # Use HTTP (not HTTPS) to avoid CA/cert issues inside minimal images causing false "unhealthy".
       test: [ "CMD", "wget", "-q", "--spider", "http://ipinfo.io/json" ]
@@ -601,11 +406,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=INFO
-      # REST polling interval (fallback when WS is down)
-      - POLYMARKET_POLL_INTERVAL_SECONDS=2.0
     volumes:
       # DEBUG MODE: write NDJSON instrumentation to the host workspace file
       - ./.cursor:/app/.cursor

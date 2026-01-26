@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+#[cfg(feature = "python")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -344,6 +345,7 @@ pub struct CircuitBreakerStatus {
 // ============================================================================
 
 /// Python wrapper for circuit breaker configuration
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "CircuitBreakerConfig"))]
 #[derive(Clone)]
 pub struct PyCircuitBreakerConfig {
@@ -361,6 +363,7 @@ pub struct PyCircuitBreakerConfig {
     pub enabled: bool,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyCircuitBreakerConfig {
     #[cfg_attr(feature = "python", new)]
@@ -391,6 +394,7 @@ impl PyCircuitBreakerConfig {
     }
 }
 
+#[cfg(feature = "python")]
 impl From<PyCircuitBreakerConfig> for CircuitBreakerConfig {
     fn from(py_config: PyCircuitBreakerConfig) -> Self {
         Self {
@@ -405,11 +409,13 @@ impl From<PyCircuitBreakerConfig> for CircuitBreakerConfig {
 }
 
 /// Python wrapper for circuit breaker
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "CircuitBreaker"))]
 pub struct PyCircuitBreaker {
     inner: Arc<CircuitBreaker>,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyCircuitBreaker {
     #[cfg_attr(feature = "python", new)]

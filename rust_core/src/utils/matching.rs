@@ -578,6 +578,11 @@ const NON_MONEYLINE_INDICATORS: &[&str] = &[
     "over", "under", "o/u", "total", "spread", "handicap", "points", "goals", "runs", "score",
     "combined", "first to", "most", "mvp", "player", "quarter", "half", "period", "inning",
     "how many", "exact", "margin",
+    // Time-sliced markets (1H/2H/quarters/periods)
+    "1h", "2h", "1st half", "first half", "2nd half", "second half",
+    "1q", "2q", "3q", "4q", "q1", "q2", "q3", "q4",
+    "1st quarter", "2nd quarter", "3rd quarter", "4th quarter",
+    "1st period", "2nd period", "3rd period",
 ];
 
 /// Normalize a string for comparison

@@ -17,7 +17,8 @@ COPY services/position_tracker_rust ./services/position_tracker_rust
 COPY services/notification_service_rust ./services/notification_service_rust
 
 # Build
-RUN cargo build --release --package signal_processor_rust
+# Limit parallel jobs to avoid memory exhaustion
+RUN CARGO_BUILD_JOBS=2 cargo build --release --package signal_processor_rust --verbose
 
 # Runtime stage
 FROM debian:bookworm-slim

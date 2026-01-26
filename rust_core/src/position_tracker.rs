@@ -5,6 +5,7 @@
 //! - Cost basis and P&L calculation
 //! - Position resolution on market settlement
 
+#[cfg(feature = "python")]
 use parking_lot::RwLock;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "python")]
 use std::sync::Arc;
 
 /// Single position leg (one side of a position)
@@ -334,12 +336,14 @@ pub struct PositionSummary {
 // ============================================================================
 
 /// Python wrapper for ArbPosition
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "ArbPosition"))]
 #[derive(Clone)]
 pub struct PyArbPosition {
     inner: ArbPosition,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyArbPosition {
     #[cfg_attr(feature = "python", new)]
@@ -422,11 +426,13 @@ impl PyArbPosition {
 }
 
 /// Python wrapper for PositionTracker
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "PositionTracker"))]
 pub struct PyPositionTracker {
     inner: Arc<RwLock<PositionTracker>>,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyPositionTracker {
     #[cfg_attr(feature = "python", new)]

@@ -55,6 +55,25 @@ fn validate_market_sport(question: &str, expected_sport: &str) -> (bool, String)
     let soccer_keywords = ["premier league", "epl", "uefa", "champions league", "la liga", "bundesliga"];
     let mma_keywords = ["ufc", "mma", "bellator", "pfl"];
 
+    // If we're NOT expecting soccer/MLS, reject markets containing soccer keywords
+    let is_soccer_expected = matches!(expected_lower.as_str(), "soccer" | "mls");
+    if !is_soccer_expected {
+        for kw in soccer_keywords.iter() {
+            if q_lower.contains(kw) {
+                return (false, format!("Market contains soccer keyword: '{}'", kw));
+            }
+        }
+    }
+
+    // If we're NOT expecting MMA, reject markets containing MMA keywords
+    if expected_lower != "mma" {
+        for kw in mma_keywords.iter() {
+            if q_lower.contains(kw) {
+                return (false, format!("Market contains MMA keyword: '{}'", kw));
+            }
+        }
+    }
+
     // Check for cross-league indicators
     match expected_lower.as_str() {
         "nba" => {

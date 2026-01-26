@@ -297,11 +297,13 @@ impl ArbitrageOpportunity {
     }
 
     /// Max tradeable size based on liquidity
+    #[cfg(feature = "python")]
     fn max_size(&self) -> f64 {
         self.liquidity_buy.min(self.liquidity_sell)
     }
 
     /// Expected profit for given size
+    #[cfg(feature = "python")]
     fn expected_profit(&self, size: f64) -> f64 {
         size * (self.sell_price - self.buy_price)
     }
@@ -368,6 +370,7 @@ impl TradingSignal {
     }
 
     /// Kelly criterion optimal bet fraction
+    #[cfg(feature = "python")]
     fn kelly_fraction(&self) -> f64 {
         if self.edge_pct <= 0.0 {
             return 0.0;

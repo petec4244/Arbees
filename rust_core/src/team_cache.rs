@@ -142,11 +142,13 @@ impl TeamCache {
 // ============================================================================
 
 /// Python wrapper for TeamCache
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "TeamCache"))]
 pub struct PyTeamCache {
     inner: TeamCache,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyTeamCache {
     #[cfg_attr(feature = "python", new)]

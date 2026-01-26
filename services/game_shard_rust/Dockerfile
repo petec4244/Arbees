@@ -16,7 +16,9 @@ COPY services/position_tracker_rust ./services/position_tracker_rust
 COPY services/notification_service_rust ./services/notification_service_rust
 
 # Build specific member
-RUN cargo build --release --package game_shard_rust
+# Limit parallel jobs to avoid memory exhaustion (use 2 jobs or number of CPUs, whichever is less)
+# Add verbose output to see progress
+RUN CARGO_BUILD_JOBS=2 cargo build --release --package game_shard_rust --verbose
 
 FROM debian:bookworm-slim
 

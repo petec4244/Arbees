@@ -545,3 +545,122 @@ pub fn get_stop_loss_for_sport(sport: &Sport) -> f64 {
         Sport::MMA => 8.0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_game_state(sport: Sport, period: u8, time_remaining_seconds: u32) -> GameState {
+        GameState {
+            game_id: "test".to_string(),
+            sport,
+            home_team: "HOME".to_string(),
+            away_team: "AWAY".to_string(),
+            home_score: 0,
+            away_score: 0,
+            period,
+            time_remaining_seconds,
+            possession: None,
+            down: None,
+            yards_to_go: None,
+            yard_line: None,
+            is_redzone: false,
+        }
+    }
+
+    #[test]
+    fn test_nba_total_seconds() {
+        // NBA: 4 quarters × 12 minutes = 48 minutes = 2880 seconds
+        assert_eq!(Sport::NBA.total_seconds(), 2880);
+    }
+
+    #[test]
+    fn test_ncaab_total_seconds() {
+        // NCAAB: 2 halves × 20 minutes = 40 minutes = 2400 seconds
+        assert_eq!(Sport::NCAAB.total_seconds(), 2400);
+    }
+
+    #[test]
+    fn test_nhl_total_seconds() {
+        // NHL: 3 periods × 20 minutes = 60 minutes = 3600 seconds
+        assert_eq!(Sport::NHL.total_seconds(), 3600);
+    }
+
+    #[test]
+    fn test_nfl_total_seconds() {
+        // NFL: 4 quarters × 15 minutes = 60 minutes = 3600 seconds
+        assert_eq!(Sport::NFL.total_seconds(), 3600);
+    }
+
+    #[test]
+    fn test_nba_time_remaining_q1() {
+        // NBA Q1 with 5:00 left → 5 min + Q2 (12) + Q3 (12) + Q4 (12) = 41 min = 2460 sec
+        let state = make_game_state(Sport::NBA, 1, 300);
+        assert_eq!(state.total_time_remaining(), 300 + 3 * 720); // 2460
+    }
+
+    #[test]
+    fn test_nba_time_remaining_q4() {
+        // NBA Q4 with 2:00 left → just 2 minutes = 120 sec
+        let state = make_game_state(Sport::NBA, 4, 120);
+        assert_eq!(state.total_time_remaining(), 120);
+    }
+
+    #[test]
+    fn test_ncaab_time_remaining_1st_half() {
+        // NCAAB 1st half with 10:00 left → 10 min + 2nd half (20) = 30 min = 1800 sec
+        let state = make_game_state(Sport::NCAAB, 1, 600);
+        assert_eq!(state.total_time_remaining(), 600 + 1 * 1200); // 1800
+    }
+
+    #[test]
+    fn test_ncaab_time_remaining_2nd_half() {
+        // NCAAB 2nd half with 5:00 left → just 5 minutes = 300 sec
+        let state = make_game_state(Sport::NCAAB, 2, 300);
+        assert_eq!(state.total_time_remaining(), 300);
+    }
+
+    #[test]
+    fn test_nhl_time_remaining_1st_period() {
+        // NHL 1st period with 10:00 left → 10 min + P2 (20) + P3 (20) = 50 min = 3000 sec
+        let state = make_game_state(Sport::NHL, 1, 600);
+        assert_eq!(state.total_time_remaining(), 600 + 2 * 1200); // 3000
+    }
+
+    #[test]
+    fn test_nhl_time_remaining_3rd_period() {
+        // NHL 3rd period with 5:00 left → just 5 minutes = 300 sec
+        let state = make_game_state(Sport::NHL, 3, 300);
+        assert_eq!(state.total_time_remaining(), 300);
+    }
+
+    #[test]
+    fn test_nfl_time_remaining_q1() {
+        // NFL Q1 with 10:00 left → 10 min + Q2 (15) + Q3 (15) + Q4 (15) = 55 min = 3300 sec
+        let state = make_game_state(Sport::NFL, 1, 600);
+        assert_eq!(state.total_time_remaining(), 600 + 3 * 900); // 3300
+    }
+
+    #[test]
+    fn test_nfl_time_remaining_q4() {
+        // NFL Q4 with 2:00 left → just 2 minutes = 120 sec
+        let state = make_game_state(Sport::NFL, 4, 120);
+        assert_eq!(state.total_time_remaining(), 120);
+    }
+
+    #[test]
+    fn test_overtime_handling() {
+        // Overtime periods should just use current time remaining (no future periods)
+        // NBA OT (period 5)
+        let nba_ot = make_game_state(Sport::NBA, 5, 180);
+        assert_eq!(nba_ot.total_time_remaining(), 180);
+
+        // NHL OT (period 4)
+        let nhl_ot = make_game_state(Sport::NHL, 4, 300);
+        assert_eq!(nhl_ot.total_time_remaining(), 300);
+
+        // NCAAB OT (period 3)
+        let ncaab_ot = make_game_state(Sport::NCAAB, 3, 300);
+        assert_eq!(ncaab_ot.total_time_remaining(), 300);
+    }
+}

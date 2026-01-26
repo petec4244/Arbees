@@ -240,11 +240,13 @@ impl FastExecutionRequest {
 // ============================================================================
 
 /// Python wrapper for ExecutionTracker.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "ExecutionTracker"))]
 pub struct PyExecutionTracker {
     inner: ExecutionTracker,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyExecutionTracker {
     #[cfg_attr(feature = "python", new)]
@@ -291,6 +293,7 @@ impl PyExecutionTracker {
 }
 
 /// Python wrapper for FastExecutionRequest.
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pyclass(name = "FastExecutionRequest"))]
 #[derive(Clone)]
 pub struct PyFastExecutionRequest {
@@ -310,6 +313,7 @@ pub struct PyFastExecutionRequest {
     pub detected_ns: u64,
 }
 
+#[cfg(feature = "python")]
 #[cfg_attr(feature = "python", pymethods)]
 impl PyFastExecutionRequest {
     #[cfg_attr(feature = "python", new)]
