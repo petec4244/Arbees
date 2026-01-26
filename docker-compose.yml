@@ -85,7 +85,7 @@ services:
       QUIET_HOURS_MIN_PRIORITY: ${QUIET_HOURS_MIN_PRIORITY:-CRITICAL}
       RATE_LIMIT_MAX_PER_MINUTE: ${RATE_LIMIT_MAX_PER_MINUTE:-10}
       RATE_LIMIT_BYPASS_CRITICAL: ${RATE_LIMIT_BYPASS_CRITICAL:-true}
-      RUST_LOG: info
+      RUST_LOG: debug
     restart: unless-stopped
     profiles:
       - full

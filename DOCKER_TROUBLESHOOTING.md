@@ -63,8 +63,9 @@ docker compose --profile full up -d
 ### Alternative: Use Rebuild Scripts
 
 Use the provided scripts that handle staged startup:
-- `rebuild-all.ps1` - PowerShell script with staged startup
-- `rebuild-all.bat` - Batch script with staged startup
+- `scripts/rebuild-all.ps1` - PowerShell script with staged startup
+- `scripts/start-docker-safe.ps1` - Safe staged startup script
+- `scripts/build-individual-services.ps1` - Build services individually to avoid memory issues
 
 ### Long-term Fix: Optimize Volume Mounts
 

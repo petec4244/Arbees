@@ -131,10 +131,11 @@ async fn main() -> Result<()> {
             m.received += 1;
         }
 
+        // Get payload as bytes (consistent with other services)
         let payload_bytes: Vec<u8> = match msg.get_payload::<Vec<u8>>() {
             Ok(p) => p,
             Err(_) => {
-                // Fallback to string
+                // Fallback to string and convert to bytes
                 match msg.get_payload::<String>() {
                     Ok(s) => s.into_bytes(),
                     Err(e) => {
@@ -147,10 +148,18 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Parse JSON from bytes (handles UTF-8 correctly)
         let mut event: NotificationEvent = match serde_json::from_slice(&payload_bytes) {
             Ok(e) => e,
             Err(e) => {
-                warn!("notification event: invalid JSON: {}", e);
+                // Debug: show what we actually received
+                let payload_preview = String::from_utf8_lossy(&payload_bytes);
+                let preview = if payload_preview.len() > 100 {
+                    format!("{}...", &payload_preview[..100])
+                } else {
+                    payload_preview.to_string()
+                };
+                warn!("notification event: invalid JSON: {} | payload ({} bytes): {}", e, payload_bytes.len(), preview);
                 let mut m = metrics.write().await;
                 m.parse_errors += 1;
                 continue;

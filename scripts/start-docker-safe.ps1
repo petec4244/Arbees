@@ -7,7 +7,8 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-Set-Location $PSScriptRoot
+# Change to project root (parent of scripts folder)
+Set-Location (Split-Path -Parent $PSScriptRoot)
 
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "Safe Docker Compose Startup" -ForegroundColor Cyan
