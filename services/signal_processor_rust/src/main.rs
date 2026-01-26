@@ -61,10 +61,15 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            // Minimum edge must account for round-trip fees:
+            // Kalshi: ~0.7% entry + ~0.7% exit = 1.4% fees
+            // Polymarket: ~2% entry + ~2% exit = 4% fees
+            // Default 3.5% ensures positive expected value after Kalshi fees
+            // and filters out marginal Polymarket opportunities
             min_edge_pct: env::var("MIN_EDGE_PCT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2.0),
+                .unwrap_or(3.5),
             kelly_fraction: env::var("KELLY_FRACTION")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -378,6 +383,39 @@ impl SignalProcessorState {
         Ok(row.get::<i64, _>("count"))
     }
 
+    /// Check if we have an existing position on this team in the OPPOSITE direction
+    /// This prevents flip-flopping between buy and sell on the same team
+    async fn has_opposing_position(
+        &self,
+        game_id: &str,
+        team: &str,
+        direction: SignalDirection,
+    ) -> Result<bool> {
+        let opposite_side = match direction {
+            SignalDirection::Buy => "sell",
+            SignalDirection::Sell => "buy",
+            SignalDirection::Hold => return Ok(false),
+        };
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM paper_trades
+            WHERE game_id = $1
+              AND market_title = $2
+              AND side::text = $3
+              AND status = 'open'
+            "#,
+        )
+        .bind(game_id)
+        .bind(team)
+        .bind(opposite_side)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<i64, _>("count") > 0)
+    }
+
     /// Master risk check - returns (approved, rejection_reason, snapshot)
     async fn check_risk_limits(
         &self,
@@ -447,7 +485,22 @@ impl SignalProcessorState {
             ));
         }
 
-        // 5. Check position count per game (max 2)
+        // 5. Check for opposing position on same team (prevents flip-flopping)
+        if self
+            .has_opposing_position(&signal.game_id, &signal.team, signal.direction)
+            .await?
+        {
+            return Ok((
+                false,
+                Some(format!(
+                    "Opposing position exists: {} already has opposite side open",
+                    signal.team
+                )),
+                snapshot,
+            ));
+        }
+
+        // 6. Check position count per game (max 2)
         if position_count >= 2 {
             return Ok((
                 false,
@@ -760,19 +813,23 @@ impl SignalProcessorState {
             return Some("prob_low".to_string());
         }
 
-        // Duplicate position check (game-level)
+        // Duplicate position check (same-side only)
+        // Only reject if we already have a position with the SAME side
+        // This allows opposite-side trades (reversals/hedges) while preventing
+        // doubling down on the same directional bet
         if !self.config.allow_hedging {
             if let Ok(Some(existing)) = self.get_open_position_for_game(&signal.game_id).await {
                 let new_side = match signal.direction {
                     SignalDirection::Buy => "buy",
                     _ => "sell",
                 };
+                // Only reject if same side - opposite side signals are allowed
                 if existing.side == new_side {
                     *self
                         .rejected_counts
                         .entry("duplicate".to_string())
                         .or_insert(0) += 1;
-                    return Some("duplicate".to_string());
+                    return Some("duplicate_same_side".to_string());
                 }
             }
         }
