@@ -1,17 +1,19 @@
 use crate::clients::team_matching::TeamMatchingClient;
-use crate::state::{GameInfo, Sport};
+use crate::state::GameInfo;
 use anyhow::Result;
 use arbees_rust_core::clients::kalshi::{KalshiClient, KalshiMarket};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 
 pub struct KalshiDiscoveryManager {
     kalshi_client: KalshiClient,
     team_matching_client: TeamMatchingClient,
     cache: Arc<RwLock<MarketCache>>,
+    request_delay_ms: u64,
 }
 
 struct MarketCache {
@@ -23,6 +25,13 @@ struct MarketCache {
 
 impl KalshiDiscoveryManager {
     pub fn new(kalshi_client: KalshiClient, team_matching_client: TeamMatchingClient) -> Self {
+        let request_delay_ms = env::var("KALSHI_REQUEST_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250);
+
+        info!("KalshiDiscoveryManager initialized with {}ms delay between requests", request_delay_ms);
+
         Self {
             kalshi_client,
             team_matching_client,
@@ -33,6 +42,7 @@ impl KalshiDiscoveryManager {
                     .unwrap(),
                 mappings: HashMap::new(),
             })),
+            request_delay_ms,
         }
     }
 
@@ -52,9 +62,11 @@ impl KalshiDiscoveryManager {
             }
         }
 
-        // Refresh markets if stale
+        // Refresh markets if stale (use game's sport as hint)
         if self.should_refresh().await {
-            if let Err(e) = self.refresh_markets().await {
+            let mut active = HashSet::new();
+            active.insert(game.sport.as_str().to_string());
+            if let Err(e) = self.refresh_markets(Some(&active)).await {
                 error!("Failed to refresh Kalshi markets: {}", e);
             }
         }
@@ -123,23 +135,53 @@ impl KalshiDiscoveryManager {
         cache.last_refresh.elapsed() > Duration::from_secs(300) // 5 minutes
     }
 
-    async fn refresh_markets(&self) -> Result<()> {
-        info!("Refreshing Kalshi markets...");
-        // Fetch all sports we care about
-        let sports = ["nfl", "nba", "nhl", "mlb", "ncaaf", "ncaab"];
-        let mut all_markets = Vec::new();
+    /// Refresh Kalshi markets for the given active sports only.
+    /// If no active sports provided, falls back to all supported sports.
+    pub async fn refresh_markets(&self, active_sports: Option<&HashSet<String>>) -> Result<()> {
+        let all_sports = ["nfl", "nba", "nhl", "mlb", "ncaaf", "ncaab"];
 
-        for sport in sports {
-            match self.kalshi_client.get_markets(Some(sport)).await {
-                Ok(mut markets) => all_markets.append(&mut markets),
-                Err(e) => error!("Error fetching Kalshi {} markets: {}", sport, e),
+        // Filter to only active sports, or use all if none provided
+        let sports_to_fetch: Vec<&str> = match active_sports {
+            Some(active) if !active.is_empty() => {
+                all_sports
+                    .iter()
+                    .filter(|s| active.contains(&s.to_string()))
+                    .copied()
+                    .collect()
             }
+            _ => all_sports.to_vec(),
+        };
+
+        if sports_to_fetch.is_empty() {
+            info!("No active sports to fetch Kalshi markets for");
+            return Ok(());
         }
 
-        // Also generic fetch
-        match self.kalshi_client.get_markets(None).await {
-            Ok(mut markets) => all_markets.append(&mut markets),
-            Err(e) => error!("Error fetching generic Kalshi markets: {}", e),
+        info!(
+            "Refreshing Kalshi markets for {} sports: {:?} ({}ms delay between requests)",
+            sports_to_fetch.len(),
+            sports_to_fetch,
+            self.request_delay_ms
+        );
+
+        let mut all_markets = Vec::new();
+        let delay = Duration::from_millis(self.request_delay_ms);
+
+        for (i, sport) in sports_to_fetch.iter().enumerate() {
+            // Add delay between requests (not before first one)
+            if i > 0 && self.request_delay_ms > 0 {
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.kalshi_client.get_markets(Some(sport)).await {
+                Ok(mut markets) => {
+                    info!("Fetched {} Kalshi markets for {}", markets.len(), sport);
+                    all_markets.append(&mut markets);
+                }
+                Err(e) => {
+                    warn!("Error fetching Kalshi {} markets: {}", sport, e);
+                }
+            }
         }
 
         // Dedupe
@@ -149,7 +191,7 @@ impl KalshiDiscoveryManager {
         let mut cache = self.cache.write().await;
         cache.markets = all_markets;
         cache.last_refresh = Instant::now();
-        info!("Refreshed Kalshi markets: {} items", cache.markets.len());
+        info!("Refreshed Kalshi markets: {} items total", cache.markets.len());
 
         Ok(())
     }
