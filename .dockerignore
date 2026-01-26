@@ -2,28 +2,75 @@
 .git
 .gitignore
 
-# Python
+# Python (be very aggressive)
+**/__pycache__/
+**/__pycache__
+__pycache__/
 __pycache__
+**/*.py[cod]
 *.py[cod]
+**/*$py.class
 *$py.class
+**/*.egg-info/
+**/*.egg-info
+*.egg-info/
 *.egg-info
-.eggs
-dist
-build
+**/.eggs/
+.eggs/
+**/dist/
+dist/
+**/build/
+build/
+**/*.egg
 *.egg
+**/venv/
+**/venv
+venv/
 venv
-env
+**/env/
+env/
+**/.venv/
+.venv/
 .venv
+**/.Python
+.Python
+**/lib/
+**/lib64/
+**/parts/
+**/sdist/
+**/var/
+**/wheels/
+**/.installed.cfg
 
-# Rust build artifacts
+# Rust build artifacts (be very aggressive)
+**/target/
+**/target
+target/
 target
+rust_core/target/
 rust_core/target
+services/*/target/
 services/*/target
+**/*.rlib
+**/*.rmeta
 
-# Node
-frontend/node_modules
-frontend/dist
-frontend/.vite
+# Node (be very aggressive)
+**/node_modules/
+**/node_modules
+node_modules/
+node_modules
+**/dist/
+**/dist
+dist/
+dist
+**/.vite/
+**/.vite
+.vite/
+.vite
+**/package-lock.json
+**/yarn.lock
+**/.npm/
+**/.yarn/
 
 # IDE
 .vscode
@@ -61,3 +108,98 @@ nul
 
 # Docs
 docs
+
+# Reports (can be large)
+reports/*.html
+reports/*.md
+
+# Scripts (not needed in containers)
+scripts
+
+# Test files
+tests
+test_*.py
+*_test.py
+
+# Cursor workspace files
+.cursor
+*.session-state.md
+
+# Docker files (avoid recursion)
+docker-compose*.yml
+docker-compose*.yaml
+Dockerfile*
+.dockerignore
+
+# Build scripts
+rebuild-*.bat
+rebuild-*.ps1
+rebuild-*.sh
+emergency-*.bat
+emergency-*.sh
+stop_*.bat
+
+# Large data directories (be very aggressive)
+**/data/
+**/data
+data/
+data
+**/*.parquet
+*.parquet
+**/*.pkl
+*.pkl
+**/*.csv
+*.csv
+**/*.json.gz
+*.json.gz
+
+# Frontend build artifacts (if not needed)
+frontend/node_modules
+frontend/dist
+frontend/.vite
+frontend/build
+
+# Python cache at root
+*.pyc
+.pytest_cache
+.coverage
+htmlcov
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# Windows specific
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN
+
+# Git (already excluded but ensure)
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.travis.yml
+
+# Documentation markdown files (can be large)
+*.md
+!README.md
+
+# Infrastructure as code
+infrastructure
+*.tf
+*.tfvars
+.terraform
+
+# Signal CLI (if present)
+signal-cli-*
+
+# Other project directories
+GOODArbees
+Polymarket-Kalshi-Arbitrage-bot

@@ -152,8 +152,9 @@ async def update_bankroll(conn, total_pnl: float, dry_run: bool = False) -> dict
     bankroll = await get_bankroll(conn)
     old_balance = bankroll['current_balance']
 
-    # Calculate piggybank contribution (50% of profits go to piggybank)
-    piggybank_add = max(0, total_pnl * 0.5)
+    # Calculate piggybank contribution (25% of profits go to piggybank)
+    piggybank_pct = float(os.environ.get("PIGGYBANK_PERCENT", "0.25"))
+    piggybank_add = max(0, total_pnl * piggybank_pct)
     balance_add = total_pnl - piggybank_add
 
     new_balance = old_balance + balance_add

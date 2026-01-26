@@ -81,12 +81,14 @@ fn calculate_football_win_prob(state: &GameState, for_home: bool) -> f64 {
 ///
 /// Basketball has more scoring, so volatility model differs.
 /// Based on score differential and possessions remaining.
+///
+/// This model accounts for "catch-up difficulty" - large deficits late in the
+/// game are nearly insurmountable. The volatility is adjusted based on the
+/// absolute score differential and time remaining, applied symmetrically so
+/// probabilities remain complementary.
 fn calculate_basketball_win_prob(state: &GameState, for_home: bool) -> f64 {
-    let score_diff = if for_home {
-        state.home_score as f64 - state.away_score as f64
-    } else {
-        state.away_score as f64 - state.home_score as f64
-    };
+    let home_diff = state.home_score as f64 - state.away_score as f64;
+    let score_diff = if for_home { home_diff } else { -home_diff };
 
     let total_seconds = state.sport.total_seconds() as f64;
     let remaining = state.total_time_remaining() as f64;
@@ -95,8 +97,35 @@ fn calculate_basketball_win_prob(state: &GameState, for_home: bool) -> f64 {
     let possessions_remaining = (remaining / total_seconds) * 100.0;
 
     // Points per possession ~1.1, variance ~1.0
-    // Volatility = sqrt(possessions) * variance_per_possession
-    let volatility = (possessions_remaining.max(1.0)).sqrt() * 2.2;
+    // Base volatility = sqrt(possessions) * variance_per_possession
+    let base_volatility = (possessions_remaining.max(1.0)).sqrt() * 2.2;
+
+    // Calculate catch-up difficulty factor based on absolute score differential
+    // This is applied SYMMETRICALLY so probabilities remain complementary
+    let trailing_team_possessions = possessions_remaining / 2.0;
+    let abs_score_diff = home_diff.abs();
+
+    // Required points per possession to overcome the deficit
+    let required_margin_per_poss = if trailing_team_possessions > 0.5 && abs_score_diff > 0.0 {
+        abs_score_diff / trailing_team_possessions
+    } else {
+        0.0
+    };
+
+    // Apply difficulty scaling that compresses probabilities toward extremes
+    // when comebacks are unrealistic. This makes volatility shrink, which
+    // pushes probabilities toward 0 or 100%.
+    let difficulty_factor = if required_margin_per_poss > 0.5 {
+        // Exponential scaling: larger deficits with less time = lower volatility
+        // This makes the leading team's probability approach 100%
+        let excess = required_margin_per_poss - 0.5;
+        1.5_f64.powf(excess * 1.5) // Smooth exponential
+    } else {
+        1.0
+    };
+
+    // Reduce volatility based on difficulty (makes outcomes more certain)
+    let volatility = (base_volatility / difficulty_factor).max(0.3);
 
     // Possession is worth about 1 point in basketball
     let mut adjustment = 0.0;
@@ -111,7 +140,7 @@ fn calculate_basketball_win_prob(state: &GameState, for_home: bool) -> f64 {
         }
     }
 
-    let log_odds = (score_diff + adjustment) / volatility.max(1.0);
+    let log_odds = (score_diff + adjustment) / volatility.max(0.3);
     logistic(log_odds)
 }
 

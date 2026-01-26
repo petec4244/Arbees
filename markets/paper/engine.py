@@ -613,10 +613,11 @@ class PaperTradingEngine(BaseMarketClient):
         pnl = trade.pnl
 
         # Calculate new balances with piggybank split
+        piggybank_pct = float(os.environ.get("PIGGYBANK_PERCENT", "0.25"))
         if pnl > 0:
-            # WINNING trade: split profit 50/50
-            profit_to_piggybank = pnl * 0.5
-            profit_to_trading = pnl * 0.5
+            # WINNING trade: split profit based on piggybank percentage (default 25%)
+            profit_to_piggybank = pnl * piggybank_pct
+            profit_to_trading = pnl * (1 - piggybank_pct)
             new_current = self._bankroll.current_balance + profit_to_trading
             new_piggybank = self._bankroll.piggybank_balance + profit_to_piggybank
             logger.info(

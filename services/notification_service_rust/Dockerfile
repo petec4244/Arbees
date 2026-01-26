@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.4
 # Build stage
 FROM rustlang/rust:nightly as builder
 

@@ -348,8 +348,18 @@ impl GameShard {
                 },
             };
 
-            // Store the price
+            // Store the price (but filter out invalid prices with no real liquidity)
             if let Some(team) = &price.contract_team {
+                // Skip prices with no real liquidity (bid=0, ask=1 gives fake 50% mid)
+                let has_liquidity = price.yes_bid > 0.01 || price.yes_ask < 0.99;
+                if !has_liquidity {
+                    debug!(
+                        "Skipping price with no liquidity: game={} team={} bid={} ask={}",
+                        game_id, team, price.yes_bid, price.yes_ask
+                    );
+                    continue;
+                }
+
                 let mid = price
                     .mid_price
                     .or(price.implied_probability)

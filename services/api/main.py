@@ -379,6 +379,7 @@ async def get_opportunity_stats():
 async def get_live_games(
     sport: Optional[str] = None,
     max_age_hours: int = Query(6, ge=1, le=24, description="Max age of games in hours"),
+    include_final: bool = False,
 ):
     """Get all live games from game_states with team names."""
     if not db:
@@ -386,16 +387,82 @@ async def get_live_games(
 
     pool = await get_pool()
 
-    # IMPORTANT:
-    # We must filter using the *latest* game_state per game.
-    # If we filter rows first (e.g., exclude 'final') and then DISTINCT ON, we'll
-    # accidentally return the previous non-final row and the game will "stick" in the UI.
-    #
-    # Filters:
-    # - Exclude games whose latest status is final/completed/scheduled (or contains those strings)
-    # - Exclude stale games older than max_age_hours
-    # - Exclude games stuck in end_period/halftime for too long
-    # - Exclude games that appear ended (end_period + 0:00) and haven't updated recently
+    # Filters logic
+    # $1 = sport (if present)
+    # $2 = include_final (bool)
+    
+    # Base query logic
+    base_filter = f"""
+        WHERE l.last_update > NOW() - INTERVAL '{max_age_hours} hours'
+          -- Any game that hasn't updated recently is not "live" for the UI.
+          -- If include_final is True, we allow older updates (up to max_age_hours)
+          AND (
+             $2 = true OR (
+                lower(COALESCE(l.status, '')) IN ('halftime', 'status_end_period', 'end_period')
+                OR l.last_update >= NOW() - INTERVAL '15 minutes'
+             )
+          )
+    """
+
+    if not include_final:
+         base_filter += """
+          AND NOT (
+            lower(COALESCE(l.status, '')) IN ('final', 'completed', 'scheduled', 'status_scheduled')
+            OR lower(COALESCE(l.status, '')) LIKE '%final%'
+            OR lower(COALESCE(l.status, '')) LIKE '%complete%'
+          )
+          AND NOT (l.status IN ('status_end_period', 'halftime') AND l.last_update < NOW() - INTERVAL '45 minutes')
+          AND NOT (
+            lower(COALESCE(l.status, '')) LIKE '%end_period%'
+            AND (l.time_remaining LIKE '0:%' OR l.time_remaining IN ('0', '0.0', '0:00'))
+            AND l.last_update < NOW() - INTERVAL '10 minutes'
+          )
+        """
+    else:
+        # If including final games, just filter out scheduled
+        base_filter += """
+          AND NOT (
+            lower(COALESCE(l.status, '')) IN ('scheduled', 'status_scheduled')
+          )
+        """
+
+    query = f"""
+        WITH latest AS (
+            SELECT DISTINCT ON (gs.game_id)
+                gs.game_id, gs.sport, gs.home_score, gs.away_score, gs.period,
+                gs.time_remaining, gs.status, gs.possession, gs.home_win_prob,
+                gs.time as last_update
+            FROM game_states gs
+            ORDER BY gs.game_id, gs.time DESC
+        )
+        SELECT
+            l.game_id, l.sport, l.home_score, l.away_score, l.period,
+            l.time_remaining, l.status, l.possession, l.home_win_prob,
+            l.last_update, g.cooldown_until,
+            COALESCE(NULLIF(g.home_team, ''), 'Home ' || l.game_id) as home_team,
+            COALESCE(NULLIF(g.away_team, ''), 'Away ' || l.game_id) as away_team,
+            g.home_team_abbrev, g.away_team_abbrev
+        FROM latest l
+        LEFT JOIN games g ON l.game_id = g.game_id
+        {base_filter}
+    """
+    
+    params = []
+    
+    # Param 1: Sport (optional)
+    if sport:
+        query += f" AND l.sport = $1"
+        params.append(sport)
+    
+    # Param 2: include_final logic in base_filter uses $2 if sport is present? 
+    # Wait, simple numbering is best.
+    # Actually, asyncpg uses $1, $2, etc. based on the order in the list passed to fetch.
+    
+    # Let's rebuild params carefully.
+    
+    query_params = []
+    
+    # Re-construct query with correct placeholders
     query = f"""
         WITH latest AS (
             SELECT DISTINCT ON (gs.game_id)
@@ -415,12 +482,17 @@ async def get_live_games(
         FROM latest l
         LEFT JOIN games g ON l.game_id = g.game_id
         WHERE l.last_update > NOW() - INTERVAL '{max_age_hours} hours'
-          -- Any game that hasn't updated recently is not "live" for the UI.
-          -- (Halftime/end_period can be legitimately quiet, so we exempt those for longer.)
-          AND NOT (
-            lower(COALESCE(l.status, '')) NOT IN ('halftime', 'status_end_period', 'end_period')
-            AND l.last_update < NOW() - INTERVAL '15 minutes'
-          )
+    """
+    
+    # Include Final Check (always pass as param)
+    query += " AND ($1 = true OR (" # $1 is include_final
+    query += "   lower(COALESCE(l.status, '')) IN ('halftime', 'status_end_period', 'end_period')"
+    query += "   OR l.last_update >= NOW() - INTERVAL '15 minutes'"
+    query += " ))"
+    query_params.append(include_final)
+    
+    if not include_final:
+        query += """
           AND NOT (
             lower(COALESCE(l.status, '')) IN ('final', 'completed', 'scheduled', 'status_scheduled')
             OR lower(COALESCE(l.status, '')) LIKE '%final%'
@@ -432,17 +504,23 @@ async def get_live_games(
             AND (l.time_remaining LIKE '0:%' OR l.time_remaining IN ('0', '0.0', '0:00'))
             AND l.last_update < NOW() - INTERVAL '10 minutes'
           )
-    """
-    params = []
+        """
+    else:
+        query += """
+          AND NOT (
+            lower(COALESCE(l.status, '')) IN ('scheduled', 'status_scheduled')
+          )
+        """
 
     if sport:
-        query += f" AND l.sport = ${len(params) + 1}"
-        params.append(sport)
+        query += f" AND l.sport = ${len(query_params) + 1}"
+        query_params.append(sport)
 
     query += " ORDER BY l.last_update DESC"
 
-    rows = await pool.fetch(query, *params)
+    rows = await pool.fetch(query, *query_params)
     return [dict(row) for row in rows]
+
 
 
 @app.get("/api/live-games/{game_id}/state", response_model=GameStateResponse)

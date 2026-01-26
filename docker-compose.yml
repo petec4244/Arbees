@@ -1,5 +1,14 @@
 version: '3.8'
 
+# Global configuration to prevent memory leaks and recursive scanning issues
+# Note: Resource limits require Docker Compose v3.8+ and may require swarm mode
+# For standalone Docker Desktop, these limits are advisory
+x-common-resources: &common-resources
+  limits:
+    memory: 2G
+  reservations:
+    memory: 512M
+
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg15
@@ -89,6 +98,9 @@ services:
       context: .
       dockerfile: services/market_discovery_rust/Dockerfile
     container_name: arbees-market-discovery
+    deploy:
+      resources:
+        <<: *common-resources
     depends_on:
       redis:
         condition: service_healthy
@@ -114,6 +126,9 @@ services:
       context: .
       dockerfile: services/orchestrator_rust/Dockerfile
     container_name: arbees-orchestrator
+    deploy:
+      resources:
+        <<: *common-resources
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -155,6 +170,11 @@ services:
       context: .
       dockerfile: services/game_shard_rust/Dockerfile
     container_name: arbees-game-shard-rust
+    # Resource limits to prevent memory exhaustion
+    # Note: deploy.resources may require swarm mode; for standalone, use docker run --memory
+    deploy:
+      resources:
+        <<: *common-resources
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -188,6 +208,9 @@ services:
       context: .
       dockerfile: services/api/Dockerfile
     container_name: arbees-api
+    deploy:
+      resources:
+        <<: *common-resources
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -215,6 +238,9 @@ services:
       context: .
       dockerfile: services/signal_processor_rust/Dockerfile
     container_name: arbees-signal-processor-rust
+    deploy:
+      resources:
+        <<: *common-resources
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -252,6 +278,9 @@ services:
       context: .
       dockerfile: services/execution_service_rust/Dockerfile
     container_name: arbees-execution-service-rust
+    deploy:
+      resources:
+        <<: *common-resources
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -358,6 +387,9 @@ services:
       context: .
       dockerfile: services/analytics_service/Dockerfile
     container_name: arbees-analytics
+    deploy:
+      resources:
+        <<: *common-resources
     depends_on:
       timescaledb:
         condition: service_healthy
