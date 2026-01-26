@@ -59,28 +59,36 @@ impl GameManager {
         info!("Starting scheduled games sync");
         let days = 7;
 
-        for (sport, client) in &self.espn_clients {
-            match client.get_scheduled_games(days).await {
+        // Fetch games from all sports in PARALLEL for better throughput
+        let fetch_futures: Vec<_> = self
+            .espn_clients
+            .iter()
+            .map(|(sport, client)| {
+                let sport = sport.clone();
+                async move {
+                    let result = client.get_scheduled_games(days).await;
+                    (sport, result)
+                }
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(fetch_futures).await;
+
+        // Process results (upsert is sequential to avoid DB contention)
+        let mut total_games = 0;
+        for (sport, result) in results {
+            match result {
                 Ok(games) => {
                     info!("Fetched {} scheduled games for {}", games.len(), sport);
+                    total_games += games.len();
                     for game in games {
                         self.upsert_game(&game).await;
-
-                        // Pregame Discovery Trigger logic (as per orchestrator.py)
-                        // This uses pregame_discovery_window_hours
-                        // ... I'll omit complex logic for now and rely on regular discovery for simplicity,
-                        // or add it if strictly required.
-                        // orchestrator.py does: "if self._market_discovery_mode == 'rust' ... request discovery"
-                        // Since WE ARE the rust service, we could trigger discovery locally?
-                        // But `KalshiDiscoveryManager` is for Kalshi.
-                        // The `GameManager` sends discovery request for Polymarket (via `discovery:requests`).
-                        // I can add that check here.
                     }
                 }
                 Err(e) => error!("Error fetching scheduled games for {}: {}", sport, e),
             }
         }
-        info!("Scheduled games sync complete");
+        info!("Scheduled games sync complete ({} total games)", total_games);
     }
 
     async fn upsert_game(&self, game: &GameInfo) {
@@ -155,11 +163,27 @@ impl GameManager {
     // Called periodically
     pub async fn run_discovery_cycle(&self) {
         info!("Starting discovery cycle");
-        let mut all_live_games = Vec::new();
 
-        // Fetch from ESPN
-        for (sport, client) in &self.espn_clients {
-            match client.get_live_games().await {
+        // Fetch live games from ALL sports in PARALLEL for better throughput
+        // This reduces latency from 7 sequential requests to 1 parallel batch
+        let fetch_futures: Vec<_> = self
+            .espn_clients
+            .iter()
+            .map(|(sport, client)| {
+                let sport = sport.clone();
+                async move {
+                    let result = client.get_live_games().await;
+                    (sport, result)
+                }
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(fetch_futures).await;
+
+        // Collect all games from successful fetches
+        let mut all_live_games = Vec::new();
+        for (sport, result) in results {
+            match result {
                 Ok(games) => {
                     info!("Found {} live games for {}", games.len(), sport);
                     all_live_games.extend(games);

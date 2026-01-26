@@ -3,7 +3,10 @@
 //! Supports both:
 //! - Unauthenticated read-only operations (market data)
 //! - Authenticated trading operations (order placement)
+//!
+//! Includes circuit breaker for API resilience.
 
+use crate::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use log::{debug, info, warn};
@@ -16,7 +19,7 @@ use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const KALSHI_API_PROD: &str = "https://api.elections.kalshi.com/trade-api/v2";
 const KALSHI_API_DEMO: &str = "https://demo-api.kalshi.co/trade-api/v2";
@@ -30,6 +33,8 @@ pub struct KalshiClient {
     api_key: Option<String>,
     /// RSA private key for signing requests (optional for read-only operations)
     private_key: Option<Arc<RsaPrivateKey>>,
+    /// Circuit breaker for API resilience
+    circuit_breaker: Arc<ApiCircuitBreaker>,
 }
 
 impl std::fmt::Debug for KalshiClient {
@@ -37,6 +42,7 @@ impl std::fmt::Debug for KalshiClient {
         f.debug_struct("KalshiClient")
             .field("base_url", &self.base_url)
             .field("has_credentials", &self.has_credentials())
+            .field("circuit_breaker_state", &self.circuit_breaker.state())
             .finish()
     }
 }
@@ -88,6 +94,18 @@ pub struct KalshiOrderResponse {
 }
 
 impl KalshiClient {
+    /// Create circuit breaker with default Kalshi-tuned settings
+    fn create_circuit_breaker() -> Arc<ApiCircuitBreaker> {
+        Arc::new(ApiCircuitBreaker::new(
+            "kalshi",
+            ApiCircuitBreakerConfig {
+                failure_threshold: 3,           // Kalshi can be less reliable, lower threshold
+                recovery_timeout: Duration::from_secs(60),  // Longer recovery for paid API
+                success_threshold: 2,
+            },
+        ))
+    }
+
     /// Create a new client without authentication (read-only operations)
     pub fn new() -> Self {
         let base_url = env::var("KALSHI_BASE_URL")
@@ -95,12 +113,13 @@ impl KalshiClient {
 
         Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             base_url,
             api_key: None,
             private_key: None,
+            circuit_breaker: Self::create_circuit_breaker(),
         }
     }
 
@@ -117,12 +136,13 @@ impl KalshiClient {
 
         Ok(Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             base_url,
             api_key: Some(api_key),
             private_key: Some(Arc::new(private_key)),
+            circuit_breaker: Self::create_circuit_breaker(),
         })
     }
 
@@ -165,13 +185,29 @@ impl KalshiClient {
 
         Ok(Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             base_url,
             api_key,
             private_key: private_key.map(Arc::new),
+            circuit_breaker: Self::create_circuit_breaker(),
         })
+    }
+
+    /// Check if the Kalshi API is available (circuit breaker is not open)
+    pub fn is_available(&self) -> bool {
+        self.circuit_breaker.is_available()
+    }
+
+    /// Get the current circuit breaker state
+    pub fn circuit_state(&self) -> crate::circuit_breaker::ApiCircuitState {
+        self.circuit_breaker.state()
+    }
+
+    /// Reset the circuit breaker
+    pub fn reset_circuit_breaker(&self) {
+        self.circuit_breaker.reset();
     }
 
     /// Check if client has valid credentials for trading
@@ -258,6 +294,27 @@ impl KalshiClient {
 
     /// Fetch markets, optionally filtering by sport/series_ticker.
     pub async fn get_markets(&self, sport: Option<&str>) -> Result<Vec<KalshiMarket>> {
+        // Check circuit breaker before making request
+        if !self.circuit_breaker.is_available() {
+            return Err(anyhow!(
+                "Kalshi API circuit breaker is open (sport={:?})",
+                sport
+            ));
+        }
+
+        let result = self.get_markets_internal(sport).await;
+
+        // Record success or failure
+        match &result {
+            Ok(_) => self.circuit_breaker.record_success(),
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
+
+        result
+    }
+
+    /// Internal method that performs the actual API call
+    async fn get_markets_internal(&self, sport: Option<&str>) -> Result<Vec<KalshiMarket>> {
         let url = format!("{}/markets", self.base_url);
 
         let mut params = vec![

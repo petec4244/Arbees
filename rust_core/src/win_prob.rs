@@ -16,10 +16,15 @@ fn logistic(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Home field advantage in points by sport
+const NFL_HOME_ADVANTAGE_POINTS: f64 = 2.5;
+const NCAAF_HOME_ADVANTAGE_POINTS: f64 = 3.0;
+
 /// Calculate NFL/NCAAF win probability
 ///
 /// Based on:
 /// - Score differential (most important)
+/// - Home field advantage (decays with time)
 /// - Time remaining (exponential decay of variance)
 /// - Field position value (if in possession)
 /// - Down and distance (situational)
@@ -38,8 +43,17 @@ fn calculate_football_win_prob(state: &GameState, for_home: bool) -> f64 {
     // At game start, ~14 point swing is common; at end, much less
     let volatility: f64 = 14.0 * time_fraction.sqrt();
 
-    // Base probability from score differential
-    let mut log_odds = score_diff / volatility.max(1.0);
+    // Home field advantage - decays as game progresses
+    // NFL: ~2.5 points, NCAAF: ~3.0 points (college crowds are louder)
+    let home_advantage = match state.sport {
+        Sport::NFL => NFL_HOME_ADVANTAGE_POINTS * time_fraction.sqrt(),
+        Sport::NCAAF => NCAAF_HOME_ADVANTAGE_POINTS * time_fraction.sqrt(),
+        _ => 0.0,
+    };
+    let home_adj = if for_home { home_advantage } else { -home_advantage };
+
+    // Base probability from score differential + home advantage
+    let mut log_odds = (score_diff + home_adj) / volatility.max(1.0);
 
     // Possession bonus: having the ball is worth ~2.5 points on average
     if let Some(ref poss) = state.possession {
@@ -77,33 +91,53 @@ fn calculate_football_win_prob(state: &GameState, for_home: bool) -> f64 {
     logistic(log_odds)
 }
 
+/// Home court advantage in points by sport
+const NBA_HOME_ADVANTAGE_POINTS: f64 = 3.0;
+const NCAAB_HOME_ADVANTAGE_POINTS: f64 = 4.0;
+
 /// Calculate NBA/NCAAB win probability
 ///
 /// Basketball has more scoring, so volatility model differs.
 /// Based on score differential and possessions remaining.
 ///
-/// This model accounts for "catch-up difficulty" - large deficits late in the
-/// game are nearly insurmountable. The volatility is adjusted based on the
-/// absolute score differential and time remaining, applied symmetrically so
-/// probabilities remain complementary.
+/// This model accounts for:
+/// - **Home court advantage**: NBA (~3 pts), NCAAB (~4 pts) added directly to score diff
+/// - **Catch-up difficulty**: large deficits late are nearly insurmountable
+/// - **Possession value**: having the ball is worth ~1 point
+///
+/// The volatility is adjusted based on the absolute score differential and time
+/// remaining, applied symmetrically so probabilities remain complementary.
 fn calculate_basketball_win_prob(state: &GameState, for_home: bool) -> f64 {
-    let home_diff = state.home_score as f64 - state.away_score as f64;
-    let score_diff = if for_home { home_diff } else { -home_diff };
-
     let total_seconds = state.sport.total_seconds() as f64;
     let remaining = state.total_time_remaining() as f64;
+    let time_remaining_pct = remaining / total_seconds;
+
+    // Home court advantage - applied as equivalent score points
+    // Decays linearly with time (at halftime = half value, at end = near zero)
+    // This is NOT scaled by volatility so it has more impact early in the game
+    let home_advantage_points = match state.sport {
+        Sport::NBA => NBA_HOME_ADVANTAGE_POINTS * time_remaining_pct,
+        Sport::NCAAB => NCAAB_HOME_ADVANTAGE_POINTS * time_remaining_pct,
+        _ => 0.0,
+    };
+
+    // Calculate effective score differential including home advantage
+    let raw_home_diff = state.home_score as f64 - state.away_score as f64;
+    let adjusted_home_diff = raw_home_diff + home_advantage_points;
+    let score_diff = if for_home { adjusted_home_diff } else { -adjusted_home_diff };
 
     // Estimate possessions remaining (about 100 possessions per game for NBA)
-    let possessions_remaining = (remaining / total_seconds) * 100.0;
+    let possessions_remaining = time_remaining_pct * 100.0;
 
     // Points per possession ~1.1, variance ~1.0
     // Base volatility = sqrt(possessions) * variance_per_possession
     let base_volatility = (possessions_remaining.max(1.0)).sqrt() * 2.2;
 
     // Calculate catch-up difficulty factor based on absolute score differential
+    // Use the RAW score diff (without home advantage) for difficulty calculation
     // This is applied SYMMETRICALLY so probabilities remain complementary
     let trailing_team_possessions = possessions_remaining / 2.0;
-    let abs_score_diff = home_diff.abs();
+    let abs_score_diff = raw_home_diff.abs();
 
     // Required points per possession to overcome the deficit
     let required_margin_per_poss = if trailing_team_possessions > 0.5 && abs_score_diff > 0.0 {
@@ -128,7 +162,7 @@ fn calculate_basketball_win_prob(state: &GameState, for_home: bool) -> f64 {
     let volatility = (base_volatility / difficulty_factor).max(0.3);
 
     // Possession is worth about 1 point in basketball
-    let mut adjustment = 0.0;
+    let mut possession_adj = 0.0;
     if let Some(ref poss) = state.possession {
         let has_possession = if for_home {
             poss == &state.home_team
@@ -136,11 +170,11 @@ fn calculate_basketball_win_prob(state: &GameState, for_home: bool) -> f64 {
             poss == &state.away_team
         };
         if has_possession {
-            adjustment = 1.0;
+            possession_adj = 1.0;
         }
     }
 
-    let log_odds = (score_diff + adjustment) / volatility.max(0.3);
+    let log_odds = (score_diff + possession_adj) / volatility.max(0.3);
     logistic(log_odds)
 }
 
@@ -309,11 +343,34 @@ mod tests {
     }
 
     #[test]
-    fn test_tied_game_start() {
+    fn test_tied_game_start_home_advantage() {
         let state = make_nba_state(0, 0, 1, 720);
         let home_prob = calculate_win_probability(&state, true);
-        // Tied game at start should be close to 50%
-        assert!((home_prob - 0.5).abs() < 0.05);
+        let away_prob = calculate_win_probability(&state, false);
+
+        // Home team should have an advantage at game start (tied score)
+        // With 3-point home advantage, home team should be favored (>50%)
+        assert!(
+            home_prob > 0.50,
+            "Home team should be favored in tied game: {:.3}",
+            home_prob
+        );
+
+        // Probabilities should sum to ~1.0 (complementary)
+        assert!(
+            (home_prob + away_prob - 1.0).abs() < 0.01,
+            "Probs should sum to 1: {:.3} + {:.3} = {:.3}",
+            home_prob,
+            away_prob,
+            home_prob + away_prob
+        );
+
+        // But advantage shouldn't be overwhelming at game start
+        assert!(
+            home_prob < 0.65,
+            "Home advantage shouldn't be too large: {:.3}",
+            home_prob
+        );
     }
 
     #[test]
@@ -330,5 +387,64 @@ mod tests {
         let home_prob = calculate_win_probability(&state, true);
         // 2 point lead with 1 minute left should favor home but not certain
         assert!(home_prob > 0.5 && home_prob < 0.85);
+    }
+
+    #[test]
+    fn test_home_advantage_decays_with_time() {
+        // Test that home advantage is smaller late in the game
+        let early_state = make_nba_state(50, 50, 1, 720); // Q1, tied
+        let late_state = make_nba_state(90, 90, 4, 60);  // Q4, 1 min left, tied
+
+        let early_home = calculate_win_probability(&early_state, true);
+        let late_home = calculate_win_probability(&late_state, true);
+
+        // Early game: home advantage should give clear edge
+        let early_advantage = early_home - 0.5;
+        // Late game: home advantage should be much smaller
+        let late_advantage = late_home - 0.5;
+
+        // Home advantage should decay (early > late)
+        assert!(
+            early_advantage > late_advantage,
+            "Home advantage should decay: early={:.3} > late={:.3}",
+            early_advantage,
+            late_advantage
+        );
+    }
+
+    #[test]
+    fn test_ncaab_home_advantage_larger() {
+        // NCAAB has larger home court advantage than NBA
+        let nba_state = GameState {
+            game_id: "test".to_string(),
+            sport: Sport::NBA,
+            home_team: "PHI".to_string(),
+            away_team: "NYK".to_string(),
+            home_score: 0,
+            away_score: 0,
+            period: 1,
+            time_remaining_seconds: 720,
+            possession: None,
+            down: None,
+            yards_to_go: None,
+            yard_line: None,
+            is_redzone: false,
+        };
+
+        let ncaab_state = GameState {
+            sport: Sport::NCAAB,
+            ..nba_state.clone()
+        };
+
+        let nba_home = calculate_win_probability(&nba_state, true);
+        let ncaab_home = calculate_win_probability(&ncaab_state, true);
+
+        // NCAAB should have larger home advantage
+        assert!(
+            ncaab_home > nba_home,
+            "NCAAB home advantage should be larger: NCAAB={:.3} > NBA={:.3}",
+            ncaab_home,
+            nba_home
+        );
     }
 }

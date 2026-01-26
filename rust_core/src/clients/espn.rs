@@ -1,10 +1,22 @@
-use anyhow::Result;
+use crate::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
+use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EspnClient {
     client: Client,
+    circuit_breaker: Arc<ApiCircuitBreaker>,
+}
+
+impl std::fmt::Debug for EspnClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EspnClient")
+            .field("circuit_breaker_state", &self.circuit_breaker.state())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -35,19 +47,75 @@ impl EspnClient {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            circuit_breaker: Arc::new(ApiCircuitBreaker::new(
+                "espn",
+                ApiCircuitBreakerConfig {
+                    failure_threshold: 5,
+                    recovery_timeout: Duration::from_secs(30),
+                    success_threshold: 2,
+                },
+            )),
         }
     }
 
+    /// Create with custom circuit breaker configuration
+    pub fn with_config(config: ApiCircuitBreakerConfig) -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            circuit_breaker: Arc::new(ApiCircuitBreaker::new("espn", config)),
+        }
+    }
+
+    /// Check if the ESPN API is available (circuit breaker is not open)
+    pub fn is_available(&self) -> bool {
+        self.circuit_breaker.is_available()
+    }
+
+    /// Get the current circuit breaker state
+    pub fn circuit_state(&self) -> crate::circuit_breaker::ApiCircuitState {
+        self.circuit_breaker.state()
+    }
+
+    /// Reset the circuit breaker
+    pub fn reset_circuit_breaker(&self) {
+        self.circuit_breaker.reset();
+    }
+
     pub async fn get_games(&self, sport: &str, league: &str) -> Result<Vec<Game>> {
+        // Check circuit breaker before making request
+        if !self.circuit_breaker.is_available() {
+            return Err(anyhow!(
+                "ESPN API circuit breaker is open (sport={}, league={})",
+                sport,
+                league
+            ));
+        }
+
         let url = format!(
             "http://site.api.espn.com/apis/site/v2/sports/{}/{}/scoreboard",
             sport, league
         );
 
-        let resp = self.client.get(&url).send().await?;
+        let result = self.fetch_games_internal(&url).await;
+
+        // Record success or failure
+        match &result {
+            Ok(_) => self.circuit_breaker.record_success(),
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
+
+        result
+    }
+
+    /// Internal fetch method that performs the actual HTTP request
+    async fn fetch_games_internal(&self, url: &str) -> Result<Vec<Game>> {
+        let resp = self.client.get(url).send().await?;
         let data: serde_json::Value = resp.json().await?;
 
         let mut games = Vec::new();

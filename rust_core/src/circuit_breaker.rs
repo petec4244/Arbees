@@ -511,12 +511,291 @@ impl PyCircuitBreaker {
 }
 
 // ============================================================================
+// API Circuit Breaker for External Service Resilience
+// ============================================================================
+
+/// States for the API circuit breaker
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiCircuitState {
+    /// Normal operation - requests are allowed
+    Closed,
+    /// Circuit is open - requests are blocked
+    Open,
+    /// Testing if service is recovered
+    HalfOpen,
+}
+
+/// Configuration for API circuit breaker
+#[derive(Debug, Clone)]
+pub struct ApiCircuitBreakerConfig {
+    /// Number of consecutive failures to trip the circuit
+    pub failure_threshold: u32,
+    /// Duration to wait before attempting recovery
+    pub recovery_timeout: Duration,
+    /// Number of successful calls in half-open state to close circuit
+    pub success_threshold: u32,
+}
+
+impl Default for ApiCircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            recovery_timeout: Duration::from_secs(30),
+            success_threshold: 2,
+        }
+    }
+}
+
+/// Lightweight circuit breaker for external API calls.
+///
+/// Unlike the trading CircuitBreaker, this is designed for API resilience:
+/// - Tracks consecutive failures
+/// - Opens circuit after threshold failures
+/// - Auto-transitions to half-open after timeout
+/// - Closes after successful calls in half-open state
+///
+/// # Example
+/// ```ignore
+/// let breaker = ApiCircuitBreaker::new("espn", ApiCircuitBreakerConfig::default());
+///
+/// // Before making API call
+/// if !breaker.is_available() {
+///     return Err(anyhow!("ESPN API circuit breaker open"));
+/// }
+///
+/// // After API call
+/// match api_call().await {
+///     Ok(result) => {
+///         breaker.record_success();
+///         Ok(result)
+///     }
+///     Err(e) => {
+///         breaker.record_failure();
+///         Err(e)
+///     }
+/// }
+/// ```
+pub struct ApiCircuitBreaker {
+    name: String,
+    config: ApiCircuitBreakerConfig,
+    state: RwLock<ApiCircuitState>,
+    failure_count: std::sync::atomic::AtomicU32,
+    success_count: std::sync::atomic::AtomicU32,
+    last_failure_time: RwLock<Option<Instant>>,
+}
+
+impl ApiCircuitBreaker {
+    /// Create a new API circuit breaker
+    pub fn new(name: &str, config: ApiCircuitBreakerConfig) -> Self {
+        Self {
+            name: name.to_string(),
+            config,
+            state: RwLock::new(ApiCircuitState::Closed),
+            failure_count: std::sync::atomic::AtomicU32::new(0),
+            success_count: std::sync::atomic::AtomicU32::new(0),
+            last_failure_time: RwLock::new(None),
+        }
+    }
+
+    /// Create with default configuration
+    pub fn with_defaults(name: &str) -> Self {
+        Self::new(name, ApiCircuitBreakerConfig::default())
+    }
+
+    /// Check if the circuit breaker allows requests
+    pub fn is_available(&self) -> bool {
+        let mut state = self.state.write();
+
+        match *state {
+            ApiCircuitState::Closed => true,
+            ApiCircuitState::Open => {
+                // Check if recovery timeout has passed
+                let should_try = self
+                    .last_failure_time
+                    .read()
+                    .map(|t| t.elapsed() >= self.config.recovery_timeout)
+                    .unwrap_or(true);
+
+                if should_try {
+                    // Transition to half-open
+                    *state = ApiCircuitState::HalfOpen;
+                    self.success_count.store(0, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            }
+            ApiCircuitState::HalfOpen => true,
+        }
+    }
+
+    /// Record a successful API call
+    pub fn record_success(&self) {
+        self.failure_count.store(0, Ordering::SeqCst);
+
+        let mut state = self.state.write();
+        match *state {
+            ApiCircuitState::HalfOpen => {
+                let successes = self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if successes >= self.config.success_threshold {
+                    *state = ApiCircuitState::Closed;
+                    tracing::info!(
+                        "API circuit breaker '{}' closed after {} successful calls",
+                        self.name,
+                        successes
+                    );
+                }
+            }
+            _ => {
+                // Ensure we're in closed state on success
+                *state = ApiCircuitState::Closed;
+            }
+        }
+    }
+
+    /// Record a failed API call
+    pub fn record_failure(&self) {
+        let failures = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.last_failure_time.write() = Some(Instant::now());
+
+        let mut state = self.state.write();
+        match *state {
+            ApiCircuitState::Closed => {
+                if failures >= self.config.failure_threshold {
+                    *state = ApiCircuitState::Open;
+                    tracing::warn!(
+                        "API circuit breaker '{}' OPENED after {} consecutive failures",
+                        self.name,
+                        failures
+                    );
+                }
+            }
+            ApiCircuitState::HalfOpen => {
+                // Any failure in half-open goes back to open
+                *state = ApiCircuitState::Open;
+                tracing::warn!(
+                    "API circuit breaker '{}' re-OPENED during half-open test",
+                    self.name
+                );
+            }
+            ApiCircuitState::Open => {
+                // Already open, nothing to do
+            }
+        }
+    }
+
+    /// Get current state
+    pub fn state(&self) -> ApiCircuitState {
+        *self.state.read()
+    }
+
+    /// Get the name of this circuit breaker
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get current failure count
+    pub fn failure_count(&self) -> u32 {
+        self.failure_count.load(Ordering::SeqCst)
+    }
+
+    /// Reset the circuit breaker to closed state
+    pub fn reset(&self) {
+        let mut state = self.state.write();
+        *state = ApiCircuitState::Closed;
+        self.failure_count.store(0, Ordering::SeqCst);
+        self.success_count.store(0, Ordering::SeqCst);
+        *self.last_failure_time.write() = None;
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_api_circuit_breaker_basic() {
+        let cb = ApiCircuitBreaker::new(
+            "test_api",
+            ApiCircuitBreakerConfig {
+                failure_threshold: 3,
+                recovery_timeout: Duration::from_millis(100),
+                success_threshold: 2,
+            },
+        );
+
+        // Initially available
+        assert!(cb.is_available());
+        assert_eq!(cb.state(), ApiCircuitState::Closed);
+
+        // Record failures
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.is_available()); // Still available (2 < 3)
+
+        cb.record_failure();
+        assert_eq!(cb.state(), ApiCircuitState::Open);
+        assert!(!cb.is_available()); // Now blocked
+    }
+
+    #[test]
+    fn test_api_circuit_breaker_recovery() {
+        let cb = ApiCircuitBreaker::new(
+            "test_api",
+            ApiCircuitBreakerConfig {
+                failure_threshold: 2,
+                recovery_timeout: Duration::from_millis(10),
+                success_threshold: 2,
+            },
+        );
+
+        // Trip the breaker
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), ApiCircuitState::Open);
+
+        // Wait for recovery timeout
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Should transition to half-open
+        assert!(cb.is_available());
+        assert_eq!(cb.state(), ApiCircuitState::HalfOpen);
+
+        // Success in half-open
+        cb.record_success();
+        assert_eq!(cb.state(), ApiCircuitState::HalfOpen); // Need 2 successes
+
+        cb.record_success();
+        assert_eq!(cb.state(), ApiCircuitState::Closed); // Now closed
+    }
+
+    #[test]
+    fn test_api_circuit_breaker_half_open_failure() {
+        let cb = ApiCircuitBreaker::new(
+            "test_api",
+            ApiCircuitBreakerConfig {
+                failure_threshold: 1,
+                recovery_timeout: Duration::from_millis(10),
+                success_threshold: 1,
+            },
+        );
+
+        // Trip the breaker
+        cb.record_failure();
+        assert_eq!(cb.state(), ApiCircuitState::Open);
+
+        // Wait for recovery timeout
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(cb.is_available()); // Transitions to half-open
+
+        // Failure in half-open should re-open
+        cb.record_failure();
+        assert_eq!(cb.state(), ApiCircuitState::Open);
+    }
 
     #[test]
     fn test_max_daily_loss_trips() {

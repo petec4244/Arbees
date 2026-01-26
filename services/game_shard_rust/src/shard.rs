@@ -1,9 +1,11 @@
 use anyhow::Result;
+use arbees_rust_core::atomic_orderbook::kalshi_fee_cents;
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
     channels, GameState, Platform, SignalDirection, SignalType, Sport, TradingSignal,
 };
 use arbees_rust_core::redis::bus::RedisBus;
+use arbees_rust_core::simd::{check_arbs_simd, calculate_profit_cents, decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
 use arbees_rust_core::win_prob::calculate_win_probability;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -19,12 +21,56 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-/// Minimum edge percentage to generate a signal
-const MIN_EDGE_PCT: f64 = 2.0;
+/// Default minimum edge percentage to generate a signal (can be overridden via MIN_EDGE_PCT env var)
+/// Matches signal_processor_rust default (5.0%) to ensure consistency across services
+const DEFAULT_MIN_EDGE_PCT: f64 = 5.0;
 /// Maximum probability to buy (avoid buying near-certain outcomes)
 const MAX_BUY_PROB: f64 = 0.95;
 /// Minimum probability to buy (avoid buying very unlikely outcomes)
 const MIN_BUY_PROB: f64 = 0.05;
+/// Polymarket fee rate (2% per side)
+const POLYMARKET_FEE_RATE: f64 = 0.02;
+
+/// Calculate fee-adjusted edge percentage, accounting for round-trip trading fees.
+///
+/// For buying (model_prob > market_prob):
+///   - Entry cost: market_ask + entry_fee
+///   - Expected exit at model_prob with exit_fee
+///   - Net edge = model_prob - market_ask - entry_fee - exit_fee
+///
+/// For selling (model_prob < market_prob):
+///   - Entry proceeds: market_bid - entry_fee (selling YES)
+///   - Expected cost at model_prob with exit_fee
+///   - Net edge = market_bid - model_prob - entry_fee - exit_fee
+fn calculate_fee_adjusted_edge(
+    market_price: f64,
+    model_prob: f64,
+    platform: Platform,
+) -> f64 {
+    // Calculate entry fee based on the market price we're entering at
+    let entry_price_cents = (market_price * 100.0).round() as u16;
+    let entry_fee = match platform {
+        Platform::Kalshi | Platform::Paper => {
+            kalshi_fee_cents(entry_price_cents) as f64 / 100.0
+        }
+        Platform::Polymarket => market_price * POLYMARKET_FEE_RATE,
+    };
+
+    // Calculate exit fee based on expected exit price (model probability)
+    let exit_price_cents = (model_prob * 100.0).round() as u16;
+    let exit_fee = match platform {
+        Platform::Kalshi | Platform::Paper => {
+            kalshi_fee_cents(exit_price_cents) as f64 / 100.0
+        }
+        Platform::Polymarket => model_prob * POLYMARKET_FEE_RATE,
+    };
+
+    // Gross edge before fees
+    let gross_edge = model_prob - market_price;
+
+    // Net edge after round-trip fees (as percentage)
+    (gross_edge - entry_fee - exit_fee) * 100.0
+}
 
 #[derive(Clone)]
 pub struct GameShard {
@@ -137,7 +183,7 @@ impl GameShard {
         let min_edge_pct = env::var("MIN_EDGE_PCT")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(MIN_EDGE_PCT);
+            .unwrap_or(DEFAULT_MIN_EDGE_PCT);
 
         Ok(Self {
             shard_id,
@@ -536,6 +582,44 @@ async fn monitor_game(
                 let (home_kalshi, home_poly) = find_team_prices(game_prices, &game.home_team);
                 let (away_kalshi, away_poly) = find_team_prices(game_prices, &game.away_team);
 
+                // ===== CROSS-PLATFORM ARBITRAGE CHECK (SIMD) =====
+                // Check for arbitrage opportunities when we have prices from both platforms
+                // Arbs are higher priority than model-edge signals (guaranteed profit)
+                const MIN_ARB_PROFIT_CENTS: i16 = 1;
+
+                if let Some((arb_mask, profit)) = check_cross_platform_arb(home_kalshi, home_poly, MIN_ARB_PROFIT_CENTS) {
+                    let arb_key = (game.home_team.clone(), "arb".to_string());
+                    let should_emit_arb = match last_signal_times.get(&arb_key) {
+                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
+                        None => true,
+                    };
+                    if should_emit_arb {
+                        if emit_arb_signal(
+                            &redis, &game_id, sport_enum, &game.home_team,
+                            arb_mask, profit, home_kalshi.unwrap(), home_poly.unwrap()
+                        ).await {
+                            last_signal_times.insert(arb_key, Instant::now());
+                        }
+                    }
+                }
+
+                if let Some((arb_mask, profit)) = check_cross_platform_arb(away_kalshi, away_poly, MIN_ARB_PROFIT_CENTS) {
+                    let arb_key = (game.away_team.clone(), "arb".to_string());
+                    let should_emit_arb = match last_signal_times.get(&arb_key) {
+                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
+                        None => true,
+                    };
+                    if should_emit_arb {
+                        if emit_arb_signal(
+                            &redis, &game_id, sport_enum, &game.away_team,
+                            arb_mask, profit, away_kalshi.unwrap(), away_poly.unwrap()
+                        ).await {
+                            last_signal_times.insert(arb_key, Instant::now());
+                        }
+                    }
+                }
+                // ===== END ARBITRAGE CHECK =====
+
                 // Select best price (lowest ask) for each team
                 let home_best = select_best_price(home_kalshi, home_poly);
                 let away_best = select_best_price(away_kalshi, away_poly);
@@ -706,16 +790,25 @@ async fn check_and_emit_signal(
 ) -> bool {
     let market_prob = market_price.mid_price;
 
-    // Calculate edge: model_prob - market_prob (as percentage)
-    let edge_pct = (model_prob - market_prob) * 100.0;
+    // Calculate gross edge (without fees) for direction determination
+    let gross_edge_pct = (model_prob - market_prob) * 100.0;
 
-    // Skip if edge is too small
-    if edge_pct.abs() < min_edge_pct {
+    // Calculate fee-adjusted edge for the actual trading decision
+    // This accounts for entry and exit fees based on the platform
+    let fee_adjusted_edge_pct = calculate_fee_adjusted_edge(market_prob, model_prob, selected_platform);
+
+    // Skip if fee-adjusted edge is too small (this is the key change)
+    // We use the absolute value because sells have negative gross edge
+    if fee_adjusted_edge_pct.abs() < min_edge_pct {
+        debug!(
+            "Skipping {} - gross edge {:.1}%, fee-adjusted edge {:.1}% < {:.1}% threshold ({:?})",
+            team, gross_edge_pct.abs(), fee_adjusted_edge_pct.abs(), min_edge_pct, selected_platform
+        );
         return false;
     }
 
-    // Determine direction
-    let (direction, signal_type) = if edge_pct > 0.0 {
+    // Determine direction (based on gross edge direction)
+    let (direction, signal_type) = if gross_edge_pct > 0.0 {
         // Model thinks team is undervalued -> BUY
         if model_prob > MAX_BUY_PROB {
             debug!(
@@ -740,6 +833,7 @@ async fn check_and_emit_signal(
     };
 
     // Create signal with the selected platform
+    // Use fee-adjusted edge for the signal's edge_pct field
     let signal = TradingSignal {
         signal_id: Uuid::new_v4().to_string(),
         signal_type,
@@ -749,8 +843,8 @@ async fn check_and_emit_signal(
         direction,
         model_prob,
         market_prob: Some(market_prob),
-        edge_pct: edge_pct.abs(),
-        confidence: (edge_pct.abs() / 10.0).min(1.0), // Simple confidence based on edge size
+        edge_pct: fee_adjusted_edge_pct.abs(), // Use fee-adjusted edge
+        confidence: (fee_adjusted_edge_pct.abs() / 10.0).min(1.0), // Confidence based on fee-adjusted edge
         platform_buy: Some(selected_platform),
         platform_sell: None,
         buy_price: Some(market_price.yes_ask),
@@ -761,10 +855,11 @@ async fn check_and_emit_signal(
             .or(market_price.total_liquidity)
             .unwrap_or(10000.0),
         reason: format!(
-            "Model: {:.1}% vs Market: {:.1}% = {:.1}% edge ({:?})",
+            "Model: {:.1}% vs Market: {:.1}% = {:.1}% gross / {:.1}% net ({:?})",
             model_prob * 100.0,
             market_prob * 100.0,
-            edge_pct.abs(),
+            gross_edge_pct.abs(),
+            fee_adjusted_edge_pct.abs(),
             selected_platform
         ),
         created_at: Utc::now(),
@@ -779,12 +874,14 @@ async fn check_and_emit_signal(
         SignalDirection::Hold => "hold",
     };
     info!(
-        "SIGNAL: {} {} - model={:.1}% market={:.1}% edge={:.1}%",
+        "SIGNAL: {} {} - model={:.1}% market={:.1}% gross={:.1}% net={:.1}% ({:?})",
         team,
         direction_str,
         model_prob * 100.0,
         market_prob * 100.0,
-        edge_pct.abs()
+        gross_edge_pct.abs(),
+        fee_adjusted_edge_pct.abs(),
+        selected_platform
     );
 
     // Publish signal
@@ -886,4 +983,137 @@ fn format_time_remaining(seconds: u32) -> String {
     let mins = seconds / 60;
     let secs = seconds % 60;
     format!("{}:{:02}", mins, secs)
+}
+
+/// Check for cross-platform arbitrage opportunities using SIMD scanner.
+///
+/// Returns Some((arb_mask, profit_cents)) if an arb is found, None otherwise.
+///
+/// Arbitrage exists when:
+/// - Kalshi YES + Poly NO < 100¢ (or vice versa)
+/// - This means buying both sides guarantees profit
+fn check_cross_platform_arb(
+    kalshi_price: Option<&MarketPriceData>,
+    poly_price: Option<&MarketPriceData>,
+    min_profit_cents: i16,
+) -> Option<(u8, i16)> {
+    let (kalshi, poly) = match (kalshi_price, poly_price) {
+        (Some(k), Some(p)) => (k, p),
+        _ => return None, // Need both platforms for cross-platform arb
+    };
+
+    // Convert prices to cents (0-100 scale)
+    let k_yes = (kalshi.yes_ask * 100.0).round() as u16;
+    let k_no = ((1.0 - kalshi.yes_bid) * 100.0).round() as u16; // NO ask = 1 - YES bid
+    let p_yes = (poly.yes_ask * 100.0).round() as u16;
+    let p_no = ((1.0 - poly.yes_bid) * 100.0).round() as u16;
+
+    // Use SIMD scanner to check for arbs (threshold 100 = $1.00)
+    let arb_mask = check_arbs_simd(k_yes, k_no, p_yes, p_no, 100);
+
+    if arb_mask == 0 {
+        return None;
+    }
+
+    // Calculate profit for cross-platform arbs only
+    let cross_platform_mask = arb_mask & (ARB_POLY_YES_KALSHI_NO | ARB_KALSHI_YES_POLY_NO);
+
+    if cross_platform_mask == 0 {
+        return None;
+    }
+
+    // Find the most profitable cross-platform arb
+    let mut best_profit = 0i16;
+    let mut best_mask = 0u8;
+
+    if arb_mask & ARB_POLY_YES_KALSHI_NO != 0 {
+        let profit = calculate_profit_cents(k_yes, k_no, p_yes, p_no, ARB_POLY_YES_KALSHI_NO);
+        if profit > best_profit {
+            best_profit = profit;
+            best_mask = ARB_POLY_YES_KALSHI_NO;
+        }
+    }
+
+    if arb_mask & ARB_KALSHI_YES_POLY_NO != 0 {
+        let profit = calculate_profit_cents(k_yes, k_no, p_yes, p_no, ARB_KALSHI_YES_POLY_NO);
+        if profit > best_profit {
+            best_profit = profit;
+            best_mask = ARB_KALSHI_YES_POLY_NO;
+        }
+    }
+
+    if best_profit >= min_profit_cents {
+        Some((best_mask, best_profit))
+    } else {
+        None
+    }
+}
+
+/// Emit a cross-platform arbitrage signal
+async fn emit_arb_signal(
+    redis: &RedisBus,
+    game_id: &str,
+    sport: Sport,
+    team: &str,
+    arb_mask: u8,
+    profit_cents: i16,
+    kalshi_price: &MarketPriceData,
+    poly_price: &MarketPriceData,
+) -> bool {
+    let arb_types = decode_arb_mask(arb_mask);
+    let arb_type_str = arb_types.first().unwrap_or(&"Unknown");
+
+    let (buy_platform, sell_platform) = if arb_mask == ARB_POLY_YES_KALSHI_NO {
+        (Platform::Polymarket, Platform::Kalshi)
+    } else {
+        (Platform::Kalshi, Platform::Polymarket)
+    };
+
+    let signal = TradingSignal {
+        signal_id: Uuid::new_v4().to_string(),
+        signal_type: SignalType::CrossMarketArb,
+        game_id: game_id.to_string(),
+        sport,
+        team: team.to_string(),
+        direction: SignalDirection::Buy,
+        model_prob: 0.0,
+        market_prob: None,
+        edge_pct: profit_cents as f64,
+        confidence: 1.0,
+        platform_buy: Some(buy_platform),
+        platform_sell: Some(sell_platform),
+        buy_price: Some(if arb_mask == ARB_POLY_YES_KALSHI_NO {
+            poly_price.yes_ask
+        } else {
+            kalshi_price.yes_ask
+        }),
+        sell_price: Some(if arb_mask == ARB_POLY_YES_KALSHI_NO {
+            1.0 - kalshi_price.yes_bid
+        } else {
+            1.0 - poly_price.yes_bid
+        }),
+        liquidity_available: kalshi_price.yes_ask_size.unwrap_or(100.0).min(
+            poly_price.yes_ask_size.unwrap_or(100.0)
+        ),
+        reason: format!(
+            "ARB: {} - profit={:.0}¢ (buy {:?} YES + {:?} NO)",
+            arb_type_str, profit_cents, buy_platform, sell_platform
+        ),
+        created_at: Utc::now(),
+        expires_at: Some(Utc::now() + chrono::Duration::seconds(10)),
+        play_id: None,
+    };
+
+    info!(
+        "ARB SIGNAL: {} {} - profit={}¢ ({:?} YES + {:?} NO)",
+        team, arb_type_str, profit_cents, buy_platform, sell_platform
+    );
+
+    match redis.publish(channels::SIGNALS_NEW, &signal).await {
+        Ok(_) => true,
+        Err(e) => {
+            error!("Failed to publish arb signal: {}", e);
+            false
+        }
+    }
 }
