@@ -5,14 +5,17 @@ This document outlines the remaining strategic steps required to bring the Arbee
 
 ---
 
-## 1. Polymarket VPN Architecture (IMMEDIATE PRIORITY)
+## 1. Polymarket VPN Architecture
 **Primary Document:** `docs/VPN_FOR_POLYMARKETPLAN.md`
 
-**Status:** 🚧 **Next Up**
-The system currently lacks a reliable way to bypass Polymarket's geofencing for automated trading.
-- **Goal:** Deploy a specialized monitor shard behind a VPN to stream Polymarket CLOB data.
-- **Key Step:** Isolate Polymarket traffic from Kalshi traffic (which requires low-latency direct lines).
-- **Consolidated From:** `INTEGRATED_IMPLEMENTATION_PLAN.md` (Foundation Layer).
+**Status:** ✅ **IMPLEMENTED**
+The VPN architecture is complete and operational:
+- Gluetun VPN container configured in `docker-compose.yml`
+- Polymarket monitor runs behind VPN (network_mode: service:vpn)
+- Kalshi connections remain direct (low-latency)
+- All services access Polymarket prices via Redis (< 5ms latency)
+
+**Reference:** See `docker-compose.yml` lines 565-615 for VPN configuration.
 
 ## 2. AWS Distributed Deployment
 **Primary Document:** `docs/AWS_DEPLOYMENT.md`
@@ -37,10 +40,11 @@ Once the infrastructure is live, the system requires robust monitoring.
   - **End-to-End Testing:** Verify the full loop (VPN -> Detection -> Execution) under load.
 
 ## 4. Advanced Risk Management refining
-**Derived From:** `RISK_MANAGEMENT_2026-01-20.md`
 
-**Status:** 🔄 **Continuous Improvement**
-- **Tasks:**
-  - Refine position sizing logic in `PositionManager`.
-  - Implement tighter stop-loss mechanisms for high-volatility markets.
-  - Verify "No Market" rejection logic (recently added) prevents execution against stale data.
+**Status:** ✅ **IMPLEMENTED** - Risk management is operational
+- Risk limits enforced (per-game, per-sport, daily loss)
+- Position correlation detection
+- Latency circuit breaker
+- Signal spam control
+
+**Note:** Continuous improvement ongoing based on trading data.
