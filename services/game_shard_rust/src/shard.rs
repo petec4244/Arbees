@@ -500,86 +500,76 @@ async fn monitor_game(
             }
 
             // Get market prices for this game
+            // FIX: Only emit ONE signal per game - the team with the strongest edge
+            // This prevents betting on both teams to win the same game!
             let prices = market_prices.read().await;
             if let Some(game_prices) = prices.get(&game_id) {
-                // Check home team
-                if let Some(home_price) = find_team_price(game_prices, &game.home_team) {
-                    // Pre-calculate direction for debounce check
-                    let home_edge = (home_win_prob - home_price.mid_price) * 100.0;
-                    let home_direction = if home_edge > 0.0 { "buy" } else { "sell" };
-                    let home_key = (game.home_team.clone(), home_direction.to_string());
-
-                    // Check debounce
-                    let should_emit_home = match last_signal_times.get(&home_key) {
-                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
-                        None => true,
-                    };
-
-                    if should_emit_home && home_edge.abs() >= min_edge_pct {
-                        if check_and_emit_signal(
-                            &redis,
-                            &game_id,
-                            sport_enum,
-                            &game.home_team,
-                            home_win_prob,
-                            home_price,
-                            old_prob,
-                            min_edge_pct,
-                        )
-                        .await
-                        {
-                            last_signal_times.insert(home_key, Instant::now());
-                        }
-                    } else if !should_emit_home && home_edge.abs() >= min_edge_pct {
-                        debug!(
-                            "DEBOUNCE: {} {} - {}s remaining",
-                            game.home_team,
-                            home_direction,
-                            signal_debounce_secs.saturating_sub(
-                                last_signal_times.get(&home_key).map(|t| t.elapsed().as_secs()).unwrap_or(0)
-                            )
-                        );
-                    }
-                }
-
-                // Check away team
+                let home_price_opt = find_team_price(game_prices, &game.home_team);
+                let away_price_opt = find_team_price(game_prices, &game.away_team);
                 let away_win_prob = 1.0 - home_win_prob;
-                if let Some(away_price) = find_team_price(game_prices, &game.away_team) {
-                    // Pre-calculate direction for debounce check
-                    let away_edge = (away_win_prob - away_price.mid_price) * 100.0;
-                    let away_direction = if away_edge > 0.0 { "buy" } else { "sell" };
-                    let away_key = (game.away_team.clone(), away_direction.to_string());
 
-                    // Check debounce
-                    let should_emit_away = match last_signal_times.get(&away_key) {
-                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
-                        None => true,
-                    };
+                // Calculate edges for both teams
+                let home_edge_data = home_price_opt.map(|hp| {
+                    let edge = (home_win_prob - hp.mid_price) * 100.0;
+                    (edge, hp, home_win_prob, &game.home_team, old_prob)
+                });
 
-                    if should_emit_away && away_edge.abs() >= min_edge_pct {
-                        if check_and_emit_signal(
-                            &redis,
-                            &game_id,
-                            sport_enum,
-                            &game.away_team,
-                            away_win_prob,
-                            away_price,
-                            old_prob.map(|p| 1.0 - p),
-                            min_edge_pct,
-                        )
-                        .await
-                        {
-                            last_signal_times.insert(away_key, Instant::now());
+                let away_edge_data = away_price_opt.map(|ap| {
+                    let edge = (away_win_prob - ap.mid_price) * 100.0;
+                    (edge, ap, away_win_prob, &game.away_team, old_prob.map(|p| 1.0 - p))
+                });
+
+                // Determine which team has stronger edge (by absolute value)
+                let stronger_signal = match (home_edge_data, away_edge_data) {
+                    (Some(home), Some(away)) => {
+                        if home.0.abs() >= away.0.abs() {
+                            Some(home)
+                        } else {
+                            Some(away)
                         }
-                    } else if !should_emit_away && away_edge.abs() >= min_edge_pct {
-                        debug!(
-                            "DEBOUNCE: {} {} - {}s remaining",
-                            game.away_team,
-                            away_direction,
-                            signal_debounce_secs.saturating_sub(
-                                last_signal_times.get(&away_key).map(|t| t.elapsed().as_secs()).unwrap_or(0)
+                    }
+                    (Some(home), None) => Some(home),
+                    (None, Some(away)) => Some(away),
+                    (None, None) => None,
+                };
+
+                // Only emit signal for the team with stronger edge
+                if let Some((edge, price, prob, team, old_p)) = stronger_signal {
+                    if edge.abs() >= min_edge_pct {
+                        let direction = if edge > 0.0 { "buy" } else { "sell" };
+                        let signal_key = (team.clone(), direction.to_string());
+
+                        // Check debounce
+                        let should_emit = match last_signal_times.get(&signal_key) {
+                            Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
+                            None => true,
+                        };
+
+                        if should_emit {
+                            if check_and_emit_signal(
+                                &redis,
+                                &game_id,
+                                sport_enum,
+                                team,
+                                prob,
+                                price,
+                                old_p,
+                                min_edge_pct,
                             )
-                        );
+                            .await
+                            {
+                                last_signal_times.insert(signal_key, Instant::now());
+                            }
+                        } else {
+                            debug!(
+                                "DEBOUNCE: {} {} - {}s remaining",
+                                team,
+                                direction,
+                                signal_debounce_secs.saturating_sub(
+                                    last_signal_times.get(&signal_key).map(|t| t.elapsed().as_secs()).unwrap_or(0)
+                                )
+                            );
+                        }
                     }
                 }
             }
