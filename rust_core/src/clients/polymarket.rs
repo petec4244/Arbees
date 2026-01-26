@@ -10,16 +10,28 @@ const POLY_API: &str = "https://gamma-api.polymarket.com/markets";
 fn tag_id_for_slug(slug: &str) -> Option<u64> {
     // Gamma tag slugs -> numeric tag IDs (as returned by https://gamma-api.polymarket.com/tags).
     // We hardcode these to keep discovery low-latency and avoid an extra tags lookup call.
+    // Tag IDs can be found at: https://gamma-api.polymarket.com/tags
     match slug.to_lowercase().as_str() {
+        // Broad category
         "sports" => Some(1),
+        // Sport types
         "basketball" => Some(28),
         "football" => Some(10),
         "hockey" => Some(100088),
+        "baseball" => Some(100089),
+        "soccer" => Some(100090),
+        "tennis" => Some(100091),
+        "mma" | "ufc" => Some(100092),
+        // League-specific (preferred - more precise)
         "nba" => Some(745),
         "nfl" => Some(450),
         "nhl" => Some(899),
-        "ncaab" => Some(101952),
-        // TODO: Add more tag IDs as needed (soccer, mlb, ncaaf, etc).
+        "ncaab" | "ncaa_basketball" => Some(101952),
+        "ncaaf" | "ncaa_football" | "cfb" => Some(101953),
+        "mlb" => Some(100094),
+        "mls" => Some(100095),
+        "epl" | "premier_league" => Some(100096),
+        "uefa" | "champions_league" => Some(100097),
         _ => None,
     }
 }
