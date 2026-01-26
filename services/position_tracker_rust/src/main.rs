@@ -650,7 +650,7 @@ impl PositionTrackerState {
                 "exit_price": exit_price,
                 "size": position.size,
                 "pnl": gross_pnl,
-                "pnl_pct": pnl_pct,
+                "pnl_pct": net_pnl_pct,
                 "duration_minutes": duration_minutes,
                 "exit_reason": exit_reason,
             }),
