@@ -104,6 +104,7 @@ struct OpenPosition {
     size: f64,
     entry_time: DateTime<Utc>,
     contract_team: Option<String>,
+    entry_fees: f64, // Track entry fees for accurate P&L
 }
 
 // ============================================================================
@@ -219,7 +220,8 @@ impl PositionTrackerState {
         let rows = sqlx::query(
             r#"
             SELECT trade_id, signal_id, game_id, sport::text, platform::text, market_id, market_title,
-                   side::text, entry_price::float8, size::float8, time as entry_time
+                   side::text, entry_price::float8, size::float8, time as entry_time,
+                   COALESCE(entry_fees, 0.0)::float8 as entry_fees
             FROM paper_trades
             WHERE status = 'open'
             "#,
@@ -267,6 +269,7 @@ impl PositionTrackerState {
                 size: row.get("size"),
                 entry_time: row.try_get("entry_time").unwrap_or_else(|_| Utc::now()),
                 contract_team: None,
+                entry_fees: row.try_get::<f64, _>("entry_fees").unwrap_or(0.0),
             });
         }
 
@@ -307,6 +310,7 @@ impl PositionTrackerState {
                 size: result.filled_qty,
                 entry_time: result.executed_at,
                 contract_team: result.contract_team.clone(),
+                entry_fees: result.fees, // Track entry fees for accurate P&L
             };
 
             self.open_positions.push(position);
@@ -336,8 +340,8 @@ impl PositionTrackerState {
 
             if let Err(e) = sqlx::query(
                 r#"
-                INSERT INTO paper_trades (trade_id, signal_id, game_id, sport, platform, market_id, market_title, side, entry_price, size, time, entry_time, status, edge_at_entry)
-                VALUES ($1, $2, $3, $4::sport_enum, $5::platform_enum, $6, $7, $8::trade_side_enum, $9, $10, $11, $11, 'open', $12)
+                INSERT INTO paper_trades (trade_id, signal_id, game_id, sport, platform, market_id, market_title, side, entry_price, size, time, entry_time, status, edge_at_entry, entry_fees)
+                VALUES ($1, $2, $3, $4::sport_enum, $5::platform_enum, $6, $7, $8::trade_side_enum, $9, $10, $11, $11, 'open', $12, $13)
                 "#,
             )
             .bind(&trade_id)
@@ -352,12 +356,13 @@ impl PositionTrackerState {
             .bind(result.filled_qty)
             .bind(result.executed_at)
             .bind(result.edge_pct)
+            .bind(result.fees) // Store entry fees
             .execute(&self.pool)
             .await
             {
                 error!("Failed to insert paper_trade: {}", e);
             } else {
-                info!("Inserted paper_trade {} into database", trade_id);
+                info!("Inserted paper_trade {} into database (entry_fees=${:.2})", trade_id, result.fees);
             }
 
             // Emit position update
@@ -514,26 +519,54 @@ impl PositionTrackerState {
     ) -> Result<()> {
         self.positions_closed += 1;
 
-        // Calculate PnL
+        // Calculate gross PnL (before fees)
         let gross_pnl = match position.side {
             TradeSide::Buy => position.size * (exit_price - position.entry_price),
             TradeSide::Sell => position.size * (position.entry_price - exit_price),
         };
 
-        // Piggybank: 50% of profit goes to savings
-        if gross_pnl > 0.0 {
-            let to_piggybank = gross_pnl * 0.5;
+        // Calculate exit fees based on platform
+        // Kalshi: ~0.7% of contract value
+        // Polymarket: ~2% of contract value
+        // Paper: simulate Kalshi fees (0.7%)
+        let exit_fee_rate = match position.platform {
+            Platform::Kalshi => 0.007,
+            Platform::Polymarket => 0.02,
+            Platform::Paper => 0.007,
+        };
+        let exit_value = position.size * exit_price;
+        let exit_fees = exit_value * exit_fee_rate;
+
+        // Total fees = entry fees + exit fees
+        let total_fees = position.entry_fees + exit_fees;
+
+        // Net PnL = gross PnL - total fees
+        let net_pnl = gross_pnl - total_fees;
+
+        // Update win/loss based on NET PnL (after fees)
+        let actual_was_win = net_pnl > 0.0;
+
+        // Piggybank: 50% of NET profit goes to savings
+        if net_pnl > 0.0 {
+            let to_piggybank = net_pnl * 0.5;
             self.piggybank_balance += to_piggybank;
-            self.current_balance += gross_pnl - to_piggybank;
+            self.current_balance += net_pnl - to_piggybank;
         } else {
-            self.current_balance += gross_pnl;
+            self.current_balance += net_pnl;
         }
 
-        // Update trade in DB with PnL
-        let outcome = if was_win { "win" } else { "loss" };
-        let pnl_pct = match position.side {
-            TradeSide::Buy => (exit_price - position.entry_price) / position.entry_price * 100.0,
-            TradeSide::Sell => (position.entry_price - exit_price) / position.entry_price * 100.0,
+        info!(
+            "P&L breakdown: gross=${:.2}, entry_fees=${:.2}, exit_fees=${:.2}, net=${:.2}",
+            gross_pnl, position.entry_fees, exit_fees, net_pnl
+        );
+
+        // Update trade in DB with net PnL (after fees)
+        let outcome = if actual_was_win { "win" } else { "loss" };
+        // Calculate net PnL percentage based on position size
+        let net_pnl_pct = if position.size > 0.0 {
+            (net_pnl / position.size) * 100.0
+        } else {
+            0.0
         };
 
         sqlx::query(
@@ -544,14 +577,16 @@ impl PositionTrackerState {
                 exit_time = NOW(),
                 outcome = $2::trade_outcome_enum,
                 pnl = $3,
-                pnl_pct = $4
-            WHERE trade_id = $5
+                pnl_pct = $4,
+                exit_fees = $5
+            WHERE trade_id = $6
             "#,
         )
         .bind(exit_price)
         .bind(outcome)
-        .bind(gross_pnl)
-        .bind(pnl_pct)
+        .bind(net_pnl)
+        .bind(net_pnl_pct)
+        .bind(exit_fees)
         .bind(&position.trade_id)
         .execute(&self.pool)
         .await?;
@@ -559,11 +594,11 @@ impl PositionTrackerState {
         // Save bankroll
         self.save_bankroll().await?;
 
-        // Record cooldown
+        // Record cooldown based on actual win/loss after fees
         self.game_cooldowns
-            .insert(position.game_id.clone(), (Utc::now(), was_win));
+            .insert(position.game_id.clone(), (Utc::now(), actual_was_win));
 
-        // Emit position update
+        // Emit position update with net PnL
         let update = PositionUpdate {
             position_id: Uuid::new_v4().to_string(),
             trade_id: position.trade_id.clone(),
@@ -581,8 +616,8 @@ impl PositionTrackerState {
             current_price: Some(exit_price),
             size: position.size,
             unrealized_pnl: 0.0,
-            realized_pnl: gross_pnl,
-            fees_paid: 0.0,
+            realized_pnl: net_pnl, // Use net PnL (after fees)
+            fees_paid: total_fees,
             exit_price: Some(exit_price),
             exit_reason: Some(exit_reason.to_string()),
             stop_loss_price: None,
@@ -630,10 +665,11 @@ impl PositionTrackerState {
             TradeSide::Buy => "to win",
             TradeSide::Sell => "to lose",
         };
-        let pnl_sign = if gross_pnl >= 0.0 { "+" } else { "" };
+        let pnl_sign = if net_pnl >= 0.0 { "+" } else { "" };
+        let outcome_str = if actual_was_win { "WIN" } else { "LOSS" };
         info!(
-            "CLOSE: {} {} - entry={:.3} exit={:.3} pnl={}{:.2} ({})",
-            position.market_title, direction_str, position.entry_price, exit_price, pnl_sign, gross_pnl, exit_reason
+            "CLOSE [{}]: {} {} - entry={:.3} exit={:.3} net_pnl={}{:.2} fees=${:.2} ({})",
+            outcome_str, position.market_title, direction_str, position.entry_price, exit_price, pnl_sign, net_pnl, total_fees, exit_reason
         );
 
         Ok(())
@@ -740,6 +776,16 @@ impl PositionTrackerState {
         current_price: f64,
         stop_loss_pct: f64,
     ) -> (bool, String) {
+        // Hold positions when game is basically decided - let them settle to 0 or 1
+        if position.side == TradeSide::Buy && current_price > 0.85 {
+            // Winning by a lot on a buy, will likely settle at 1.00
+            return (false, "holding_for_settlement".to_string());
+        }
+        if position.side == TradeSide::Sell && current_price < 0.15 {
+            // Winning by a lot on a sell, will likely settle at 0.00
+            return (false, "holding_for_settlement".to_string());
+        }
+
         let entry_price = position.entry_price;
         let take_profit_threshold = self.config.take_profit_pct / 100.0;
         let stop_loss_threshold = stop_loss_pct / 100.0;

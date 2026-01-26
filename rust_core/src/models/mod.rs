@@ -233,7 +233,8 @@ impl TradingSignal {
     }
 
     pub fn kelly_fraction(&self) -> f64 {
-        if self.edge_pct <= 0.0 || self.market_prob.is_none() {
+        // Use absolute value - sell signals have negative edge_pct
+        if self.edge_pct.abs() <= 0.01 || self.market_prob.is_none() {
             return 0.0;
         }
         let p = self.model_prob;
