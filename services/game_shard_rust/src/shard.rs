@@ -33,7 +33,8 @@ pub struct GameShard {
     espn: EspnClient,
     db_pool: PgPool,
     games: Arc<Mutex<HashMap<String, GameEntry>>>,
-    /// Shared market prices: game_id -> (team, MarketPrice)
+    /// Shared market prices: game_id -> (team|platform -> MarketPrice)
+    /// Key format for inner map: "{team}|{platform}" to support prices from multiple platforms
     market_prices: Arc<RwLock<HashMap<String, HashMap<String, MarketPriceData>>>>,
     poll_interval: Duration,
     heartbeat_interval: Duration,
@@ -50,6 +51,12 @@ struct MarketPriceData {
     pub yes_ask: f64,
     pub mid_price: f64,
     pub timestamp: chrono::DateTime<Utc>,
+    /// Liquidity available at the yes bid (contracts available to sell)
+    pub yes_bid_size: Option<f64>,
+    /// Liquidity available at the yes ask (contracts available to buy)
+    pub yes_ask_size: Option<f64>,
+    /// Total liquidity in the market (if reported)
+    pub total_liquidity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +96,12 @@ struct IncomingMarketPrice {
     mid_price: Option<f64>,
     implied_probability: Option<f64>,
     timestamp: Option<String>,
+    /// Liquidity at the yes bid (contracts available to sell)
+    yes_bid_size: Option<f64>,
+    /// Liquidity at the yes ask (contracts available to buy)
+    yes_ask_size: Option<f64>,
+    /// Total market liquidity (optional)
+    liquidity: Option<f64>,
 }
 
 impl GameShard {
@@ -373,11 +386,16 @@ impl GameShard {
                     yes_ask: price.yes_ask,
                     mid_price: mid,
                     timestamp: Utc::now(),
+                    yes_bid_size: price.yes_bid_size,
+                    yes_ask_size: price.yes_ask_size,
+                    total_liquidity: price.liquidity,
                 };
 
                 let mut prices = self.market_prices.write().await;
                 let game_prices = prices.entry(game_id.clone()).or_insert_with(HashMap::new);
-                game_prices.insert(team.clone(), data);
+                // Store with team|platform key to support multiple platforms per team
+                let key = format!("{}|{}", team, price.platform.to_lowercase());
+                game_prices.insert(key, data);
             }
         }
 
@@ -514,19 +532,25 @@ async fn monitor_game(
             // This prevents betting on both teams to win the same game!
             let prices = market_prices.read().await;
             if let Some(game_prices) = prices.get(&game_id) {
-                let home_price_opt = find_team_price(game_prices, &game.home_team);
-                let away_price_opt = find_team_price(game_prices, &game.away_team);
+                // Get prices from both platforms for each team
+                let (home_kalshi, home_poly) = find_team_prices(game_prices, &game.home_team);
+                let (away_kalshi, away_poly) = find_team_prices(game_prices, &game.away_team);
+
+                // Select best price (lowest ask) for each team
+                let home_best = select_best_price(home_kalshi, home_poly);
+                let away_best = select_best_price(away_kalshi, away_poly);
+
                 let away_win_prob = 1.0 - home_win_prob;
 
-                // Calculate edges for both teams
-                let home_edge_data = home_price_opt.map(|hp| {
+                // Calculate edges for both teams using best available price
+                let home_edge_data = home_best.map(|(hp, platform)| {
                     let edge = (home_win_prob - hp.mid_price) * 100.0;
-                    (edge, hp, home_win_prob, &game.home_team, old_prob)
+                    (edge, hp, platform, home_win_prob, &game.home_team, old_prob)
                 });
 
-                let away_edge_data = away_price_opt.map(|ap| {
+                let away_edge_data = away_best.map(|(ap, platform)| {
                     let edge = (away_win_prob - ap.mid_price) * 100.0;
-                    (edge, ap, away_win_prob, &game.away_team, old_prob.map(|p| 1.0 - p))
+                    (edge, ap, platform, away_win_prob, &game.away_team, old_prob.map(|p| 1.0 - p))
                 });
 
                 // Determine which team has stronger edge (by absolute value)
@@ -543,8 +567,8 @@ async fn monitor_game(
                     (None, None) => None,
                 };
 
-                // Only emit signal for the team with stronger edge
-                if let Some((edge, price, prob, team, old_p)) = stronger_signal {
+                // Only emit signal for the team with stronger edge, using the best platform
+                if let Some((edge, price, platform, prob, team, old_p)) = stronger_signal {
                     if edge.abs() >= min_edge_pct {
                         let direction = if edge > 0.0 { "buy" } else { "sell" };
                         let signal_key = (team.clone(), direction.to_string());
@@ -556,6 +580,15 @@ async fn monitor_game(
                         };
 
                         if should_emit {
+                            // Log platform selection for debugging
+                            debug!(
+                                "Selected {:?} for {} (kalshi={}, poly={})",
+                                platform,
+                                team,
+                                home_kalshi.map(|p| format!("{:.3}", p.yes_ask)).unwrap_or_else(|| "N/A".to_string()),
+                                home_poly.map(|p| format!("{:.3}", p.yes_ask)).unwrap_or_else(|| "N/A".to_string())
+                            );
+
                             if check_and_emit_signal(
                                 &redis,
                                 &game_id,
@@ -563,6 +596,7 @@ async fn monitor_game(
                                 team,
                                 prob,
                                 price,
+                                platform,
                                 old_p,
                                 min_edge_pct,
                             )
@@ -589,22 +623,73 @@ async fn monitor_game(
     }
 }
 
+/// Find all platform prices for a team (returns up to one price per platform)
+fn find_team_prices<'a>(
+    prices: &'a HashMap<String, MarketPriceData>,
+    team: &str,
+) -> (Option<&'a MarketPriceData>, Option<&'a MarketPriceData>) {
+    let team_lower = team.to_lowercase();
+    let mut kalshi_price: Option<&MarketPriceData> = None;
+    let mut poly_price: Option<&MarketPriceData> = None;
+
+    for (key, price) in prices {
+        // Parse key: "team|platform"
+        let parts: Vec<&str> = key.split('|').collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let price_team = parts[0].to_lowercase();
+        let platform = parts.get(1).map(|p| p.to_lowercase()).unwrap_or_default();
+
+        // Check if team matches (exact or partial)
+        let team_matches = price_team.contains(&team_lower) || team_lower.contains(&price_team);
+        if !team_matches {
+            continue;
+        }
+
+        // Assign to appropriate platform slot
+        if platform.contains("kalshi") && kalshi_price.is_none() {
+            kalshi_price = Some(price);
+        } else if platform.contains("polymarket") && poly_price.is_none() {
+            poly_price = Some(price);
+        }
+
+        // Early exit if we found both
+        if kalshi_price.is_some() && poly_price.is_some() {
+            break;
+        }
+    }
+
+    (kalshi_price, poly_price)
+}
+
+/// Select the best price from available platform prices (lowest ask for buying)
+fn select_best_price<'a>(
+    kalshi_price: Option<&'a MarketPriceData>,
+    poly_price: Option<&'a MarketPriceData>,
+) -> Option<(&'a MarketPriceData, Platform)> {
+    match (kalshi_price, poly_price) {
+        (Some(k), Some(p)) => {
+            // For buying, prefer lower ask price
+            if k.yes_ask <= p.yes_ask {
+                Some((k, Platform::Kalshi))
+            } else {
+                Some((p, Platform::Polymarket))
+            }
+        }
+        (Some(k), None) => Some((k, Platform::Kalshi)),
+        (None, Some(p)) => Some((p, Platform::Polymarket)),
+        (None, None) => None,
+    }
+}
+
+/// Legacy function for backward compatibility - returns best price among all platforms
 fn find_team_price<'a>(
     prices: &'a HashMap<String, MarketPriceData>,
     team: &str,
 ) -> Option<&'a MarketPriceData> {
-    // Try exact match first
-    if let Some(price) = prices.get(team) {
-        return Some(price);
-    }
-    // Try case-insensitive partial match
-    let team_lower = team.to_lowercase();
-    for (key, price) in prices {
-        if key.to_lowercase().contains(&team_lower) || team_lower.contains(&key.to_lowercase()) {
-            return Some(price);
-        }
-    }
-    None
+    let (kalshi, poly) = find_team_prices(prices, team);
+    select_best_price(kalshi, poly).map(|(p, _)| p)
 }
 
 /// Returns true if a signal was emitted, false otherwise
@@ -615,6 +700,7 @@ async fn check_and_emit_signal(
     team: &str,
     model_prob: f64,
     market_price: &MarketPriceData,
+    selected_platform: Platform,
     _old_prob: Option<f64>,
     min_edge_pct: f64,
 ) -> bool {
@@ -653,7 +739,7 @@ async fn check_and_emit_signal(
         (SignalDirection::Sell, SignalType::ModelEdgeNo)
     };
 
-    // Create signal
+    // Create signal with the selected platform
     let signal = TradingSignal {
         signal_id: Uuid::new_v4().to_string(),
         signal_type,
@@ -665,16 +751,21 @@ async fn check_and_emit_signal(
         market_prob: Some(market_prob),
         edge_pct: edge_pct.abs(),
         confidence: (edge_pct.abs() / 10.0).min(1.0), // Simple confidence based on edge size
-        platform_buy: Some(Platform::Polymarket),
+        platform_buy: Some(selected_platform),
         platform_sell: None,
         buy_price: Some(market_price.yes_ask),
         sell_price: Some(market_price.yes_bid),
-        liquidity_available: 10000.0, // TODO: Get actual liquidity
+        // Use actual liquidity from market price, fallback to yes_ask_size, then total_liquidity
+        liquidity_available: market_price
+            .yes_ask_size
+            .or(market_price.total_liquidity)
+            .unwrap_or(10000.0),
         reason: format!(
-            "Model: {:.1}% vs Market: {:.1}% = {:.1}% edge",
+            "Model: {:.1}% vs Market: {:.1}% = {:.1}% edge ({:?})",
             model_prob * 100.0,
             market_prob * 100.0,
-            edge_pct.abs()
+            edge_pct.abs(),
+            selected_platform
         ),
         created_at: Utc::now(),
         expires_at: Some(Utc::now() + chrono::Duration::seconds(30)),

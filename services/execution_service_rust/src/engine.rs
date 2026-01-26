@@ -1,8 +1,35 @@
 use anyhow::Result;
+use arbees_rust_core::atomic_orderbook::kalshi_fee_cents;
 use arbees_rust_core::clients::{kalshi::KalshiClient, polymarket::PolymarketClient};
-use arbees_rust_core::models::{ExecutionRequest, ExecutionResult, ExecutionStatus, Platform};
+use arbees_rust_core::models::{ExecutionRequest, ExecutionResult, ExecutionSide, ExecutionStatus, Platform};
 use chrono::Utc;
-use log::info;
+use log::{error, info, warn};
+
+/// Calculate trading fee for a given platform, price, and size.
+///
+/// For Kalshi and Paper trading:
+/// - Uses Kalshi's fee schedule: fee = ceil(7 * price * (100 - price) / 10000) cents per contract
+/// - Fee is per contract, so total fee = fee_per_contract * quantity
+///
+/// For Polymarket:
+/// - Uses 2% fee on the position value
+fn calculate_fee(platform: Platform, price: f64, size: f64) -> f64 {
+    match platform {
+        Platform::Kalshi | Platform::Paper => {
+            // Convert price (0.0-1.0) to cents (0-100)
+            let price_cents = (price * 100.0).round() as u16;
+            // Get fee in cents per contract
+            let fee_cents = kalshi_fee_cents(price_cents);
+            // Convert back to dollars and multiply by quantity
+            // Size represents number of contracts, each contract has face value of $1
+            (fee_cents as f64 / 100.0) * size
+        }
+        Platform::Polymarket => {
+            // Polymarket charges 2% fee on position value
+            price * size * 0.02
+        }
+    }
+}
 
 pub struct ExecutionEngine {
     kalshi: KalshiClient,
@@ -11,22 +38,60 @@ pub struct ExecutionEngine {
 }
 
 impl ExecutionEngine {
+    /// Create a new execution engine
+    ///
+    /// If paper_trading is true, all orders will be simulated.
+    /// Otherwise, the engine will attempt live trading on supported platforms.
+    ///
+    /// For Kalshi live trading, set environment variables:
+    /// - KALSHI_API_KEY: Your API key
+    /// - KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_PATH: RSA private key
+    /// - KALSHI_ENV: "prod" or "demo" (defaults to prod)
     pub fn new(paper_trading: bool) -> Self {
+        // Try to load Kalshi credentials from environment
+        let kalshi = match KalshiClient::from_env() {
+            Ok(client) => {
+                if client.has_credentials() {
+                    info!("Kalshi client initialized with trading credentials");
+                } else {
+                    warn!("Kalshi client initialized without credentials (will reject live trades)");
+                }
+                client
+            }
+            Err(e) => {
+                warn!("Failed to initialize Kalshi client from env: {}. Using read-only client.", e);
+                KalshiClient::new()
+            }
+        };
+
         Self {
-            kalshi: KalshiClient::new(),
+            kalshi,
             polymarket: PolymarketClient::new(),
             paper_trading,
         }
+    }
+
+    /// Check if Kalshi live trading is available
+    pub fn kalshi_live_enabled(&self) -> bool {
+        !self.paper_trading && self.kalshi.has_credentials()
     }
 
     pub async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResult> {
         info!("Executing request: {:?}", request);
 
         if self.paper_trading {
-            // Paper trading logic (simplified for now)
+            // Paper trading logic with realistic fee calculation
             info!("Paper trade simulation for {}", request.request_id);
             let executed_at = Utc::now();
             let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
+
+            // Calculate realistic fees based on the platform
+            let fees = calculate_fee(request.platform, request.limit_price, request.size);
+            info!(
+                "Paper trade fees: ${:.4} (platform={:?}, price={:.3}, size={:.2})",
+                fees, request.platform, request.limit_price, request.size
+            );
+
             return Ok(ExecutionResult {
                 request_id: request.request_id,
                 idempotency_key: request.idempotency_key,
@@ -35,7 +100,7 @@ impl ExecutionEngine {
                 order_id: Some(format!("paper-{}", uuid::Uuid::new_v4())),
                 filled_qty: request.size,
                 avg_price: request.limit_price,
-                fees: 0.0,
+                fees,
                 platform: request.platform,
                 market_id: request.market_id,
                 contract_team: request.contract_team,
@@ -54,63 +119,44 @@ impl ExecutionEngine {
         // Real execution
         match request.platform {
             Platform::Kalshi => {
-                // TODO: Call Kalshi client place_order
-                // For now return dummy
+                self.execute_kalshi(request).await
+            }
+            Platform::Polymarket => {
+                // Polymarket CLOB integration is complex and deferred
+                // It requires wallet signing with ethers, CLOB API, etc.
                 let executed_at = Utc::now();
                 let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
                 Ok(ExecutionResult {
-                     request_id: request.request_id,
-                     idempotency_key: request.idempotency_key,
-                     status: ExecutionStatus::Rejected,
-                     rejection_reason: Some("Real execution not implemented yet".to_string()),
-                     order_id: None,
-                     filled_qty: 0.0,
-                     avg_price: 0.0,
-                     fees: 0.0,
-                     platform: Platform::Kalshi,
-                     market_id: request.market_id,
-                     contract_team: request.contract_team,
-                     game_id: request.game_id,
-                     sport: request.sport,
-                     signal_id: request.signal_id,
-                     signal_type: request.signal_type,
-                     edge_pct: request.edge_pct,
-                     side: request.side,
-                     requested_at: request.created_at,
-                     executed_at,
-                     latency_ms,
-                })
-            }
-            Platform::Polymarket => {
-                 // TODO: Call Polymarket client place_order
-                 let executed_at = Utc::now();
-                 let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
-                  Ok(ExecutionResult {
-                     request_id: request.request_id,
-                     idempotency_key: request.idempotency_key,
-                     status: ExecutionStatus::Rejected,
-                     rejection_reason: Some("Real execution not implemented yet".to_string()),
-                     order_id: None,
-                     filled_qty: 0.0,
-                     avg_price: 0.0,
-                     fees: 0.0,
-                     platform: Platform::Polymarket,
-                     market_id: request.market_id,
-                     contract_team: request.contract_team,
-                     game_id: request.game_id,
-                     sport: request.sport,
-                     signal_id: request.signal_id,
-                     signal_type: request.signal_type,
-                     edge_pct: request.edge_pct,
-                     side: request.side,
-                     requested_at: request.created_at,
-                     executed_at,
-                     latency_ms,
+                    request_id: request.request_id,
+                    idempotency_key: request.idempotency_key,
+                    status: ExecutionStatus::Rejected,
+                    rejection_reason: Some(
+                        "Polymarket live trading not yet implemented - requires CLOB integration"
+                            .to_string(),
+                    ),
+                    order_id: None,
+                    filled_qty: 0.0,
+                    avg_price: 0.0,
+                    fees: 0.0,
+                    platform: Platform::Polymarket,
+                    market_id: request.market_id,
+                    contract_team: request.contract_team,
+                    game_id: request.game_id,
+                    sport: request.sport,
+                    signal_id: request.signal_id,
+                    signal_type: request.signal_type,
+                    edge_pct: request.edge_pct,
+                    side: request.side,
+                    requested_at: request.created_at,
+                    executed_at,
+                    latency_ms,
                 })
             }
             Platform::Paper => {
                 let executed_at = Utc::now();
                 let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
+                // Calculate realistic fees using Kalshi fee schedule for Paper trades
+                let fees = calculate_fee(Platform::Paper, request.limit_price, request.size);
                 Ok(ExecutionResult {
                     request_id: request.request_id,
                     idempotency_key: request.idempotency_key,
@@ -119,8 +165,169 @@ impl ExecutionEngine {
                     order_id: Some(format!("paper-{}", uuid::Uuid::new_v4())),
                     filled_qty: request.size,
                     avg_price: request.limit_price,
-                    fees: 0.0,
+                    fees,
                     platform: Platform::Paper,
+                    market_id: request.market_id,
+                    contract_team: request.contract_team,
+                    game_id: request.game_id,
+                    sport: request.sport,
+                    signal_id: request.signal_id,
+                    signal_type: request.signal_type,
+                    edge_pct: request.edge_pct,
+                    side: request.side,
+                    requested_at: request.created_at,
+                    executed_at,
+                    latency_ms,
+                })
+            }
+        }
+    }
+
+    /// Execute a Kalshi order using the live API
+    async fn execute_kalshi(&self, request: ExecutionRequest) -> Result<ExecutionResult> {
+        let start_time = Utc::now();
+
+        // Check if we have credentials
+        if !self.kalshi.has_credentials() {
+            let executed_at = Utc::now();
+            let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
+            return Ok(ExecutionResult {
+                request_id: request.request_id,
+                idempotency_key: request.idempotency_key,
+                status: ExecutionStatus::Rejected,
+                rejection_reason: Some(
+                    "Kalshi credentials not configured. Set KALSHI_API_KEY and KALSHI_PRIVATE_KEY"
+                        .to_string(),
+                ),
+                order_id: None,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                fees: 0.0,
+                platform: Platform::Kalshi,
+                market_id: request.market_id,
+                contract_team: request.contract_team,
+                game_id: request.game_id,
+                sport: request.sport,
+                signal_id: request.signal_id,
+                signal_type: request.signal_type,
+                edge_pct: request.edge_pct,
+                side: request.side,
+                requested_at: request.created_at,
+                executed_at,
+                latency_ms,
+            });
+        }
+
+        // Map ExecutionSide to Kalshi side string
+        let side_str = match request.side {
+            ExecutionSide::Yes => "yes",
+            ExecutionSide::No => "no",
+        };
+
+        // Convert size to contracts (assuming size is in dollars and contracts are $1 each)
+        let quantity = request.size.round() as i32;
+        if quantity < 1 {
+            let executed_at = Utc::now();
+            let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
+            return Ok(ExecutionResult {
+                request_id: request.request_id,
+                idempotency_key: request.idempotency_key,
+                status: ExecutionStatus::Rejected,
+                rejection_reason: Some(format!(
+                    "Order size too small: {} contracts (minimum 1)",
+                    quantity
+                )),
+                order_id: None,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                fees: 0.0,
+                platform: Platform::Kalshi,
+                market_id: request.market_id.clone(),
+                contract_team: request.contract_team,
+                game_id: request.game_id,
+                sport: request.sport,
+                signal_id: request.signal_id,
+                signal_type: request.signal_type,
+                edge_pct: request.edge_pct,
+                side: request.side,
+                requested_at: request.created_at,
+                executed_at,
+                latency_ms,
+            });
+        }
+
+        info!(
+            "Placing Kalshi live order: {} {} x{} @ {:.2} on {}",
+            "buy", side_str, quantity, request.limit_price, request.market_id
+        );
+
+        // Place the order
+        match self
+            .kalshi
+            .place_order(&request.market_id, side_str, request.limit_price, quantity)
+            .await
+        {
+            Ok(order) => {
+                let executed_at = Utc::now();
+                let latency_ms = (executed_at - start_time).num_milliseconds() as f64;
+
+                // Determine fill status
+                let filled_qty = (order.count - order.remaining_count.unwrap_or(0)) as f64;
+                let status = if filled_qty >= quantity as f64 {
+                    ExecutionStatus::Filled
+                } else if filled_qty > 0.0 {
+                    ExecutionStatus::Partial
+                } else {
+                    ExecutionStatus::Accepted // Order accepted but not yet filled
+                };
+
+                // Calculate fees based on filled quantity
+                let fees = calculate_fee(Platform::Kalshi, request.limit_price, filled_qty);
+
+                info!(
+                    "Kalshi order {} status: {:?}, filled: {}/{}, fees: ${:.4}",
+                    order.order_id, status, filled_qty, quantity, fees
+                );
+
+                Ok(ExecutionResult {
+                    request_id: request.request_id,
+                    idempotency_key: request.idempotency_key,
+                    status,
+                    rejection_reason: None,
+                    order_id: Some(order.order_id),
+                    filled_qty,
+                    avg_price: request.limit_price, // TODO: Get actual fill price from order
+                    fees,
+                    platform: Platform::Kalshi,
+                    market_id: request.market_id,
+                    contract_team: request.contract_team,
+                    game_id: request.game_id,
+                    sport: request.sport,
+                    signal_id: request.signal_id,
+                    signal_type: request.signal_type,
+                    edge_pct: request.edge_pct,
+                    side: request.side,
+                    requested_at: request.created_at,
+                    executed_at,
+                    latency_ms,
+                })
+            }
+            Err(e) => {
+                let executed_at = Utc::now();
+                let latency_ms = (executed_at - start_time).num_milliseconds() as f64;
+
+                error!("Kalshi order failed: {}", e);
+
+                Ok(ExecutionResult {
+                    request_id: request.request_id,
+                    idempotency_key: request.idempotency_key,
+                    status: ExecutionStatus::Failed,
+                    rejection_reason: Some(format!("Kalshi API error: {}", e)),
+                    order_id: None,
+                    filled_qty: 0.0,
+                    avg_price: 0.0,
+                    fees: 0.0,
+                    platform: Platform::Kalshi,
                     market_id: request.market_id,
                     contract_team: request.contract_team,
                     game_id: request.game_id,

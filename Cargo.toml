@@ -45,6 +45,11 @@ parking_lot = "0.12"         # Faster RwLock than std
 wide = "0.7"                 # SIMD support
 # Pin home to version that doesn't require edition 2024
 home = "=0.5.9"
+# RSA signing for Kalshi API authentication
+rsa = { version = "0.9", features = ["sha2"] }  # RSA encryption/signing with SHA2 support
+sha2 = "0.10"                # SHA256 for RSA-PSS
+base64 = "0.21"              # Base64 encoding for signatures
+rand = "0.8"                 # Random number generation for RSA
 
 [profile.release]
 lto = true

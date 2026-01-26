@@ -56,6 +56,8 @@ struct Config {
     loss_cooldown_seconds: f64,
     initial_bankroll: f64,
     team_match_min_confidence: f64,
+    /// Price staleness TTL in seconds - prices older than this are ignored
+    price_staleness_secs: f64,
 }
 
 impl Default for Config {
@@ -121,6 +123,12 @@ impl Default for Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.7),
+            // Price staleness TTL - prices older than this are considered stale
+            // Default: 30 seconds (was hardcoded as 2 minutes previously)
+            price_staleness_secs: env::var("PRICE_STALENESS_TTL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30.0),
         }
     }
 }
@@ -637,6 +645,8 @@ impl SignalProcessorState {
             return self.get_any_recent_price(&signal.game_id).await;
         }
 
+        // Use configurable price staleness TTL instead of hardcoded 2 minutes
+        let staleness_interval = format!("{} seconds", self.config.price_staleness_secs);
         let rows = sqlx::query(
             r#"
             SELECT market_id, market_title, contract_team, yes_bid, yes_ask,
@@ -644,12 +654,13 @@ impl SignalProcessorState {
             FROM market_prices
             WHERE game_id = $1
               AND contract_team IS NOT NULL
-              AND time > NOW() - INTERVAL '2 minutes'
+              AND time > NOW() - $2::interval
             ORDER BY time DESC
             LIMIT 10
             "#,
         )
         .bind(&signal.game_id)
+        .bind(&staleness_interval)
         .fetch_all(&self.pool)
         .await?;
 
