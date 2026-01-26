@@ -233,20 +233,44 @@ impl TradingSignal {
     }
 
     pub fn kelly_fraction(&self) -> f64 {
-        // Use absolute value - sell signals have negative edge_pct
+        // Check if we have valid inputs
         if self.edge_pct.abs() <= 0.01 || self.market_prob.is_none() {
             return 0.0;
         }
-        let p = self.model_prob;
-        let q = 1.0 - p;
+        
         let market_prob = self.market_prob.unwrap_or(0.0);
-        if market_prob <= 0.0 {
+        if market_prob <= 0.0 || market_prob >= 1.0 {
             return 0.0;
         }
-        let b = (1.0 / market_prob) - 1.0;
+        
+        // For sell signals (negative edge), calculate Kelly for betting AGAINST
+        // Use the complement probability
+        let (p, odds_price) = match self.direction {
+            SignalDirection::Sell => {
+                // Selling YES = betting NO will happen
+                // p = probability of NO, odds based on NO price
+                (1.0 - self.model_prob, 1.0 - market_prob)
+            }
+            _ => {
+                // Buying YES = betting YES will happen  
+                // p = probability of YES, odds based on YES price
+                (self.model_prob, market_prob)
+            }
+        };
+        
+        let q = 1.0 - p;
+        
+        if odds_price <= 0.0 || odds_price >= 1.0 {
+            return 0.0;
+        }
+        
+        // Kelly formula: f = (bp - q) / b
+        // where b = odds (payout per dollar)
+        let b = (1.0 / odds_price) - 1.0;
         if b <= 0.0 {
             return 0.0;
         }
+        
         ((p * b - q) / b).max(0.0)
     }
 }

@@ -37,6 +37,96 @@ const HEARTBEAT_CHANNEL: &str = "health:heartbeats";
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TTL_SECS: u64 = 35;
 
+/// Validates that a market question doesn't contain sport-specific keywords
+/// that indicate a DIFFERENT sport than expected.
+/// Returns (is_valid, reason) - (true, _) if the sport matches or is ambiguous
+fn validate_market_sport(question: &str, expected_sport: &str) -> (bool, String) {
+    let q_lower = question.to_lowercase();
+    let expected_lower = expected_sport.to_lowercase();
+
+    // Keywords that strongly indicate specific sports/leagues
+    // If we find keywords for a DIFFERENT sport, reject the match
+    let nba_keywords = ["nba", "lakers", "celtics", "warriors", "76ers", "knicks", "nets", "clippers"];
+    let ncaab_keywords = ["ncaa", "college", "march madness", "final four", "wildcats", "bluejays", "zags", "huskies"];
+    let nfl_keywords = ["nfl", "chiefs", "eagles", "cowboys", "49ers", "steelers", "patriots", "super bowl"];
+    let ncaaf_keywords = ["college football", "cfb", "bowl game", "playoff"];
+    let nhl_keywords = ["nhl", "stanley cup", "bruins", "rangers", "penguins", "avalanche"];
+    let mlb_keywords = ["mlb", "yankees", "dodgers", "red sox", "world series"];
+    let soccer_keywords = ["premier league", "epl", "uefa", "champions league", "la liga", "bundesliga"];
+    let mma_keywords = ["ufc", "mma", "bellator", "pfl"];
+
+    // Check for cross-league indicators
+    match expected_lower.as_str() {
+        "nba" => {
+            // If expecting NBA but see college keywords, reject
+            for kw in ncaab_keywords.iter() {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains college basketball keyword: '{}'", kw));
+                }
+            }
+        }
+        "ncaab" => {
+            // If expecting college basketball but see NBA keywords, reject
+            for kw in nba_keywords.iter() {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains NBA keyword: '{}'", kw));
+                }
+            }
+        }
+        "nfl" => {
+            // If expecting NFL but see college football keywords, reject
+            for kw in ncaaf_keywords.iter() {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains college football keyword: '{}'", kw));
+                }
+            }
+        }
+        "ncaaf" => {
+            // If expecting college football but see NFL keywords, reject
+            for kw in nfl_keywords.iter() {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains NFL keyword: '{}'", kw));
+                }
+            }
+        }
+        "nhl" => {
+            // NHL is fairly distinct, but check for other sports
+            for kw in nba_keywords.iter().chain(nfl_keywords.iter()) {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains non-NHL keyword: '{}'", kw));
+                }
+            }
+        }
+        "mlb" => {
+            // MLB should not match other sports
+            for kw in nba_keywords.iter().chain(nfl_keywords.iter()).chain(nhl_keywords.iter()) {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains non-MLB keyword: '{}'", kw));
+                }
+            }
+        }
+        "soccer" | "mls" => {
+            // Soccer should not match American sports leagues
+            for kw in nba_keywords.iter().chain(nfl_keywords.iter()).chain(mlb_keywords.iter()) {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains non-soccer keyword: '{}'", kw));
+                }
+            }
+        }
+        "mma" => {
+            // MMA should not match team sports
+            for kw in nba_keywords.iter().chain(nfl_keywords.iter()).chain(nhl_keywords.iter()) {
+                if q_lower.contains(kw) {
+                    return (false, format!("Market contains non-MMA keyword: '{}'", kw));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (true, "Sport validation passed".to_string())
+}
+
 #[derive(Debug, Deserialize)]
 struct DiscoveryRequest {
     game_id: String,
@@ -584,6 +674,18 @@ async fn discover_for_game(
     for market in &poly_markets {
         // Skip non-moneyline markets (totals, spreads, props)
         if is_non_moneyline_market(&market.question) {
+            continue;
+        }
+
+        // SPORT VALIDATION: Check for cross-league keywords BEFORE team matching
+        // This prevents matching NBA teams to NCAAB markets (e.g., Cleveland Cavaliers -> Cleveland State)
+        let (sport_valid, sport_reason) = validate_market_sport(&market.question, sport);
+        if !sport_valid {
+            debug!(
+                "[DISCOVERY] Sport validation failed for market '{}': {}",
+                market.question.chars().take(80).collect::<String>(),
+                sport_reason
+            );
             continue;
         }
 

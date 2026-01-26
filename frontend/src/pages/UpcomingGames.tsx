@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { Clock, Filter, Calendar, MapPin, Tv, ChevronDown, ChevronUp, AlertCircle, Timer, CalendarClock, LineChart, ArrowUpDown } from 'lucide-react'
+import { Clock, Filter, Calendar, MapPin, Tv, ChevronDown, ChevronUp, AlertCircle, Timer, CalendarClock, LineChart, ArrowUpDown, Activity } from 'lucide-react'
 import { getSportConfig, SportBackground } from '../utils/sports'
 
 interface UpcomingGame {
@@ -73,11 +73,68 @@ const HOURS_OPTIONS = [
   { value: 168, label: '1 week' },
 ]
 
+function StartedGamesList({ games }: { games: any[] }) {
+  if (!games || games.length === 0) return null
+
+  return (
+    <div className="bg-gradient-to-r from-red-900/10 to-transparent border-l-4 border-red-500/50 bg-gray-900/30 rounded-lg p-4 mb-6">
+      <div className="flex items-center gap-2 mb-3">
+        <Activity className="w-5 h-5 text-red-500 animate-pulse" />
+        <h2 className="text-lg font-bold text-gray-100">Live & Recent Games</h2>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        {games.map(game => (
+          <div key={game.game_id} className="bg-gray-800/80 rounded border border-gray-700 p-3 flex justify-between items-center group hover:bg-gray-800 transition-colors">
+            <div className="flex flex-col gap-1 flex-1">
+              <div className="flex justify-between items-center w-full">
+                <span className="text-gray-300 text-sm font-medium">{game.away_team_abbrev || game.away_team}</span>
+                <span className={`text-lg font-mono font-bold ${game.away_score > game.home_score ? 'text-white' : 'text-gray-500'}`}>{game.away_score}</span>
+              </div>
+              <div className="flex justify-between items-center w-full">
+                <span className="text-gray-300 text-sm font-medium">{game.home_team_abbrev || game.home_team}</span>
+                <span className={`text-lg font-mono font-bold ${game.home_score > game.away_score ? 'text-white' : 'text-gray-500'}`}>{game.home_score}</span>
+              </div>
+            </div>
+
+            <div className="border-l border-gray-700 pl-3 ml-3 flex flex-col items-end min-w-[60px]">
+              <span className="text-[10px] uppercase text-gray-500 font-bold mb-1">{game.sport}</span>
+              {game.status?.toLowerCase().includes('final') || game.status?.toLowerCase().includes('complete') ? (
+                <span className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-medium">FINAL</span>
+              ) : (
+                <>
+                  <span className="text-xs text-green-400 font-bold animate-pulse">LIVE</span>
+                  <span className="text-[10px] text-gray-400">{game.period ? `Q${game.period}` : ''} {game.time_remaining}</span>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export default function UpcomingGames() {
   const [selectedSport, setSelectedSport] = useState<string>('ALL')
   const [hoursAhead, setHoursAhead] = useState<number>(24)
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set())
   const [sortBy, setSortBy] = useState<'time' | 'sport'>('time')
+
+  // Fetch started/live games (including recently finalized)
+  const { data: startedGames } = useQuery({
+    queryKey: ['startedGames', selectedSport],
+    queryFn: async () => {
+      let url = '/api/live-games?include_final=true&max_age_hours=3'
+      if (selectedSport !== 'ALL') {
+        url += `&sport=${selectedSport}`
+      }
+      const res = await fetch(url)
+      if (!res.ok) return []
+      return res.json()
+    },
+    refetchInterval: 10000,
+  })
 
   const { data: games, isLoading, isError } = useQuery<UpcomingGame[]>({
     queryKey: ['upcomingGames', hoursAhead, selectedSport === 'ALL' ? undefined : selectedSport],
@@ -249,6 +306,9 @@ export default function UpcomingGames() {
           </button>
         </div>
       </div>
+
+      {/* Started/Live Games */}
+      <StartedGamesList games={startedGames} />
 
       {/* Stats Summary */}
       {stats && (
