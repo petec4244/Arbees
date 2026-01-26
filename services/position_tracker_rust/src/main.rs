@@ -879,16 +879,22 @@ impl PositionTrackerState {
             return Ok(());
         }
 
-        // Query for ended games - using simple approach
+        // Query for ended games - join game_states (for status/scores) with games (for team names)
         let mut ended_games: HashMap<String, GameEndRow> = HashMap::new();
 
         for game_id in &game_ids {
             let row = sqlx::query(
                 r#"
-                SELECT game_id, home_team, away_team, final_home_score, final_away_score, status
-                FROM games
-                WHERE game_id = $1
-                  AND status IN ('final', 'complete', 'completed')
+                SELECT g.game_id, g.home_team, g.away_team, gs.home_score, gs.away_score
+                FROM games g
+                JOIN (
+                    SELECT DISTINCT ON (game_id) game_id, home_score, away_score, status
+                    FROM game_states
+                    WHERE game_id = $1
+                    ORDER BY game_id, time DESC
+                ) gs ON g.game_id = gs.game_id
+                WHERE g.game_id = $1
+                  AND gs.status = 'STATUS_FINAL'
                 "#,
             )
             .bind(game_id)
@@ -901,8 +907,8 @@ impl PositionTrackerState {
                     GameEndRow {
                         home_team: r.try_get("home_team").unwrap_or_default(),
                         away_team: r.try_get("away_team").unwrap_or_default(),
-                        home_score: r.try_get("final_home_score").unwrap_or(0),
-                        away_score: r.try_get("final_away_score").unwrap_or(0),
+                        home_score: r.try_get("home_score").unwrap_or(0),
+                        away_score: r.try_get("away_score").unwrap_or(0),
                     },
                 );
             }
