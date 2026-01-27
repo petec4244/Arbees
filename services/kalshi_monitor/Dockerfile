@@ -21,7 +21,7 @@ COPY services/ ./services/
 RUN pip install --no-cache-dir .
 
 # Install additional dependencies for this service
-RUN pip install --no-cache-dir httpx loguru
+RUN pip install --no-cache-dir httpx loguru pyzmq
 
 ENV PYTHONPATH=/app:/app/shared
 

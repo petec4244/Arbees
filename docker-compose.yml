@@ -169,7 +169,7 @@ services:
     environment:
       # ZMQ configuration for low-latency messaging
       ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
-      ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://polymarket_monitor:5556"
+      ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5558"
     expose:
       - "5558"
@@ -429,8 +429,10 @@ services:
       # Retry settings for connection stability
       - OPENVPN_VERBOSITY=1
       # Control plane for server switching
-      - PUBLICIP_API=ipinfo.io
+      - PUBLICIP_API=ipinfo
       - PUBLICIP_PERIOD=60s
+      # Use Docker's embedded DNS (127.0.0.11) so containers using network_mode:service:vpn can resolve hostnames
+      - DNS_KEEP_NAMESERVER=on
     healthcheck:
       # Use HTTP (not HTTPS) to avoid CA/cert issues inside minimal images causing false "unhealthy".
       # Check both connectivity and that we're in an EU country (geo-bypass check)
