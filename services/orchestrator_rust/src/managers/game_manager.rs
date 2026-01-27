@@ -351,15 +351,26 @@ impl GameManager {
             let channel = format!("shard:{}:command", shard.shard_id);
             let _ = conn.publish::<_, _, ()>(channel, command.to_string()).await;
 
-            // Publish market assignment for monitors
-            let _ = conn.publish::<_, _, ()>("orchestrator:market_assignments", serde_json::json!({
-                "type": "polymarket_assign", 
-                "game_id": game.game_id,
-                "sport": game.sport.as_str(),
-                "markets": if let Some(pid) = &poly_id {
-                    vec![serde_json::json!({"market_type": "moneyline", "condition_id": pid})]
-                } else { vec![] }
-            }).to_string()).await;
+            // Publish market assignments for monitors
+            // Polymarket assignment
+            if let Some(pid) = &poly_id {
+                let _ = conn.publish::<_, _, ()>("orchestrator:market_assignments", serde_json::json!({
+                    "type": "polymarket_assign", 
+                    "game_id": game.game_id,
+                    "sport": game.sport.as_str(),
+                    "markets": vec![serde_json::json!({"market_type": "moneyline", "condition_id": pid})]
+                }).to_string()).await;
+            }
+            
+            // Kalshi assignment
+            if let Some(kid) = &kalshi_id {
+                let _ = conn.publish::<_, _, ()>("orchestrator:market_assignments", serde_json::json!({
+                    "type": "kalshi_assign", 
+                    "game_id": game.game_id,
+                    "sport": game.sport.as_str(),
+                    "markets": vec![serde_json::json!({"market_type": "moneyline", "ticker": kid})]
+                }).to_string()).await;
+            }
 
             info!("Assigned game {} to shard {}", game.game_id, shard.shard_id);
 

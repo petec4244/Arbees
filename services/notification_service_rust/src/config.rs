@@ -7,6 +7,25 @@ use std::time::Duration;
 
 use arbees_rust_core::models::NotificationPriority;
 
+/// Notification mode controls the verbosity and behavior of notifications
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationMode {
+    /// Adaptive behavior based on context
+    Smart,
+    /// Errors + daily digest only
+    Minimal,
+    /// All events immediately (legacy behavior)
+    Verbose,
+    /// Errors only, no summaries
+    Silent,
+}
+
+impl Default for NotificationMode {
+    fn default() -> Self {
+        Self::Smart
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub redis_url: String,
@@ -23,8 +42,24 @@ pub struct Config {
 
     pub rate_limit_max_per_minute: usize,
     pub rate_limit_window: Duration,
-
     pub rate_limit_bypass_critical: bool,
+
+    // Adaptive scheduling
+    pub notification_mode: NotificationMode,
+    pub summary_interval_active_mins: u64,    // During active trading
+    pub summary_interval_games_mins: u64,     // Games in progress, no trades
+    pub summary_interval_idle_mins: u64,      // No games happening
+    pub upcoming_games_window_hours: u64,     // Window for "imminent" games
+    pub game_freshness_mins: u64,             // Max age for "active" game status
+
+    // Threshold notifications
+    pub pnl_threshold_notify: f64,            // Notify when PnL crosses this
+    pub trade_burst_threshold: u64,           // Notify after N trades in window
+    pub trade_burst_window_mins: u64,         // Window for burst detection
+    pub win_streak_threshold: u64,            // Notify on win streak
+
+    // End-of-session
+    pub session_digest_enabled: bool,         // Send digest when games complete
 }
 
 impl Config {
@@ -63,6 +98,34 @@ impl Config {
 
         let rate_limit_bypass_critical = parse_bool_env("RATE_LIMIT_BYPASS_CRITICAL", true);
 
+        // Notification mode
+        let notification_mode = parse_notification_mode_env("NOTIFICATION_MODE", NotificationMode::Smart)?;
+
+        // Adaptive scheduling intervals (in minutes)
+        let summary_interval_active_mins =
+            parse_u64_env("SUMMARY_INTERVAL_ACTIVE_MINS", 15).context("SUMMARY_INTERVAL_ACTIVE_MINS")?;
+        let summary_interval_games_mins =
+            parse_u64_env("SUMMARY_INTERVAL_GAMES_MINS", 30).context("SUMMARY_INTERVAL_GAMES_MINS")?;
+        let summary_interval_idle_mins =
+            parse_u64_env("SUMMARY_INTERVAL_IDLE_MINS", 240).context("SUMMARY_INTERVAL_IDLE_MINS")?;
+        let upcoming_games_window_hours =
+            parse_u64_env("UPCOMING_GAMES_WINDOW_HOURS", 2).context("UPCOMING_GAMES_WINDOW_HOURS")?;
+        let game_freshness_mins =
+            parse_u64_env("GAME_FRESHNESS_MINS", 30).context("GAME_FRESHNESS_MINS")?;
+
+        // Threshold notifications
+        let pnl_threshold_notify =
+            parse_f64_env("PNL_THRESHOLD_NOTIFY", 50.0).context("PNL_THRESHOLD_NOTIFY")?;
+        let trade_burst_threshold =
+            parse_u64_env("TRADE_BURST_THRESHOLD", 5).context("TRADE_BURST_THRESHOLD")?;
+        let trade_burst_window_mins =
+            parse_u64_env("TRADE_BURST_WINDOW_MINS", 10).context("TRADE_BURST_WINDOW_MINS")?;
+        let win_streak_threshold =
+            parse_u64_env("WIN_STREAK_THRESHOLD", 3).context("WIN_STREAK_THRESHOLD")?;
+
+        // End-of-session
+        let session_digest_enabled = parse_bool_env("SESSION_DIGEST_ENABLED", true);
+
         Ok(Self {
             redis_url,
             signal_api_base_url,
@@ -76,6 +139,17 @@ impl Config {
             rate_limit_max_per_minute,
             rate_limit_window,
             rate_limit_bypass_critical,
+            notification_mode,
+            summary_interval_active_mins,
+            summary_interval_games_mins,
+            summary_interval_idle_mins,
+            upcoming_games_window_hours,
+            game_freshness_mins,
+            pnl_threshold_notify,
+            trade_burst_threshold,
+            trade_burst_window_mins,
+            win_streak_threshold,
+            session_digest_enabled,
         })
     }
 }
@@ -127,6 +201,36 @@ fn parse_priority_env(key: &str, default: NotificationPriority) -> Result<Notifi
         "ERROR" => Ok(NotificationPriority::Error),
         "CRITICAL" => Ok(NotificationPriority::Critical),
         other => Err(anyhow!("Invalid {key}: {other} (expected INFO|WARNING|ERROR|CRITICAL)")),
+    }
+}
+
+fn parse_u64_env(key: &str, default: u64) -> Result<u64> {
+    let raw = env::var(key).unwrap_or_else(|_| default.to_string());
+    raw.parse::<u64>()
+        .with_context(|| format!("Invalid {key}: {raw} (expected integer)"))
+}
+
+fn parse_f64_env(key: &str, default: f64) -> Result<f64> {
+    let raw = env::var(key).unwrap_or_else(|_| default.to_string());
+    raw.parse::<f64>()
+        .with_context(|| format!("Invalid {key}: {raw} (expected number)"))
+}
+
+fn parse_notification_mode_env(key: &str, default: NotificationMode) -> Result<NotificationMode> {
+    let default_str = match default {
+        NotificationMode::Smart => "SMART",
+        NotificationMode::Minimal => "MINIMAL",
+        NotificationMode::Verbose => "VERBOSE",
+        NotificationMode::Silent => "SILENT",
+    };
+    let raw = env::var(key).unwrap_or_else(|_| default_str.to_string());
+
+    match raw.trim().to_uppercase().as_str() {
+        "SMART" => Ok(NotificationMode::Smart),
+        "MINIMAL" => Ok(NotificationMode::Minimal),
+        "VERBOSE" => Ok(NotificationMode::Verbose),
+        "SILENT" => Ok(NotificationMode::Silent),
+        other => Err(anyhow!("Invalid {key}: {other} (expected SMART|MINIMAL|VERBOSE|SILENT)")),
     }
 }
 

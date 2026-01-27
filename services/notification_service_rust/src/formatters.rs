@@ -1,6 +1,9 @@
 use arbees_rust_core::models::{NotificationEvent, NotificationType};
 use chrono::{DateTime, Utc};
 
+use crate::game_context::SessionSummary;
+use crate::scheduler::TradingContext;
+
 pub fn format_message(event: &NotificationEvent) -> String {
     match event.event_type {
         NotificationType::TradeEntry => format_trade_entry(event),
@@ -10,8 +13,23 @@ pub fn format_message(event: &NotificationEvent) -> String {
     }
 }
 
+/// Format timestamp concisely (time only for recent, date+time for older)
 fn ts_str(ts: Option<DateTime<Utc>>) -> String {
-    ts.unwrap_or_else(Utc::now).to_rfc3339()
+    let t = ts.unwrap_or_else(Utc::now);
+    let now = Utc::now();
+    let age = now.signed_duration_since(t);
+
+    // If within last 24 hours, just show time
+    if age.num_hours() < 24 {
+        t.format("%H:%M:%S").to_string()
+    } else {
+        t.format("%m-%d %H:%M").to_string()
+    }
+}
+
+/// Format timestamp as time only (for compact messages)
+fn time_only(ts: Option<DateTime<Utc>>) -> String {
+    ts.unwrap_or_else(Utc::now).format("%H:%M").to_string()
 }
 
 fn get_str(v: &serde_json::Value, key: &str) -> Option<String> {
@@ -142,3 +160,168 @@ fn format_error(event: &NotificationEvent) -> String {
     out
 }
 
+/// Summary data for formatting
+#[derive(Debug, Clone, Default)]
+pub struct SummaryData {
+    pub trade_entries: u64,
+    pub trade_exits: u64,
+    pub risk_rejections: u64,
+    pub total_entry_size: f64,
+    pub total_exit_pnl: f64,
+    pub last_update: Option<DateTime<Utc>>,
+    pub active_games: u64,
+    pub imminent_games: u64,
+    pub upcoming_today: u64,
+    pub context: Option<TradingContext>,
+    pub interval_mins: u64,
+    pub session_pnl: f64,
+    pub win_streak: i32,
+}
+
+pub fn format_summary(data: &SummaryData) -> String {
+    let mut out = String::new();
+
+    // Header with context-aware interval
+    let interval_desc = match data.interval_mins {
+        15 => "15m",
+        30 => "30m",
+        60 => "1h",
+        240 => "4h",
+        _ => "periodic",
+    };
+    out.push_str(&format!("📊 STATUS ({})\n", interval_desc));
+
+    // Context indicator (compact)
+    if let Some(ctx) = &data.context {
+        let ctx_emoji = match ctx {
+            TradingContext::ActiveTrading => "🔥",
+            TradingContext::GamesInProgress => "🎮",
+            TradingContext::GamesImminent => "⏰",
+            TradingContext::Idle => "💤",
+            TradingContext::QuietHours => "🌙",
+        };
+        out.push_str(&format!("{} {}\n", ctx_emoji, ctx.as_str()));
+    }
+
+    // Game counts (compact single line)
+    if data.active_games > 0 || data.imminent_games > 0 {
+        out.push_str(&format!(
+            "Games: {} live",
+            data.active_games
+        ));
+        if data.imminent_games > 0 {
+            out.push_str(&format!(", {} soon", data.imminent_games));
+        }
+        out.push('\n');
+    } else if data.upcoming_today > 0 {
+        out.push_str(&format!("📅 {} games today\n", data.upcoming_today));
+    } else {
+        out.push_str("No games scheduled\n");
+    }
+
+    // Trading activity (compact)
+    let total_trades = data.trade_entries + data.trade_exits;
+    if total_trades > 0 {
+        out.push_str(&format!(
+            "Trades: {}↗ {}↘",
+            data.trade_entries, data.trade_exits
+        ));
+        if data.total_exit_pnl != 0.0 {
+            let sign = if data.total_exit_pnl >= 0.0 { "+" } else { "" };
+            out.push_str(&format!(" {sign}${:.2}", data.total_exit_pnl));
+        }
+        out.push('\n');
+    }
+
+    // Session stats (if meaningful)
+    if data.session_pnl.abs() > 0.01 {
+        let sign = if data.session_pnl >= 0.0 { "+" } else { "" };
+        out.push_str(&format!("Session: {sign}${:.2}", data.session_pnl));
+        if data.win_streak != 0 {
+            let streak_emoji = if data.win_streak > 0 { "🔥" } else { "📉" };
+            out.push_str(&format!(" {}x{}", streak_emoji, data.win_streak.abs()));
+        }
+        out.push('\n');
+    }
+
+    // Risk rejections (only if any)
+    if data.risk_rejections > 0 {
+        out.push_str(&format!("🛑 {} blocked\n", data.risk_rejections));
+    }
+
+    // Timestamp (compact)
+    if let Some(ts) = data.last_update {
+        out.push_str(&format!("@ {}", time_only(Some(ts))));
+    } else {
+        out.push_str(&format!("@ {}", time_only(None)));
+    }
+
+    out
+}
+
+/// Legacy format_summary for backwards compatibility
+pub fn format_summary_legacy(
+    trade_entries: u64,
+    trade_exits: u64,
+    risk_rejections: u64,
+    total_entry_size: f64,
+    total_exit_pnl: f64,
+    last_update: Option<DateTime<Utc>>,
+    active_games: u64,
+    upcoming_games: u64,
+) -> String {
+    let data = SummaryData {
+        trade_entries,
+        trade_exits,
+        risk_rejections,
+        total_entry_size,
+        total_exit_pnl,
+        last_update,
+        active_games,
+        imminent_games: 0,
+        upcoming_today: upcoming_games,
+        context: None,
+        interval_mins: 30,
+        session_pnl: total_exit_pnl,
+        win_streak: 0,
+    };
+    format_summary(&data)
+}
+
+/// Format end-of-session digest
+pub fn format_session_digest(summary: &SessionSummary) -> String {
+    let mut out = String::new();
+
+    out.push_str("🏁 SESSION COMPLETE\n");
+
+    // Duration
+    if let Some(dur) = summary.duration {
+        let hours = dur.num_hours();
+        let mins = dur.num_minutes() % 60;
+        if hours > 0 {
+            out.push_str(&format!("Duration: {}h {}m\n", hours, mins));
+        } else {
+            out.push_str(&format!("Duration: {}m\n", mins));
+        }
+    }
+
+    // Games
+    out.push_str(&format!("Games: {}\n", summary.games_count));
+
+    // Trades and PnL
+    out.push_str(&format!("Trades: {}\n", summary.trades_count));
+
+    let sign = if summary.total_pnl >= 0.0 { "+" } else { "" };
+    let emoji = if summary.total_pnl >= 0.0 { "💰" } else { "📉" };
+    out.push_str(&format!("{} PnL: {sign}${:.2}\n", emoji, summary.total_pnl));
+
+    // Win rate if calculable
+    if summary.trades_count > 0 {
+        // Note: We don't have win count in SessionSummary, so skip win rate
+        // This could be enhanced later
+    }
+
+    out.push_str(&format!("@ {}", time_only(None)));
+
+    out
+}

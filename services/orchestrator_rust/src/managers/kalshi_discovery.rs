@@ -2,6 +2,7 @@ use crate::clients::team_matching::TeamMatchingClient;
 use crate::state::GameInfo;
 use anyhow::Result;
 use arbees_rust_core::clients::kalshi::{KalshiClient, KalshiMarket};
+use arbees_rust_core::league_config::LEAGUE_CONFIGS;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
@@ -62,12 +63,30 @@ impl KalshiDiscoveryManager {
             }
         }
 
-        // Refresh markets if stale (use game's sport as hint)
-        if self.should_refresh().await {
-            let mut active = HashSet::new();
-            active.insert(game.sport.as_str().to_string());
-            if let Err(e) = self.refresh_markets(Some(&active)).await {
-                error!("Failed to refresh Kalshi markets: {}", e);
+        // Refresh markets if stale or missing this sport's series
+        let (refresh_needed, missing_series) = {
+            let cache = self.cache.read().await;
+            let stale = cache.last_refresh.elapsed() > Duration::from_secs(300);
+            let series = self.series_ticker_for_sport(game.sport.as_str());
+            let has_series = series.map_or(false, |s| {
+                cache.markets.iter().any(|m| m.ticker.starts_with(s))
+            });
+            // If we don't have any markets for this sport, refresh more aggressively (30s)
+            let missing_series = !has_series && cache.last_refresh.elapsed() > Duration::from_secs(30);
+            (stale || missing_series, missing_series)
+        };
+
+        if refresh_needed {
+            if missing_series {
+                if let Err(e) = self.refresh_markets(None).await {
+                    error!("Failed to refresh Kalshi markets (all sports): {}", e);
+                }
+            } else {
+                let mut active = HashSet::new();
+                active.insert(game.sport.as_str().to_string());
+                if let Err(e) = self.refresh_markets(Some(&active)).await {
+                    error!("Failed to refresh Kalshi markets: {}", e);
+                }
             }
         }
 
@@ -204,9 +223,12 @@ impl KalshiDiscoveryManager {
         if t.contains("SINGLEGAME") || t.contains("FLOORGAME") {
             return true;
         }
-        // Heuristic: if description mentions "Game" or "Match" vs "Season"?
-        // For now, allow default to false if unknown pattern to be safe, or check Python logic.
-        // Python logic: "Unknown pattern - be conservative and skip" -> return False.
+        // Accept known per-game series tickers (KXNBAGAME, KXNHLGAME, etc.)
+        for cfg in LEAGUE_CONFIGS {
+            if t.starts_with(cfg.kalshi_series_game) {
+                return true;
+            }
+        }
         false
     }
 
@@ -226,5 +248,12 @@ impl KalshiDiscoveryManager {
     pub fn get_markets(&self) -> Vec<KalshiMarket> {
         // Exposed for testing or debug if needed, technically not needed for core loop
         vec![]
+    }
+
+    fn series_ticker_for_sport(&self, sport: &str) -> Option<&'static str> {
+        LEAGUE_CONFIGS
+            .iter()
+            .find(|cfg| cfg.league_code.eq_ignore_ascii_case(sport))
+            .map(|cfg| cfg.kalshi_series_game)
     }
 }

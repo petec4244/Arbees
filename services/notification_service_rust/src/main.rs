@@ -1,21 +1,30 @@
 mod config;
 mod filters;
 mod formatters;
+mod game_context;
+mod scheduler;
 mod signal_client;
+mod thresholds;
 
-use anyhow::Result;
-use arbees_rust_core::models::{channels, NotificationEvent};
+use anyhow::{Context, Result};
+use arbees_rust_core::models::{channels, NotificationEvent, NotificationType};
 use arbees_rust_core::redis::RedisBus;
 use chrono::Utc;
 use config::Config;
 use dotenv::dotenv;
 use filters::NotificationFilter;
+use formatters::SummaryData;
 use futures_util::StreamExt;
+use game_context::{get_active_game_ids, get_game_counts, GameSessionTracker};
 use log::{error, info, warn};
+use scheduler::AdaptiveScheduler;
 use signal_client::SignalClient;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use thresholds::ThresholdTracker;
 use tokio::sync::RwLock;
 
 // ============================================================================
@@ -39,6 +48,28 @@ struct Metrics {
     filtered: u64,
     parse_errors: u64,
     send_errors: u64,
+}
+
+#[derive(Debug, Default)]
+struct BatchedEvents {
+    trade_entries: u64,
+    trade_exits: u64,
+    risk_rejections: u64,
+    total_entry_size: f64,
+    total_exit_pnl: f64,
+    last_update: Option<chrono::DateTime<Utc>>,
+    wins: u64,
+    losses: u64,
+}
+
+/// Shared state for adaptive scheduling
+struct SharedState {
+    metrics: Metrics,
+    batched: BatchedEvents,
+    scheduler: AdaptiveScheduler,
+    thresholds: ThresholdTracker,
+    session_tracker: GameSessionTracker,
+    filter: NotificationFilter,
 }
 
 async fn heartbeat_loop(redis: RedisBus, instance_id: String, metrics: Arc<RwLock<Metrics>>) -> Result<()> {
@@ -82,19 +113,30 @@ async fn main() -> Result<()> {
     dotenv().ok();
     env_logger::init();
 
-    info!("Starting Rust Notification Service...");
+    info!("Starting Rust Notification Service (modernized)...");
 
     let cfg = Config::from_env()?;
     info!(
-        "Config: redis_url={} recipients={} quiet_hours={} rate_limit={}/min",
-        cfg.redis_url,
-        cfg.signal_recipients.len(),
+        "Config: mode={:?} quiet_hours={} intervals={}m/{}m/{}m",
+        cfg.notification_mode,
         cfg.quiet_hours_enabled,
-        cfg.rate_limit_max_per_minute
+        cfg.summary_interval_active_mins,
+        cfg.summary_interval_games_mins,
+        cfg.summary_interval_idle_mins,
     );
 
     let redis = RedisBus::new().await?;
     info!("Connected to Redis");
+
+    // Database connection for game counts
+    let database_url = env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://arbees:arbees@localhost:5432/arbees".to_string());
+    let db_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await
+        .context("Failed to connect to database")?;
+    info!("Connected to database");
 
     let signal = SignalClient::new(
         cfg.signal_api_base_url.clone(),
@@ -102,8 +144,17 @@ async fn main() -> Result<()> {
         cfg.signal_recipients.clone(),
     );
 
-    let mut filter = NotificationFilter::new(cfg.clone());
+    // Initialize shared state
+    let state = Arc::new(RwLock::new(SharedState {
+        metrics: Metrics::default(),
+        batched: BatchedEvents::default(),
+        scheduler: AdaptiveScheduler::new(cfg.clone()),
+        thresholds: ThresholdTracker::new(cfg.clone()),
+        session_tracker: GameSessionTracker::new(),
+        filter: NotificationFilter::new(cfg.clone()),
+    }));
 
+    // Legacy metrics for heartbeat compatibility
     let metrics: Arc<RwLock<Metrics>> = Arc::new(RwLock::new(Metrics::default()));
 
     // Start heartbeat
@@ -116,6 +167,17 @@ async fn main() -> Result<()> {
             if let Err(e) = heartbeat_loop(redis_hb, instance_id, metrics_hb).await {
                 error!("Heartbeat loop error: {}", e);
             }
+        });
+    }
+
+    // Start adaptive summary timer
+    {
+        let signal_summary = signal.clone();
+        let state_summary = state.clone();
+        let db_summary = db_pool.clone();
+        let cfg_summary = cfg.clone();
+        tokio::spawn(async move {
+            adaptive_summary_loop(signal_summary, state_summary, db_summary, cfg_summary).await;
         });
     }
 
@@ -170,36 +232,253 @@ async fn main() -> Result<()> {
             event.ts = Some(Utc::now());
         }
 
-        let (should_send, reason) = filter.should_notify(event.priority);
-        if !should_send {
-            let mut m = metrics.write().await;
-            m.filtered += 1;
-            info!(
-                "Filtered notification: priority={:?} reason={}",
-                event.priority,
-                reason.unwrap_or_else(|| "unknown".to_string())
-            );
-            continue;
+        // Process event through shared state
+        let alerts = process_event(&event, &state, &signal, &metrics, &cfg).await;
+
+        // Send any threshold alerts
+        for alert in alerts {
+            let message = alert.format_message();
+            if let Err(e) = signal.send(&message).await {
+                error!("Failed to send threshold alert: {}", e);
+            } else {
+                info!("Sent threshold alert: {:?}", alert);
+            }
         }
-
-        // Format + send
-        let message = formatters::format_message(&event);
-        if let Err(e) = signal.send(&message).await {
-            error!("Signal send failed: {}", e);
-            let mut m = metrics.write().await;
-            m.send_errors += 1;
-            continue;
-        }
-
-        info!(
-            "Sent notification: type={:?} priority={:?}",
-            event.event_type, event.priority
-        );
-
-        let mut m = metrics.write().await;
-        m.sent += 1;
     }
 
     Ok(())
+}
+
+/// Process a notification event and return any immediate alerts
+async fn process_event(
+    event: &NotificationEvent,
+    state: &Arc<RwLock<SharedState>>,
+    signal: &SignalClient,
+    metrics: &Arc<RwLock<Metrics>>,
+    cfg: &Config,
+) -> Vec<thresholds::ThresholdAlert> {
+    let mut alerts = Vec::new();
+
+    // Error events are always sent immediately (not batched)
+    if event.event_type == NotificationType::Error {
+        let should_send = {
+            let mut s = state.write().await;
+            let (send, reason) = s.filter.should_notify(event.priority);
+            if !send {
+                let mut m = metrics.write().await;
+                m.filtered += 1;
+                info!(
+                    "Filtered error notification: priority={:?} reason={}",
+                    event.priority,
+                    reason.unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            send
+        };
+
+        if should_send {
+            let message = formatters::format_message(event);
+            if let Err(e) = signal.send(&message).await {
+                error!("Signal send failed: {}", e);
+                let mut m = metrics.write().await;
+                m.send_errors += 1;
+            } else {
+                info!("Sent error notification: priority={:?}", event.priority);
+                let mut m = metrics.write().await;
+                m.sent += 1;
+            }
+        }
+
+        return alerts;
+    }
+
+    // Batch trade events and check thresholds
+    let mut s = state.write().await;
+
+    match event.event_type {
+        NotificationType::TradeEntry => {
+            s.batched.trade_entries += 1;
+            s.scheduler.record_trade();
+
+            if let Some(size) = event.data.get("size").and_then(|v| v.as_f64()) {
+                s.batched.total_entry_size += size;
+            }
+
+            // Record in threshold tracker (no PnL yet)
+            let entry_alerts = s.thresholds.record_trade(None, None);
+            alerts.extend(entry_alerts);
+        }
+        NotificationType::TradeExit => {
+            s.batched.trade_exits += 1;
+            s.scheduler.record_trade();
+
+            let pnl = event.data.get("pnl").and_then(|v| v.as_f64());
+            if let Some(p) = pnl {
+                s.batched.total_exit_pnl += p;
+
+                // Track wins/losses for session
+                let is_win = p > 0.0;
+                if is_win {
+                    s.batched.wins += 1;
+                } else {
+                    s.batched.losses += 1;
+                }
+
+                // Record in session tracker
+                s.session_tracker.record_trade(Some(p));
+
+                // Check threshold alerts
+                let exit_alerts = s.thresholds.record_trade(Some(p), Some(is_win));
+                alerts.extend(exit_alerts);
+            }
+        }
+        NotificationType::RiskRejection => {
+            s.batched.risk_rejections += 1;
+        }
+        _ => {}
+    }
+
+    s.batched.last_update = Some(Utc::now());
+
+    info!(
+        "Batched notification: type={:?} (entries={} exits={} pnl=${:.2})",
+        event.event_type, s.batched.trade_entries, s.batched.trade_exits, s.batched.total_exit_pnl
+    );
+
+    alerts
+}
+
+/// Adaptive summary loop with context-aware intervals
+async fn adaptive_summary_loop(
+    signal: SignalClient,
+    state: Arc<RwLock<SharedState>>,
+    db: PgPool,
+    cfg: Config,
+) {
+    info!("Starting adaptive summary loop");
+
+    // Start with a reasonable default interval
+    let mut current_interval = std::time::Duration::from_secs(cfg.summary_interval_games_mins * 60);
+
+    loop {
+        tokio::time::sleep(current_interval).await;
+
+        // Query game counts with freshness check
+        let game_counts = match get_game_counts(&db, cfg.game_freshness_mins, cfg.upcoming_games_window_hours).await {
+            Ok(counts) => counts,
+            Err(e) => {
+                warn!("Failed to query game counts: {}", e);
+                game_context::GameCounts::default()
+            }
+        };
+
+        // Get active game IDs for session tracking
+        let active_game_ids = match get_active_game_ids(&db, cfg.game_freshness_mins).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("Failed to get active game IDs: {}", e);
+                Vec::new()
+            }
+        };
+
+        // Update state and determine if we should send
+        let (should_send, summary_opt, session_digest_opt, new_interval) = {
+            let mut s = state.write().await;
+
+            // Check quiet hours
+            let is_quiet = s.filter.is_in_quiet_hours();
+
+            // Update scheduler context
+            let context = s.scheduler.update_context(
+                game_counts.active,
+                game_counts.imminent,
+                is_quiet,
+            );
+
+            // Get new interval based on context
+            let interval = s.scheduler.get_summary_interval();
+
+            // Check if we should send summary
+            let (filter_ok, skip_reason) = s.filter.should_send_summary();
+            if !filter_ok {
+                info!("Skipping summary: {:?}", skip_reason);
+                (false, None, None, interval)
+            } else {
+                // Check skip logic based on activity
+                let trade_count = s.batched.trade_entries + s.batched.trade_exits + s.batched.risk_rejections;
+                let (skip, skip_reason) = s.scheduler.should_skip_summary(
+                    trade_count,
+                    game_counts.active,
+                    game_counts.imminent,
+                );
+
+                if skip {
+                    info!("Skipping summary: {:?} context={}", skip_reason, context.as_str());
+                    (false, None, None, interval)
+                } else {
+                    // Check for session end (games completed)
+                    let session_digest = if cfg.session_digest_enabled {
+                        s.session_tracker.check_session_end(&active_game_ids)
+                    } else {
+                        None
+                    };
+
+                    // Record active games
+                    for id in &active_game_ids {
+                        s.session_tracker.record_active_game(id);
+                    }
+
+                    // Build summary data
+                    let summary_data = SummaryData {
+                        trade_entries: s.batched.trade_entries,
+                        trade_exits: s.batched.trade_exits,
+                        risk_rejections: s.batched.risk_rejections,
+                        total_entry_size: s.batched.total_entry_size,
+                        total_exit_pnl: s.batched.total_exit_pnl,
+                        last_update: s.batched.last_update,
+                        active_games: game_counts.active,
+                        imminent_games: game_counts.imminent,
+                        upcoming_today: game_counts.upcoming_today,
+                        context: Some(context),
+                        interval_mins: interval.as_secs() / 60,
+                        session_pnl: s.thresholds.session_pnl(),
+                        win_streak: s.thresholds.current_streak(),
+                    };
+
+                    let summary = formatters::format_summary(&summary_data);
+
+                    // Reset batch
+                    s.batched = BatchedEvents::default();
+
+                    (true, Some(summary), session_digest, interval)
+                }
+            }
+        };
+
+        // Update interval for next iteration
+        current_interval = new_interval;
+
+        // Send summary if appropriate
+        if should_send {
+            if let Some(summary) = summary_opt {
+                if let Err(e) = signal.send(&summary).await {
+                    error!("Failed to send summary: {}", e);
+                } else {
+                    info!("Sent adaptive summary (interval={}m)", current_interval.as_secs() / 60);
+                }
+            }
+        }
+
+        // Send session digest if games completed
+        if let Some(digest) = session_digest_opt {
+            let digest_msg = formatters::format_session_digest(&digest);
+            if let Err(e) = signal.send(&digest_msg).await {
+                error!("Failed to send session digest: {}", e);
+            } else {
+                info!("Sent session digest: {} games, {} trades, ${:.2} PnL",
+                    digest.games_count, digest.trades_count, digest.total_pnl);
+            }
+        }
+    }
 }
 

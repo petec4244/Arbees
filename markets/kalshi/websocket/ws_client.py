@@ -17,6 +17,7 @@ from typing import AsyncIterator, Optional, Set
 
 import websockets
 from websockets.client import WebSocketClientProtocol
+from websockets.protocol import State
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
@@ -118,7 +119,13 @@ class KalshiWebSocketClient:
     @property
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
-        return self._ws is not None and not self._ws.closed
+        if self._ws is None:
+            return False
+        if hasattr(self._ws, "closed"):
+            return not self._ws.closed
+        if hasattr(self._ws, "state"):
+            return self._ws.state == State.OPEN
+        return False
     
     def _load_private_key_from_file(self, path: str) -> None:
         """Load RSA private key from PEM file."""
@@ -191,7 +198,7 @@ class KalshiWebSocketClient:
             # Connect with RSA-signed authentication
             self._ws = await websockets.connect(
                 self._ws_url,
-                extra_headers=auth_headers,
+                additional_headers=auth_headers,
                 ping_interval=None,  # We handle ping ourselves
             )
             
@@ -233,8 +240,16 @@ class KalshiWebSocketClient:
                 pass
         
         # Close connection
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
+        if self._ws:
+            try:
+                if hasattr(self._ws, "closed"):
+                    if not self._ws.closed:
+                        await self._ws.close()
+                elif hasattr(self._ws, "state"):
+                    if self._ws.state == State.OPEN:
+                        await self._ws.close()
+            except Exception as e:
+                logger.warning(f"Error closing Kalshi WebSocket: {e}")
         
         self._ws = None
         logger.info("Disconnected from Kalshi WebSocket")
@@ -253,16 +268,14 @@ class KalshiWebSocketClient:
         if not new_markets:
             return
         
-        # Send subscribe message
+        # Send subscribe message (Kalshi WS format)
         subscribe_msg = {
-            "type": "subscribe",
-            "channels": [
-                {
-                    "name": "orderbook_delta",
-                    "market_ticker": ticker,
-                }
-                for ticker in new_markets
-            ]
+            "id": int(time.time() * 1000),
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": list(new_markets),
+            },
         }
         
         await self._ws.send(json.dumps(subscribe_msg))
@@ -284,16 +297,14 @@ class KalshiWebSocketClient:
         if not markets_to_remove:
             return
         
-        # Send unsubscribe message
+        # Send unsubscribe message (Kalshi WS format)
         unsubscribe_msg = {
-            "type": "unsubscribe",
-            "channels": [
-                {
-                    "name": "orderbook_delta",
-                    "market_ticker": ticker,
-                }
-                for ticker in markets_to_remove
-            ]
+            "id": int(time.time() * 1000),
+            "cmd": "unsubscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": list(markets_to_remove),
+            },
         }
         
         await self._ws.send(json.dumps(unsubscribe_msg))
@@ -390,8 +401,8 @@ class KalshiWebSocketClient:
                 await asyncio.sleep(self.PING_INTERVAL)
                 
                 if self.is_connected:
-                    ping_msg = {"type": "ping"}
-                    await self._ws.send(json.dumps(ping_msg))
+                    # Use WebSocket ping control frame (avoid Kalshi "Unknown command")
+                    await self._ws.ping()
                     logger.debug("Sent ping to Kalshi")
             
             except Exception as e:

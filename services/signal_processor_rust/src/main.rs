@@ -20,7 +20,7 @@ use futures_util::StreamExt;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{FromRow, PgPool, Row};
+use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
@@ -391,25 +391,6 @@ impl SignalProcessorState {
         Ok(row.get::<i64, _>("count"))
     }
 
-    /// Count active games for a sport (games currently in progress)
-    /// Used to calculate dynamic per-game exposure limit
-    async fn count_active_games(&self, sport: Sport) -> Result<i64> {
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(DISTINCT game_id) as count
-            FROM game_states
-            WHERE sport = $1::text::sport_enum
-              AND status IN ('STATUS_IN_PROGRESS', 'in')
-              AND time > NOW() - INTERVAL '10 minutes'
-            "#,
-        )
-        .bind(sport.as_str().to_lowercase())
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(row.get::<i64, _>("count").max(1)) // At least 1 to avoid division by zero
-    }
-
     /// Check if we have an existing position on this team in the OPPOSITE direction
     /// This prevents flip-flopping between buy and sell on the same team
     async fn has_opposing_position(
@@ -460,15 +441,13 @@ impl SignalProcessorState {
             sport_exposure_result,
             position_count_result,
             has_opposing_result,
-            active_games_result,
         ) = tokio::join!(
             self.get_available_balance(),
             self.get_daily_loss(),
             self.get_game_exposure(&signal.game_id),
             self.get_sport_exposure(signal.sport),
             self.count_game_positions(&signal.game_id),
-            self.has_opposing_position(&signal.game_id, &signal.team, signal.direction),
-            self.count_active_games(signal.sport)
+            self.has_opposing_position(&signal.game_id, &signal.team, signal.direction)
         );
 
         // Unwrap results (propagate first error if any)
@@ -478,11 +457,13 @@ impl SignalProcessorState {
         let sport_exposure = sport_exposure_result?;
         let position_count = position_count_result?;
         let has_opposing = has_opposing_result?;
-        let active_games = active_games_result?;
 
-        // Dynamic game exposure: divide sport budget by number of active games
-        // This allows bigger bets when fewer games, spreads risk when many games
-        let dynamic_max_game_exposure = self.config.max_sport_exposure / active_games as f64;
+        // Game exposure limit: if MAX_GAME_EXPOSURE < 0, disable per-game limit entirely
+        let effective_max_game_exposure = if self.config.max_game_exposure < 0.0 {
+            None  // No per-game limit
+        } else {
+            Some(self.config.max_game_exposure)
+        };
 
         let snapshot = RiskSnapshot {
             balance,
@@ -516,16 +497,18 @@ impl SignalProcessorState {
             ));
         }
 
-        // 3. Check game exposure limit (dynamic: sport_budget / active_games)
-        if game_exposure + proposed_size > dynamic_max_game_exposure {
-            return Ok((
-                false,
-                Some(format!(
-                    "Game exposure limit: ${:.2} + ${:.2} > ${:.2} ({} active games)",
-                    game_exposure, proposed_size, dynamic_max_game_exposure, active_games
-                )),
-                snapshot,
-            ));
+        // 3. Check game exposure limit (skip if MAX_GAME_EXPOSURE < 0)
+        if let Some(max_exposure) = effective_max_game_exposure {
+            if game_exposure + proposed_size > max_exposure {
+                return Ok((
+                    false,
+                    Some(format!(
+                        "Game exposure limit: ${:.2} + ${:.2} > ${:.2}",
+                        game_exposure, proposed_size, max_exposure
+                    )),
+                    snapshot,
+                ));
+            }
         }
 
         // 4. Check sport exposure limit
@@ -567,9 +550,12 @@ impl SignalProcessorState {
             SignalDirection::Sell => "to lose",
             SignalDirection::Hold => "hold",
         };
+        let max_exposure_str = effective_max_game_exposure
+            .map(|m| format!("${:.2}", m))
+            .unwrap_or_else(|| "unlimited".to_string());
         info!(
-            "OPEN: {} {} - ${:.2} (balance=${:.2}, game_exp=${:.2}, max=${:.2}, {} games)",
-            signal.team, direction_str, proposed_size, balance, game_exposure, dynamic_max_game_exposure, active_games
+            "OPEN: {} {} - ${:.2} (balance=${:.2}, game_exp=${:.2}, max={})",
+            signal.team, direction_str, proposed_size, balance, game_exposure, max_exposure_str
         );
         Ok((true, None, snapshot))
     }
@@ -691,22 +677,51 @@ impl SignalProcessorState {
 
         // Use configurable price staleness TTL instead of hardcoded 2 minutes
         let staleness_interval = format!("{} seconds", self.config.price_staleness_secs);
-        let rows = sqlx::query(
-            r#"
-            SELECT market_id, market_title, contract_team, yes_bid, yes_ask,
-                   yes_bid_size, yes_ask_size, volume, liquidity, time, platform
-            FROM market_prices
-            WHERE game_id = $1
-              AND contract_team IS NOT NULL
-              AND time > NOW() - $2::interval
-            ORDER BY time DESC
-            LIMIT 10
-            "#,
-        )
-        .bind(&signal.game_id)
-        .bind(&staleness_interval)
-        .fetch_all(&self.pool)
-        .await?;
+        
+        // Prefer the platform the signal intended to trade on (when present).
+        let preferred_platform = signal.platform_buy.as_ref().map(|p| match p {
+            Platform::Kalshi => "kalshi",
+            Platform::Polymarket => "polymarket",
+            Platform::Paper => "paper",
+        });
+
+        let rows = if let Some(pf) = preferred_platform {
+            sqlx::query(
+                r#"
+                SELECT market_id, market_title, contract_team, yes_bid, yes_ask,
+                       yes_bid_size, yes_ask_size, volume, liquidity, time, platform
+                FROM market_prices
+                WHERE game_id = $1
+                  AND platform = $2::text::platform_enum
+                  AND contract_team IS NOT NULL
+                  AND time > NOW() - $3::interval
+                ORDER BY time DESC
+                LIMIT 10
+                "#,
+            )
+            .bind(&signal.game_id)
+            .bind(pf)
+            .bind(&staleness_interval)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT market_id, market_title, contract_team, yes_bid, yes_ask,
+                       yes_bid_size, yes_ask_size, volume, liquidity, time, platform
+                FROM market_prices
+                WHERE game_id = $1
+                  AND contract_team IS NOT NULL
+                  AND time > NOW() - $2::interval
+                ORDER BY time DESC
+                LIMIT 10
+                "#,
+            )
+            .bind(&signal.game_id)
+            .bind(&staleness_interval)
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         let mut best_match: Option<MarketPriceRow> = None;
         let mut best_confidence = 0.0;
@@ -800,7 +815,9 @@ impl SignalProcessorState {
 
         let limit_price = match side {
             ExecutionSide::Yes => market.yes_ask,
-            ExecutionSide::No => market.yes_bid,
+            // Buying NO should use the executable NO ask, which equals (1 - YES bid).
+            // Using YES bid here will systematically misprice NO entries.
+            ExecutionSide::No => (1.0 - market.yes_bid).clamp(0.0, 1.0),
         };
 
         let platform = match market.platform.as_str() {

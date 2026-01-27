@@ -1,0 +1,1 @@
+"""Kalshi price monitor service."""

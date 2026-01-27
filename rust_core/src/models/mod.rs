@@ -115,6 +115,62 @@ impl Sport {
 // Game State (for win probability calculation)
 // ============================================================================
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FootballState {
+    pub down: Option<u8>,
+    pub yards_to_go: Option<u8>,
+    pub yard_line: Option<u8>,
+    pub is_redzone: bool,
+    pub timeouts_home: u8,
+    pub timeouts_away: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BasketballState {
+    pub timeouts_home: u8,
+    pub timeouts_away: u8,
+    pub home_team_fouls: u8,
+    pub away_team_fouls: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HockeyState {
+    pub power_play_team: Option<String>,
+    pub power_play_seconds_remaining: Option<u16>,
+    pub home_goalie_pulled: bool,
+    pub away_goalie_pulled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BaseballState {
+    pub outs: u8,
+    /// Bitmask: 1=1st, 2=2nd, 4=3rd
+    pub base_runners: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SoccerState {
+    pub home_red_cards: u8,
+    pub away_red_cards: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SportSpecificState {
+    Football(FootballState),
+    Basketball(BasketballState),
+    Hockey(HockeyState),
+    Baseball(BaseballState),
+    Soccer(SoccerState),
+    Other, // For sports without specific state
+}
+
+impl Default for SportSpecificState {
+    fn default() -> Self {
+        SportSpecificState::Other
+    }
+}
+
+
 /// Game state for win probability calculation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
@@ -127,10 +183,14 @@ pub struct GameState {
     pub period: u8,
     pub time_remaining_seconds: u32,
     pub possession: Option<String>,
-    pub down: Option<u8>,
-    pub yards_to_go: Option<u8>,
-    pub yard_line: Option<u8>,
-    pub is_redzone: bool,
+    
+    // Pre-game expectation
+    #[serde(default)]
+    pub pregame_home_prob: Option<f64>,
+
+    // Sport-specific details
+    #[serde(flatten)]
+    pub sport_specific: SportSpecificState,
 }
 
 impl GameState {
@@ -767,7 +827,7 @@ pub fn get_stop_loss_for_sport(sport: &Sport) -> f64 {
 mod tests {
     use super::*;
 
-    fn make_game_state(sport: Sport, period: u8, time_remaining_seconds: u32) -> GameState {
+    fn make_game_state(sport: Sport, period: u8, time_remaining_seconds: u32, sport_specific: SportSpecificState) -> GameState {
         GameState {
             game_id: "test".to_string(),
             sport,
@@ -778,10 +838,8 @@ mod tests {
             period,
             time_remaining_seconds,
             possession: None,
-            down: None,
-            yards_to_go: None,
-            yard_line: None,
-            is_redzone: false,
+            pregame_home_prob: None,
+            sport_specific,
         }
     }
 
@@ -812,56 +870,56 @@ mod tests {
     #[test]
     fn test_nba_time_remaining_q1() {
         // NBA Q1 with 5:00 left → 5 min + Q2 (12) + Q3 (12) + Q4 (12) = 41 min = 2460 sec
-        let state = make_game_state(Sport::NBA, 1, 300);
+        let state = make_game_state(Sport::NBA, 1, 300, SportSpecificState::Basketball(Default::default()));
         assert_eq!(state.total_time_remaining(), 300 + 3 * 720); // 2460
     }
 
     #[test]
     fn test_nba_time_remaining_q4() {
         // NBA Q4 with 2:00 left → just 2 minutes = 120 sec
-        let state = make_game_state(Sport::NBA, 4, 120);
+        let state = make_game_state(Sport::NBA, 4, 120, SportSpecificState::Basketball(Default::default()));
         assert_eq!(state.total_time_remaining(), 120);
     }
 
     #[test]
     fn test_ncaab_time_remaining_1st_half() {
         // NCAAB 1st half with 10:00 left → 10 min + 2nd half (20) = 30 min = 1800 sec
-        let state = make_game_state(Sport::NCAAB, 1, 600);
+        let state = make_game_state(Sport::NCAAB, 1, 600, SportSpecificState::Basketball(Default::default()));
         assert_eq!(state.total_time_remaining(), 600 + 1 * 1200); // 1800
     }
 
     #[test]
     fn test_ncaab_time_remaining_2nd_half() {
         // NCAAB 2nd half with 5:00 left → just 5 minutes = 300 sec
-        let state = make_game_state(Sport::NCAAB, 2, 300);
+        let state = make_game_state(Sport::NCAAB, 2, 300, SportSpecificState::Basketball(Default::default()));
         assert_eq!(state.total_time_remaining(), 300);
     }
 
     #[test]
     fn test_nhl_time_remaining_1st_period() {
         // NHL 1st period with 10:00 left → 10 min + P2 (20) + P3 (20) = 50 min = 3000 sec
-        let state = make_game_state(Sport::NHL, 1, 600);
+        let state = make_game_state(Sport::NHL, 1, 600, SportSpecificState::Hockey(Default::default()));
         assert_eq!(state.total_time_remaining(), 600 + 2 * 1200); // 3000
     }
 
     #[test]
     fn test_nhl_time_remaining_3rd_period() {
         // NHL 3rd period with 5:00 left → just 5 minutes = 300 sec
-        let state = make_game_state(Sport::NHL, 3, 300);
+        let state = make_game_state(Sport::NHL, 3, 300, SportSpecificState::Hockey(Default::default()));
         assert_eq!(state.total_time_remaining(), 300);
     }
 
     #[test]
     fn test_nfl_time_remaining_q1() {
         // NFL Q1 with 10:00 left → 10 min + Q2 (15) + Q3 (15) + Q4 (15) = 55 min = 3300 sec
-        let state = make_game_state(Sport::NFL, 1, 600);
+        let state = make_game_state(Sport::NFL, 1, 600, SportSpecificState::Football(Default::default()));
         assert_eq!(state.total_time_remaining(), 600 + 3 * 900); // 3300
     }
 
     #[test]
     fn test_nfl_time_remaining_q4() {
         // NFL Q4 with 2:00 left → just 2 minutes = 120 sec
-        let state = make_game_state(Sport::NFL, 4, 120);
+        let state = make_game_state(Sport::NFL, 4, 120, SportSpecificState::Football(Default::default()));
         assert_eq!(state.total_time_remaining(), 120);
     }
 
@@ -869,15 +927,15 @@ mod tests {
     fn test_overtime_handling() {
         // Overtime periods should just use current time remaining (no future periods)
         // NBA OT (period 5)
-        let nba_ot = make_game_state(Sport::NBA, 5, 180);
+        let nba_ot = make_game_state(Sport::NBA, 5, 180, SportSpecificState::Basketball(Default::default()));
         assert_eq!(nba_ot.total_time_remaining(), 180);
 
         // NHL OT (period 4)
-        let nhl_ot = make_game_state(Sport::NHL, 4, 300);
+        let nhl_ot = make_game_state(Sport::NHL, 4, 300, SportSpecificState::Hockey(Default::default()));
         assert_eq!(nhl_ot.total_time_remaining(), 300);
 
         // NCAAB OT (period 3)
-        let ncaab_ot = make_game_state(Sport::NCAAB, 3, 300);
+        let ncaab_ot = make_game_state(Sport::NCAAB, 3, 300, SportSpecificState::Basketball(Default::default()));
         assert_eq!(ncaab_ot.total_time_remaining(), 300);
     }
 }
