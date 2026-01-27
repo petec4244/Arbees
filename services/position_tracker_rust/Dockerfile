@@ -18,7 +18,8 @@ COPY services/notification_service_rust ./services/notification_service_rust
 COPY services/zmq_listener_rust ./services/zmq_listener_rust
 
 # Build
-RUN cargo build --release --package position_tracker_rust
+# Limit parallel jobs to avoid memory exhaustion
+RUN CARGO_BUILD_JOBS=2 cargo build --release --package position_tracker_rust
 
 # Runtime stage
 FROM debian:bookworm-slim

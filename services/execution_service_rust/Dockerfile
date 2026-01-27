@@ -17,7 +17,8 @@ COPY services/notification_service_rust ./services/notification_service_rust
 COPY services/zmq_listener_rust ./services/zmq_listener_rust
 
 # Build specific member
-RUN cargo build --release --package execution_service_rust
+# Limit parallel jobs to avoid memory exhaustion
+RUN CARGO_BUILD_JOBS=2 cargo build --release --package execution_service_rust
 
 FROM debian:bookworm-slim
 

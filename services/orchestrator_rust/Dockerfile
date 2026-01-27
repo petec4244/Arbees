@@ -19,7 +19,8 @@ COPY services/notification_service_rust /build/services/notification_service_rus
 COPY services/zmq_listener_rust /build/services/zmq_listener_rust
 
 # Build release binary
-RUN cargo build --release --bin orchestrator_rust
+# Limit parallel jobs to avoid memory exhaustion
+RUN CARGO_BUILD_JOBS=2 cargo build --release --bin orchestrator_rust
 
 # Runtime stage
 FROM debian:bookworm-slim
