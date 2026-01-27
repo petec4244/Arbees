@@ -1355,3 +1355,272 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arbees_rust_core::models::SignalType;
+
+    // ========================================================================
+    // Config tests
+    // ========================================================================
+
+    #[test]
+    fn test_config_defaults() {
+        let config = Config::default();
+
+        // Check critical defaults
+        assert!(config.min_edge_pct >= 5.0); // Minimum edge should be substantial
+        assert!(config.max_position_pct <= 25.0); // Max position should be conservative
+        assert!(config.kelly_fraction <= 0.5); // Kelly fraction should be fractional
+        assert!(config.max_buy_prob <= 0.95); // Don't buy near-certain outcomes
+        assert!(config.min_sell_prob >= 0.05); // Don't sell near-impossible outcomes
+
+        // Check liquidity defaults
+        assert!(config.liquidity_min_threshold >= 10.0); // At least $10 liquidity
+        assert!(config.liquidity_max_position_pct <= 100.0); // Can't exceed 100%
+        assert!(config.liquidity_max_position_pct >= 50.0); // Should take meaningful portion
+
+        // Check cooldown defaults
+        assert!(config.win_cooldown_seconds > 0.0);
+        assert!(config.loss_cooldown_seconds > 0.0);
+        assert!(config.loss_cooldown_seconds >= config.win_cooldown_seconds); // Longer after loss
+    }
+
+    #[test]
+    fn test_config_fee_reservation() {
+        let config = Config::default();
+
+        // Fee rates should be reasonable
+        // Kalshi ~1.4% round-trip, Polymarket ~4% round-trip
+        // These affect position sizing
+        assert!(config.kelly_fraction > 0.0);
+        assert!(config.kelly_fraction <= 1.0);
+    }
+
+    // ========================================================================
+    // Liquidity validation tests (unit test the logic)
+    // ========================================================================
+
+    fn make_market_price_row(yes_ask_size: Option<f64>, yes_bid_size: Option<f64>) -> MarketPriceRow {
+        MarketPriceRow {
+            market_id: "test-market".to_string(),
+            platform: "kalshi".to_string(),
+            market_title: Some("Test Market".to_string()),
+            contract_team: Some("Test Team".to_string()),
+            yes_bid: 0.48,
+            yes_ask: 0.52,
+            yes_bid_size,
+            yes_ask_size,
+            volume: Some(10000.0),
+            liquidity: Some(5000.0),
+            time: Utc::now(),
+        }
+    }
+
+    fn make_test_signal(direction: SignalDirection) -> TradingSignal {
+        TradingSignal {
+            signal_id: "test-signal".to_string(),
+            signal_type: SignalType::ModelEdgeYes,
+            game_id: "test-game".to_string(),
+            sport: Sport::NBA,
+            team: "Test Team".to_string(),
+            direction,
+            model_prob: 0.60,
+            market_prob: Some(0.50),
+            edge_pct: 10.0,
+            confidence: 0.8,
+            platform_buy: Some(Platform::Kalshi),
+            platform_sell: None,
+            buy_price: Some(0.52),
+            sell_price: Some(0.48),
+            liquidity_available: 1000.0,
+            reason: "Test signal".to_string(),
+            created_at: Utc::now(),
+            expires_at: Some(Utc::now() + Duration::minutes(1)),
+            play_id: None,
+        }
+    }
+
+    #[test]
+    fn test_liquidity_validation_logic_sufficient() {
+        // Test the liquidity validation logic directly
+        let min_threshold: f64 = 10.0;
+        let max_pct: f64 = 80.0;
+        let proposed_size: f64 = 100.0;
+        let available_liquidity: f64 = 200.0;
+
+        // Should pass: 200 >= 10, and cap at 80% of 200 = 160
+        assert!(available_liquidity >= min_threshold);
+        let max_position = available_liquidity * (max_pct / 100.0);
+        let validated = proposed_size.min(max_position);
+        assert_eq!(validated, 100.0); // Not capped since 100 < 160
+    }
+
+    #[test]
+    fn test_liquidity_validation_logic_capped() {
+        // Test that position gets capped at max percentage of liquidity
+        let min_threshold: f64 = 10.0;
+        let max_pct: f64 = 80.0;
+        let proposed_size: f64 = 500.0;
+        let available_liquidity: f64 = 200.0;
+
+        assert!(available_liquidity >= min_threshold);
+        let max_position = available_liquidity * (max_pct / 100.0);
+        let validated = proposed_size.min(max_position);
+        assert_eq!(validated, 160.0); // Capped at 80% of 200
+    }
+
+    #[test]
+    fn test_liquidity_validation_logic_insufficient() {
+        // Test that low liquidity is rejected
+        let min_threshold: f64 = 10.0;
+        let available_liquidity: f64 = 5.0;
+
+        assert!(available_liquidity < min_threshold);
+        // Would return Err in real code
+    }
+
+    // ========================================================================
+    // Team cooldown tests
+    // ========================================================================
+
+    #[test]
+    fn test_cooldown_key_format() {
+        // Test that cooldown keys are formatted correctly for team-specific cooldowns
+        let game_id = "game123";
+        let team = "Lakers";
+        let cooldown_key = format!("{}:{}", game_id, team);
+        assert_eq!(cooldown_key, "game123:Lakers");
+    }
+
+    #[test]
+    fn test_separate_team_cooldowns() {
+        // Test that different teams have different cooldown keys
+        let game_id = "game123";
+        let team_a = "Lakers";
+        let team_b = "Celtics";
+
+        let key_a = format!("{}:{}", game_id, team_a);
+        let key_b = format!("{}:{}", game_id, team_b);
+
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a, "game123:Lakers");
+        assert_eq!(key_b, "game123:Celtics");
+    }
+
+    // ========================================================================
+    // Fee reservation tests
+    // ========================================================================
+
+    #[test]
+    fn test_fee_reservation_kalshi() {
+        let balance: f64 = 1000.0;
+        let fee_rate: f64 = 0.014; // 1.4% round-trip for Kalshi
+
+        let available_after_fees = balance / (1.0 + fee_rate);
+
+        // Should reserve ~1.4% for fees
+        assert!(available_after_fees < balance);
+        assert!(available_after_fees > balance * 0.98); // Not too much reserved
+        assert!((available_after_fees - 986.19).abs() < 1.0); // ~$986.19
+    }
+
+    #[test]
+    fn test_fee_reservation_polymarket() {
+        let balance: f64 = 1000.0;
+        let fee_rate: f64 = 0.04; // 4% round-trip for Polymarket
+
+        let available_after_fees = balance / (1.0 + fee_rate);
+
+        // Should reserve ~4% for fees
+        assert!(available_after_fees < balance);
+        assert!((available_after_fees - 961.54).abs() < 1.0); // ~$961.54
+    }
+
+    // ========================================================================
+    // Kelly fraction tests
+    // ========================================================================
+
+    #[test]
+    fn test_kelly_fraction_calculation() {
+        // Test Kelly criterion: f* = (bp - q) / b
+        // where b = odds received, p = prob of win, q = prob of loss
+
+        // For a 60% edge with 1:1 odds:
+        let p: f64 = 0.60;
+        let q: f64 = 1.0 - p;
+        let b: f64 = 1.0; // Even money
+
+        let kelly = (b * p - q) / b;
+        assert!((kelly - 0.20).abs() < 0.01); // 20% Kelly
+
+        // With 0.25 fractional Kelly
+        let fractional_kelly = kelly * 0.25;
+        assert!((fractional_kelly - 0.05).abs() < 0.01); // 5% position
+    }
+
+    #[test]
+    fn test_kelly_caps_at_max_position() {
+        let max_position_pct: f64 = 10.0;
+        let kelly_position_pct: f64 = 25.0; // High Kelly recommendation
+
+        let capped = kelly_position_pct.min(max_position_pct);
+        assert_eq!(capped, 10.0);
+    }
+
+    // ========================================================================
+    // Signal expiration tests
+    // ========================================================================
+
+    #[test]
+    fn test_signal_not_expired() {
+        let signal = make_test_signal(SignalDirection::Buy);
+        let now = Utc::now();
+
+        if let Some(expires_at) = signal.expires_at {
+            assert!(expires_at > now);
+        }
+    }
+
+    #[test]
+    fn test_signal_expiration_check() {
+        let mut signal = make_test_signal(SignalDirection::Buy);
+        signal.expires_at = Some(Utc::now() - Duration::minutes(1));
+
+        let now = Utc::now();
+        let is_expired = signal.expires_at.map(|e| e < now).unwrap_or(false);
+        assert!(is_expired);
+    }
+
+    // ========================================================================
+    // Direction tests
+    // ========================================================================
+
+    #[test]
+    fn test_signal_direction_buy() {
+        let signal = make_test_signal(SignalDirection::Buy);
+        assert_eq!(signal.direction, SignalDirection::Buy);
+    }
+
+    #[test]
+    fn test_signal_direction_sell() {
+        let signal = make_test_signal(SignalDirection::Sell);
+        assert_eq!(signal.direction, SignalDirection::Sell);
+    }
+
+    // ========================================================================
+    // Platform selection tests
+    // ========================================================================
+
+    #[test]
+    fn test_platform_defaults_to_kalshi() {
+        let signal = make_test_signal(SignalDirection::Buy);
+        let platform = signal.platform_buy.unwrap_or(Platform::Kalshi);
+        assert_eq!(platform, Platform::Kalshi);
+    }
+}

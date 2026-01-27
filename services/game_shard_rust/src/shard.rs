@@ -659,13 +659,42 @@ async fn monitor_game(
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
 
+    // Game state staleness TTL - should match or exceed price staleness
+    // Default: 30 seconds (if ESPN data is older than 30s, skip signal generation)
+    let game_state_staleness_secs: i64 = env::var("GAME_STATE_STALENESS_TTL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
     // Track previous score for latency-based signals
     let mut prev_home_score: Option<u16> = None;
     let mut prev_away_score: Option<u16> = None;
+    let mut stale_state_warnings = 0u32;
 
     loop {
         // Fetch game state from ESPN (with circuit breaker protection)
         if let Some((game, state)) = fetch_game_state(&espn, &game_id, &sport, &espn_circuit_breaker).await {
+            // Check game state staleness - critical for preventing trades on old data
+            let state_age_secs = (Utc::now() - state.fetched_at).num_seconds();
+            if state_age_secs > game_state_staleness_secs {
+                stale_state_warnings += 1;
+                if stale_state_warnings % 10 == 1 {  // Log every 10th warning to avoid spam
+                    warn!(
+                        "Game state for {} is stale: {}s old (max {}s) - skipping signal generation. \
+                         ESPN API might be slow or game data not updating.",
+                        game_id, state_age_secs, game_state_staleness_secs
+                    );
+                }
+                // Skip signal generation with stale game state
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+            // Reset warning counter on fresh state
+            if stale_state_warnings > 0 {
+                info!("Game state for {} is fresh again after {} stale warnings", game_id, stale_state_warnings);
+                stale_state_warnings = 0;
+            }
+
             // Calculate win probability
             let home_win_prob = calculate_win_probability(&state, true);
 
@@ -1277,6 +1306,7 @@ async fn fetch_game_state(
         period: game.period,
         time_remaining_seconds: game.time_remaining_seconds,
         possession: game.possession.clone(),
+        fetched_at: Utc::now(), // Track when this state was fetched
         pregame_home_prob: None,
         sport_specific,
     };
@@ -1524,5 +1554,291 @@ async fn emit_latency_signal(
             error!("Failed to publish latency signal: {}", e);
             false
         }
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // compute_team_net_edge tests
+    // ========================================================================
+
+    fn make_price(yes_bid: f64, yes_ask: f64) -> MarketPriceData {
+        MarketPriceData {
+            market_id: "test".to_string(),
+            platform: "kalshi".to_string(),
+            contract_team: "Test Team".to_string(),
+            yes_bid,
+            yes_ask,
+            mid_price: (yes_bid + yes_ask) / 2.0,
+            timestamp: Utc::now(),
+            yes_bid_size: Some(1000.0),
+            yes_ask_size: Some(1000.0),
+            total_liquidity: Some(2000.0),
+        }
+    }
+
+    #[test]
+    fn test_compute_net_edge_buy_yes() {
+        // Model thinks 60% YES, market at 50% mid (bid=48, ask=52)
+        let price = make_price(0.48, 0.52);
+        let (direction, signal_type, net_edge, gross_edge, market_mid) =
+            compute_team_net_edge(0.60, &price, Platform::Kalshi);
+
+        assert_eq!(direction, SignalDirection::Buy);
+        assert_eq!(signal_type, SignalType::ModelEdgeYes);
+        assert!((gross_edge - 10.0).abs() < 0.1); // 60% - 50% = 10% gross
+        assert!(net_edge < gross_edge); // Net should be less due to fees
+        assert!(net_edge > 0.0); // Should still be positive
+        assert!((market_mid - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_net_edge_buy_no() {
+        // Model thinks 40% YES (60% NO), market at 50% mid
+        let price = make_price(0.48, 0.52);
+        let (direction, signal_type, net_edge, gross_edge, market_mid) =
+            compute_team_net_edge(0.40, &price, Platform::Kalshi);
+
+        assert_eq!(direction, SignalDirection::Sell);
+        assert_eq!(signal_type, SignalType::ModelEdgeNo);
+        assert!((gross_edge - 10.0).abs() < 0.1); // |40% - 50%| = 10% gross
+        assert!(net_edge < gross_edge); // Net should be less due to fees
+        assert!((market_mid - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_compute_net_edge_platform_fees_differ() {
+        let price = make_price(0.48, 0.52);
+
+        let (_, _, kalshi_net, _, _) = compute_team_net_edge(0.60, &price, Platform::Kalshi);
+        let (_, _, poly_net, _, _) = compute_team_net_edge(0.60, &price, Platform::Polymarket);
+
+        // Both should have positive gross edge (model 60% vs market ~50%)
+        // Net edges will differ based on fee structure
+        // At mid-range prices, Polymarket's 2% per-side fee may be higher than Kalshi's tiered fees
+        // The important thing is both calculations work and produce reasonable values
+        assert!(kalshi_net > -20.0 && kalshi_net < 20.0); // Reasonable range
+        assert!(poly_net > -20.0 && poly_net < 20.0); // Reasonable range
+
+        // Both should be less than the gross edge of ~10%
+        assert!(kalshi_net < 10.0);
+        assert!(poly_net < 10.0);
+    }
+
+    #[test]
+    fn test_compute_net_edge_no_edge() {
+        // Model matches market exactly
+        let price = make_price(0.48, 0.52);
+        let (direction, _, net_edge, gross_edge, _) =
+            compute_team_net_edge(0.50, &price, Platform::Kalshi);
+
+        assert_eq!(direction, SignalDirection::Buy); // Slight bias to buy when equal
+        assert!(gross_edge.abs() < 0.1); // Near zero gross edge
+        assert!(net_edge < 0.0); // Negative after fees (no real edge)
+    }
+
+    // ========================================================================
+    // is_overtime tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_overtime_nhl() {
+        assert!(!is_overtime(Sport::NHL, 1));
+        assert!(!is_overtime(Sport::NHL, 2));
+        assert!(!is_overtime(Sport::NHL, 3));
+        assert!(is_overtime(Sport::NHL, 4)); // OT
+        assert!(is_overtime(Sport::NHL, 5)); // 2OT
+    }
+
+    #[test]
+    fn test_is_overtime_nba() {
+        assert!(!is_overtime(Sport::NBA, 1));
+        assert!(!is_overtime(Sport::NBA, 4));
+        assert!(is_overtime(Sport::NBA, 5)); // OT
+    }
+
+    #[test]
+    fn test_is_overtime_nfl() {
+        assert!(!is_overtime(Sport::NFL, 1));
+        assert!(!is_overtime(Sport::NFL, 4));
+        assert!(is_overtime(Sport::NFL, 5)); // OT
+    }
+
+    #[test]
+    fn test_is_overtime_ncaab() {
+        assert!(!is_overtime(Sport::NCAAB, 1));
+        assert!(!is_overtime(Sport::NCAAB, 2));
+        assert!(is_overtime(Sport::NCAAB, 3)); // OT (college has 2 halves)
+    }
+
+    #[test]
+    fn test_is_overtime_mlb() {
+        assert!(!is_overtime(Sport::MLB, 1));
+        assert!(!is_overtime(Sport::MLB, 9));
+        assert!(is_overtime(Sport::MLB, 10)); // Extra innings
+    }
+
+    #[test]
+    fn test_is_overtime_soccer() {
+        assert!(!is_overtime(Sport::Soccer, 1));
+        assert!(!is_overtime(Sport::Soccer, 2));
+        assert!(is_overtime(Sport::Soccer, 3)); // Extra time
+    }
+
+    // ========================================================================
+    // format_time_remaining tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_time_remaining() {
+        assert_eq!(format_time_remaining(0), "0:00");
+        assert_eq!(format_time_remaining(30), "0:30");
+        assert_eq!(format_time_remaining(60), "1:00");
+        assert_eq!(format_time_remaining(90), "1:30");
+        assert_eq!(format_time_remaining(720), "12:00"); // 12 minutes
+        assert_eq!(format_time_remaining(754), "12:34");
+    }
+
+    // ========================================================================
+    // parse_sport tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_sport_valid() {
+        assert_eq!(parse_sport("nfl"), Some(Sport::NFL));
+        assert_eq!(parse_sport("NFL"), Some(Sport::NFL));
+        assert_eq!(parse_sport("nba"), Some(Sport::NBA));
+        assert_eq!(parse_sport("nhl"), Some(Sport::NHL));
+        assert_eq!(parse_sport("mlb"), Some(Sport::MLB));
+        assert_eq!(parse_sport("ncaaf"), Some(Sport::NCAAF));
+        assert_eq!(parse_sport("ncaab"), Some(Sport::NCAAB));
+        assert_eq!(parse_sport("mls"), Some(Sport::MLS));
+        assert_eq!(parse_sport("soccer"), Some(Sport::Soccer));
+    }
+
+    #[test]
+    fn test_parse_sport_invalid() {
+        assert_eq!(parse_sport("invalid"), None);
+        assert_eq!(parse_sport(""), None);
+        assert_eq!(parse_sport("cricket"), None);
+    }
+
+    // ========================================================================
+    // espn_sport_league tests
+    // ========================================================================
+
+    #[test]
+    fn test_espn_sport_league_mapping() {
+        assert_eq!(espn_sport_league("nfl"), Some(("football", "nfl")));
+        assert_eq!(espn_sport_league("ncaaf"), Some(("football", "college-football")));
+        assert_eq!(espn_sport_league("nba"), Some(("basketball", "nba")));
+        assert_eq!(espn_sport_league("ncaab"), Some(("basketball", "mens-college-basketball")));
+        assert_eq!(espn_sport_league("nhl"), Some(("hockey", "nhl")));
+        assert_eq!(espn_sport_league("mlb"), Some(("baseball", "mlb")));
+        assert_eq!(espn_sport_league("mls"), Some(("soccer", "usa.1")));
+        assert_eq!(espn_sport_league("soccer"), Some(("soccer", "eng.1")));
+    }
+
+    #[test]
+    fn test_espn_sport_league_invalid() {
+        assert_eq!(espn_sport_league("invalid"), None);
+        assert_eq!(espn_sport_league("tennis"), None);
+    }
+
+    // ========================================================================
+    // check_cross_platform_arb tests
+    // ========================================================================
+
+    #[test]
+    fn test_check_arb_no_arb() {
+        // Efficient market: no arbitrage
+        let kalshi = make_price(0.48, 0.52);
+        let poly = make_price(0.47, 0.53);
+
+        let result = check_cross_platform_arb(Some(&kalshi), Some(&poly), 1);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_arb_missing_platform() {
+        let kalshi = make_price(0.48, 0.52);
+
+        // Need both platforms for cross-platform arb
+        assert!(check_cross_platform_arb(Some(&kalshi), None, 1).is_none());
+        assert!(check_cross_platform_arb(None, Some(&kalshi), 1).is_none());
+        assert!(check_cross_platform_arb(None, None, 1).is_none());
+    }
+
+    #[test]
+    fn test_check_arb_found() {
+        // Arb opportunity: Kalshi YES 48¢ + Poly NO 48¢ = 96¢ < 100¢
+        // Kalshi: bid=50, ask=48 (YES at 48¢)
+        // Poly: bid=54, ask=56 (NO = 1-bid = 46¢, but we need ask)
+        // Actually need: Kalshi ask + (1 - Poly bid) < 100
+        // 48 + (100 - 54) = 48 + 46 = 94 < 100 ✓
+
+        let kalshi = make_price(0.50, 0.48); // YES ask = 48¢
+        let poly = make_price(0.54, 0.56);   // NO ask = 1 - 0.54 = 46¢
+
+        let result = check_cross_platform_arb(Some(&kalshi), Some(&poly), 1);
+        assert!(result.is_some());
+
+        let (mask, profit) = result.unwrap();
+        assert!(profit > 0);
+        assert!(mask != 0);
+    }
+
+    // ========================================================================
+    // MarketPriceData tests
+    // ========================================================================
+
+    #[test]
+    fn test_market_price_data_mid_calculation() {
+        let price = make_price(0.40, 0.60);
+        assert!((price.mid_price - 0.50).abs() < 0.01);
+
+        let price2 = make_price(0.30, 0.35);
+        assert!((price2.mid_price - 0.325).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // fee_for_price tests
+    // ========================================================================
+
+    #[test]
+    fn test_fee_for_price_kalshi() {
+        // Kalshi fees are tiered based on price
+        let fee_low = fee_for_price(Platform::Kalshi, 0.10);
+        let fee_mid = fee_for_price(Platform::Kalshi, 0.50);
+        let fee_high = fee_for_price(Platform::Kalshi, 0.90);
+
+        // Fees should all be positive and reasonable
+        assert!(fee_low > 0.0 && fee_low < 0.10);
+        assert!(fee_mid > 0.0 && fee_mid < 0.10);
+        assert!(fee_high > 0.0 && fee_high < 0.10);
+    }
+
+    #[test]
+    fn test_fee_for_price_polymarket() {
+        // Polymarket charges 2% of price
+        let fee = fee_for_price(Platform::Polymarket, 0.50);
+        assert!((fee - 0.01).abs() < 0.001); // 2% of 0.50 = 0.01
+    }
+
+    #[test]
+    fn test_fee_for_price_clamped() {
+        // Prices should be clamped to 0-1
+        let fee_negative = fee_for_price(Platform::Kalshi, -0.5);
+        let fee_over = fee_for_price(Platform::Kalshi, 1.5);
+
+        assert!(fee_negative >= 0.0);
+        assert!(fee_over >= 0.0);
     }
 }

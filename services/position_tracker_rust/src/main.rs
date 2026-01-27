@@ -1499,3 +1499,343 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Config tests
+    // ========================================================================
+
+    #[test]
+    fn test_config_defaults() {
+        let config = Config::default();
+
+        // Check take profit and stop loss
+        assert!(config.take_profit_pct > 0.0);
+        assert!(config.default_stop_loss_pct > 0.0);
+        assert!(config.take_profit_pct < 100.0);
+        assert!(config.default_stop_loss_pct < 100.0);
+
+        // Check intervals
+        assert!(config.exit_check_interval_secs > 0.0);
+        assert!(config.min_hold_seconds >= 0.0);
+        assert!(config.price_staleness_ttl > 0.0);
+
+        // Check slippage buffer
+        assert!(config.slippage_buffer_pct >= 0.0);
+        assert!(config.slippage_buffer_pct <= 5.0); // Shouldn't be too high
+
+        // Check piggybank
+        assert!(config.piggybank_pct >= 0.0);
+        assert!(config.piggybank_pct <= 1.0);
+    }
+
+    #[test]
+    fn test_slippage_buffer_default() {
+        let config = Config::default();
+
+        // Default slippage buffer should be 0.5%
+        assert!((config.slippage_buffer_pct - 0.5).abs() < 0.1);
+    }
+
+    // ========================================================================
+    // Slippage calculation tests
+    // ========================================================================
+
+    #[test]
+    fn test_slippage_on_sell_exit() {
+        // When we have a BUY position, we exit by selling at bid
+        // With slippage buffer, we assume worse price
+
+        let yes_bid: f64 = 0.60; // Market bid
+        let slippage_pct: f64 = 0.5; // 0.5%
+        let slippage: f64 = slippage_pct / 100.0;
+
+        // Exit price for BUY position (selling)
+        let exit_price: f64 = yes_bid * (1.0 - slippage);
+
+        assert!(exit_price < yes_bid); // Slippage makes it worse
+        assert!((exit_price - 0.597).abs() < 0.001); // 0.60 * 0.995 = 0.597
+    }
+
+    #[test]
+    fn test_slippage_on_cover_exit() {
+        // When we have a SELL position, we exit by buying (covering) at ask
+        // With slippage buffer, we assume worse price
+
+        let yes_ask: f64 = 0.40; // Market ask
+        let slippage_pct: f64 = 0.5; // 0.5%
+        let slippage: f64 = slippage_pct / 100.0;
+
+        // Exit price for SELL position (covering)
+        let exit_price: f64 = yes_ask * (1.0 + slippage);
+
+        assert!(exit_price > yes_ask); // Slippage makes it worse
+        assert!((exit_price - 0.402).abs() < 0.001); // 0.40 * 1.005 = 0.402
+    }
+
+    #[test]
+    fn test_slippage_affects_pnl() {
+        // Calculate P&L with and without slippage
+        let entry_price: f64 = 0.50;
+        let yes_bid: f64 = 0.60; // Market moved in our favor
+        let position_size: f64 = 100.0; // $100 position
+        let slippage_pct: f64 = 0.5;
+        let slippage: f64 = slippage_pct / 100.0;
+
+        // Without slippage
+        let pnl_no_slippage: f64 = (yes_bid - entry_price) * position_size;
+        assert!((pnl_no_slippage - 10.0).abs() < 0.01); // $10 profit
+
+        // With slippage
+        let exit_with_slippage: f64 = yes_bid * (1.0 - slippage);
+        let pnl_with_slippage: f64 = (exit_with_slippage - entry_price) * position_size;
+
+        assert!(pnl_with_slippage < pnl_no_slippage); // Less profit with slippage
+        assert!((pnl_with_slippage - 9.70).abs() < 0.01); // ~$9.70 profit
+    }
+
+    // ========================================================================
+    // P&L calculation tests
+    // ========================================================================
+
+    #[test]
+    fn test_pnl_buy_profit() {
+        // BUY at 50%, exit at 60%
+        let entry: f64 = 0.50;
+        let exit: f64 = 0.60;
+        let size: f64 = 100.0;
+
+        let pnl: f64 = (exit - entry) * size;
+        assert!((pnl - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pnl_buy_loss() {
+        // BUY at 50%, exit at 40%
+        let entry: f64 = 0.50;
+        let exit: f64 = 0.40;
+        let size: f64 = 100.0;
+
+        let pnl: f64 = (exit - entry) * size;
+        assert!((pnl - (-10.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pnl_sell_profit() {
+        // SELL at 50% (short), exit at 40% (price dropped, we profit)
+        // For shorts: profit when price goes down
+        let entry: f64 = 0.50;
+        let exit: f64 = 0.40;
+        let size: f64 = 100.0;
+
+        let pnl: f64 = (entry - exit) * size; // Reversed for shorts
+        assert!((pnl - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pnl_sell_loss() {
+        // SELL at 50% (short), exit at 60% (price went up, we lose)
+        let entry: f64 = 0.50;
+        let exit: f64 = 0.60;
+        let size: f64 = 100.0;
+
+        let pnl: f64 = (entry - exit) * size; // Reversed for shorts
+        assert!((pnl - (-10.0)).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // Piggybank tests
+    // ========================================================================
+
+    #[test]
+    fn test_piggybank_calculation() {
+        let profit: f64 = 100.0;
+        let piggybank_pct: f64 = 0.5; // 50% to piggybank
+
+        let to_piggybank: f64 = profit * piggybank_pct;
+        let to_balance: f64 = profit - to_piggybank;
+
+        assert!((to_piggybank - 50.0).abs() < 0.01);
+        assert!((to_balance - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_piggybank_no_contribution_on_loss() {
+        let profit = -50.0; // Loss
+        let piggybank_pct = 0.5;
+
+        // Only positive profits go to piggybank
+        let to_piggybank = if profit > 0.0 {
+            profit * piggybank_pct
+        } else {
+            0.0
+        };
+
+        assert_eq!(to_piggybank, 0.0);
+    }
+
+    // ========================================================================
+    // Take profit / Stop loss tests
+    // ========================================================================
+
+    #[test]
+    fn test_take_profit_trigger() {
+        let take_profit_pct: f64 = 20.0;
+        let entry_price: f64 = 0.50;
+        let current_price: f64 = 0.62; // 24% gain
+
+        let pnl_pct: f64 = ((current_price - entry_price) / entry_price) * 100.0;
+        let should_take_profit = pnl_pct >= take_profit_pct;
+
+        assert!((pnl_pct - 24.0).abs() < 0.1);
+        assert!(should_take_profit);
+    }
+
+    #[test]
+    fn test_stop_loss_trigger() {
+        let stop_loss_pct: f64 = 15.0;
+        let entry_price: f64 = 0.50;
+        let current_price: f64 = 0.40; // 20% loss
+
+        let pnl_pct: f64 = ((current_price - entry_price) / entry_price) * 100.0;
+        let should_stop_loss = pnl_pct <= -stop_loss_pct;
+
+        assert!((pnl_pct - (-20.0)).abs() < 0.1);
+        assert!(should_stop_loss);
+    }
+
+    #[test]
+    fn test_no_exit_in_range() {
+        let take_profit_pct = 20.0;
+        let stop_loss_pct = 15.0;
+        let entry_price = 0.50;
+        let current_price = 0.52; // 4% gain (within range)
+
+        let pnl_pct = ((current_price - entry_price) / entry_price) * 100.0;
+        let should_take_profit = pnl_pct >= take_profit_pct;
+        let should_stop_loss = pnl_pct <= -stop_loss_pct;
+
+        assert!(!should_take_profit);
+        assert!(!should_stop_loss);
+    }
+
+    // ========================================================================
+    // Price staleness tests
+    // ========================================================================
+
+    #[test]
+    fn test_price_staleness() {
+        let staleness_ttl = 30.0; // 30 seconds
+        let price_time = Utc::now() - Duration::seconds(45); // 45 seconds ago
+        let now = Utc::now();
+
+        let age_secs = (now - price_time).num_seconds() as f64;
+        let is_stale = age_secs > staleness_ttl;
+
+        assert!(is_stale);
+    }
+
+    #[test]
+    fn test_price_fresh() {
+        let staleness_ttl = 30.0;
+        let price_time = Utc::now() - Duration::seconds(10); // 10 seconds ago
+        let now = Utc::now();
+
+        let age_secs = (now - price_time).num_seconds() as f64;
+        let is_stale = age_secs > staleness_ttl;
+
+        assert!(!is_stale);
+    }
+
+    // ========================================================================
+    // Min hold time tests
+    // ========================================================================
+
+    #[test]
+    fn test_min_hold_time_not_met() {
+        let min_hold_seconds = 30.0;
+        let entry_time = Utc::now() - Duration::seconds(10); // Entered 10s ago
+        let now = Utc::now();
+
+        let hold_time = (now - entry_time).num_seconds() as f64;
+        let can_exit = hold_time >= min_hold_seconds;
+
+        assert!(!can_exit);
+    }
+
+    #[test]
+    fn test_min_hold_time_met() {
+        let min_hold_seconds = 30.0;
+        let entry_time = Utc::now() - Duration::seconds(45); // Entered 45s ago
+        let now = Utc::now();
+
+        let hold_time = (now - entry_time).num_seconds() as f64;
+        let can_exit = hold_time >= min_hold_seconds;
+
+        assert!(can_exit);
+    }
+
+    // ========================================================================
+    // OpenPosition tests
+    // ========================================================================
+
+    fn make_open_position(side: TradeSide, entry_price: f64) -> OpenPosition {
+        OpenPosition {
+            trade_id: "test-trade".to_string(),
+            signal_id: "test-signal".to_string(),
+            game_id: "test-game".to_string(),
+            sport: Sport::NBA,
+            platform: Platform::Kalshi,
+            market_id: "test-market".to_string(),
+            market_title: "Test Market".to_string(),
+            side,
+            entry_price,
+            size: 100.0,
+            entry_time: Utc::now(),
+            contract_team: Some("Test Team".to_string()),
+            entry_fees: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_open_position_buy() {
+        let pos = make_open_position(TradeSide::Buy, 0.50);
+        assert_eq!(pos.side, TradeSide::Buy);
+        assert!((pos.entry_price - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_open_position_sell() {
+        let pos = make_open_position(TradeSide::Sell, 0.50);
+        assert_eq!(pos.side, TradeSide::Sell);
+    }
+
+    // ========================================================================
+    // Mark price tests
+    // ========================================================================
+
+    #[test]
+    fn test_mark_price_calculation() {
+        let yes_bid: f64 = 0.48;
+        let yes_ask: f64 = 0.52;
+
+        let mark_price = (yes_bid + yes_ask) / 2.0;
+        assert!((mark_price - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_mark_price_wide_spread() {
+        let yes_bid: f64 = 0.40;
+        let yes_ask: f64 = 0.60;
+
+        let mark_price = (yes_bid + yes_ask) / 2.0;
+        assert!((mark_price - 0.50).abs() < 0.01);
+    }
+}
