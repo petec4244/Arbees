@@ -554,6 +554,9 @@ pub struct ExecutionRequest {
     pub platform: Platform,
     pub market_id: String,
     pub contract_team: Option<String>,
+    /// Polymarket CLOB token ID (resolved from market_id + contract_team)
+    #[serde(default)]
+    pub token_id: Option<String>,
     pub side: ExecutionSide,
     pub limit_price: f64,
     pub size: f64,

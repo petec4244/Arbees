@@ -1,4 +1,5 @@
 mod engine;
+mod polymarket_executor;
 
 use anyhow::Result;
 use arbees_rust_core::models::{
@@ -22,10 +23,15 @@ async fn main() -> Result<()> {
 
     let paper_trading_val = env::var("PAPER_TRADING").unwrap_or_else(|_| "1".to_string());
     let paper_trading = matches!(paper_trading_val.to_lowercase().as_str(), "1" | "true" | "yes");
-    let engine = ExecutionEngine::new(paper_trading);
+    let engine = ExecutionEngine::new(paper_trading).await;
     let redis = RedisBus::new().await?;
 
-    info!("Execution Service ready (Paper Trading: {})", paper_trading);
+    info!(
+        "Execution Service ready (Paper Trading: {}, Kalshi Live: {}, Polymarket Live: {})",
+        paper_trading,
+        engine.kalshi_live_enabled(),
+        engine.polymarket_live_enabled()
+    );
 
     let mut pubsub = redis.subscribe("execution:requests").await?;
     info!("Subscribed to execution:requests");

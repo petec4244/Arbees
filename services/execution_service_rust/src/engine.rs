@@ -5,6 +5,8 @@ use arbees_rust_core::models::{ExecutionRequest, ExecutionResult, ExecutionSide,
 use chrono::Utc;
 use log::{error, info, warn};
 
+use crate::polymarket_executor::PolymarketExecutor;
+
 /// Calculate trading fee for a given platform, price, and size.
 ///
 /// For Kalshi and Paper trading:
@@ -34,6 +36,7 @@ fn calculate_fee(platform: Platform, price: f64, size: f64) -> f64 {
 pub struct ExecutionEngine {
     kalshi: KalshiClient,
     polymarket: PolymarketClient,
+    polymarket_executor: Option<PolymarketExecutor>,
     paper_trading: bool,
 }
 
@@ -47,7 +50,14 @@ impl ExecutionEngine {
     /// - KALSHI_API_KEY: Your API key
     /// - KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_PATH: RSA private key
     /// - KALSHI_ENV: "prod" or "demo" (defaults to prod)
-    pub fn new(paper_trading: bool) -> Self {
+    ///
+    /// For Polymarket live trading, set environment variables:
+    /// - POLYMARKET_PRIVATE_KEY: L1 wallet private key (hex, with 0x prefix)
+    /// - POLYMARKET_FUNDER_ADDRESS: Funder/proxy wallet address
+    /// - POLYMARKET_CHAIN_ID: 137 for mainnet, 80002 for testnet (default: 137)
+    /// - POLYMARKET_CLOB_HOST: CLOB API host (default: https://clob.polymarket.com)
+    /// - POLYMARKET_API_NONCE: Nonce for API key derivation (default: 0)
+    pub async fn new(paper_trading: bool) -> Self {
         // Try to load Kalshi credentials from environment
         let kalshi = match KalshiClient::from_env() {
             Ok(client) => {
@@ -64,9 +74,26 @@ impl ExecutionEngine {
             }
         };
 
+        // Try to initialize Polymarket CLOB executor (only for live trading)
+        let polymarket_executor = if !paper_trading {
+            match PolymarketExecutor::from_env().await {
+                Ok(exec) => {
+                    info!("Polymarket CLOB executor initialized");
+                    Some(exec)
+                }
+                Err(e) => {
+                    warn!("Polymarket CLOB executor not available: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             kalshi,
             polymarket: PolymarketClient::new(),
+            polymarket_executor,
             paper_trading,
         }
     }
@@ -74,6 +101,11 @@ impl ExecutionEngine {
     /// Check if Kalshi live trading is available
     pub fn kalshi_live_enabled(&self) -> bool {
         !self.paper_trading && self.kalshi.has_credentials()
+    }
+
+    /// Check if Polymarket live trading is available
+    pub fn polymarket_live_enabled(&self) -> bool {
+        !self.paper_trading && self.polymarket_executor.is_some()
     }
 
     pub async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResult> {
@@ -122,35 +154,37 @@ impl ExecutionEngine {
                 self.execute_kalshi(request).await
             }
             Platform::Polymarket => {
-                // Polymarket CLOB integration is complex and deferred
-                // It requires wallet signing with ethers, CLOB API, etc.
-                let executed_at = Utc::now();
-                let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
-                Ok(ExecutionResult {
-                    request_id: request.request_id,
-                    idempotency_key: request.idempotency_key,
-                    status: ExecutionStatus::Rejected,
-                    rejection_reason: Some(
-                        "Polymarket live trading not yet implemented - requires CLOB integration"
-                            .to_string(),
-                    ),
-                    order_id: None,
-                    filled_qty: 0.0,
-                    avg_price: 0.0,
-                    fees: 0.0,
-                    platform: Platform::Polymarket,
-                    market_id: request.market_id,
-                    contract_team: request.contract_team,
-                    game_id: request.game_id,
-                    sport: request.sport,
-                    signal_id: request.signal_id,
-                    signal_type: request.signal_type,
-                    edge_pct: request.edge_pct,
-                    side: request.side,
-                    requested_at: request.created_at,
-                    executed_at,
-                    latency_ms,
-                })
+                if let Some(executor) = &self.polymarket_executor {
+                    executor.execute(request).await
+                } else {
+                    let executed_at = Utc::now();
+                    let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
+                    Ok(ExecutionResult {
+                        request_id: request.request_id,
+                        idempotency_key: request.idempotency_key,
+                        status: ExecutionStatus::Rejected,
+                        rejection_reason: Some(
+                            "Polymarket CLOB not configured. Set POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS"
+                                .to_string(),
+                        ),
+                        order_id: None,
+                        filled_qty: 0.0,
+                        avg_price: 0.0,
+                        fees: 0.0,
+                        platform: Platform::Polymarket,
+                        market_id: request.market_id,
+                        contract_team: request.contract_team,
+                        game_id: request.game_id,
+                        sport: request.sport,
+                        signal_id: request.signal_id,
+                        signal_type: request.signal_type,
+                        edge_pct: request.edge_pct,
+                        side: request.side,
+                        requested_at: request.created_at,
+                        executed_at,
+                        latency_ms,
+                    })
+                }
             }
             Platform::Paper => {
                 let executed_at = Utc::now();

@@ -50,6 +50,10 @@ sha2 = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 
+# Polymarket CLOB execution
+ethers = { workspace = true }
+hmac = { workspace = true }
+
 # Python interop
 pyo3 = { workspace = true, optional = true, features = ["extension-module"] }
 
