@@ -8,6 +8,7 @@ members = [
     "services/signal_processor_rust",
     "services/position_tracker_rust",
     "services/notification_service_rust",
+    "services/zmq_listener_rust",
 ]
 resolver = "2"
 
@@ -54,6 +55,9 @@ rand = "0.8"                 # Random number generation for RSA
 # Polymarket CLOB execution
 ethers = { version = "2.0", features = ["legacy"] }  # EIP-712 signing
 hmac = "0.12"                # HMAC for API authentication
+
+# ZMQ for low-latency messaging
+zeromq = "0.4"               # ZeroMQ async bindings
 
 [profile.release]
 lto = true

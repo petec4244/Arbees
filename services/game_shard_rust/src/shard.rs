@@ -20,9 +20,20 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+use zeromq::{Socket, SocketRecv, SocketSend, PubSocket, SubSocket, ZmqMessage};
+
+/// ZMQ message envelope format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ZmqEnvelope {
+    seq: u64,
+    timestamp_ms: i64,
+    source: Option<String>,
+    payload: serde_json::Value,
+}
 
 /// Default minimum edge percentage to generate a signal (can be overridden via MIN_EDGE_PCT env var)
 /// Data shows: 5-10% edge = 36% win rate, 15%+ edge = 87.5% win rate
@@ -144,6 +155,16 @@ pub struct GameShard {
     price_stats: Arc<PriceListenerStats>,
     /// Circuit breaker for ESPN API calls
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
+    /// ZMQ enabled flag
+    zmq_enabled: bool,
+    /// ZMQ PUB socket for signals (wrapped in Arc<Mutex> for sharing)
+    zmq_pub: Option<Arc<Mutex<PubSocket>>>,
+    /// ZMQ sequence number for message ordering
+    zmq_seq: Arc<AtomicU64>,
+    /// ZMQ endpoints to subscribe to for prices
+    zmq_sub_endpoints: Vec<String>,
+    /// ZMQ PUB port for signals
+    zmq_pub_port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +289,23 @@ impl GameShard {
             30 // Can't easily get config back, log default
         );
 
+        // ZMQ configuration
+        let zmq_enabled = env::var("ZMQ_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        let zmq_sub_endpoints: Vec<String> = env::var("ZMQ_SUB_ENDPOINTS")
+            .unwrap_or_else(|_| "tcp://kalshi_monitor:5555,tcp://polymarket_monitor:5556".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let zmq_pub_port = env::var("ZMQ_PUB_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5558u16);
+
         Ok(Self {
             shard_id,
             redis,
@@ -281,6 +319,11 @@ impl GameShard {
             min_edge_pct,
             price_stats: Arc::new(PriceListenerStats::default()),
             espn_circuit_breaker,
+            zmq_enabled,
+            zmq_pub: None, // Initialized in start()
+            zmq_seq: Arc::new(AtomicU64::new(0)),
+            zmq_sub_endpoints,
+            zmq_pub_port,
         })
     }
 
@@ -289,8 +332,23 @@ impl GameShard {
         self.price_stats.snapshot()
     }
 
-    pub async fn start(&self) -> Result<()> {
+    pub async fn start(&mut self) -> Result<()> {
         info!("Starting GameShard {}", self.shard_id);
+
+        // Initialize ZMQ PUB socket for signals if enabled
+        if self.zmq_enabled {
+            info!("ZMQ enabled - initializing sockets");
+            match Self::init_zmq_pub(self.zmq_pub_port).await {
+                Ok(pub_socket) => {
+                    self.zmq_pub = Some(Arc::new(Mutex::new(pub_socket)));
+                    info!("ZMQ PUB socket bound to port {}", self.zmq_pub_port);
+                }
+                Err(e) => {
+                    error!("Failed to initialize ZMQ PUB socket: {}", e);
+                    // Continue without ZMQ PUB
+                }
+            }
+        }
 
         // Heartbeat loop
         let heartbeat_shard = self.clone();
@@ -308,15 +366,35 @@ impl GameShard {
             }
         });
 
-        // Market price listener (subscribes to game:*:price)
+        // Market price listener - ZMQ if enabled, Redis as fallback
+        if self.zmq_enabled && !self.zmq_sub_endpoints.is_empty() {
+            // ZMQ price listener (primary for low latency)
+            let zmq_shard = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = zmq_shard.zmq_price_listener_loop().await {
+                    error!("ZMQ price listener loop exited: {}", e);
+                }
+            });
+            info!("Started ZMQ price listener for endpoints: {:?}", self.zmq_sub_endpoints);
+        }
+
+        // Redis price listener (always run for backward compatibility)
         let price_shard = self.clone();
         tokio::spawn(async move {
             if let Err(e) = price_shard.price_listener_loop().await {
-                error!("Price listener loop exited: {}", e);
+                error!("Redis price listener loop exited: {}", e);
             }
         });
 
         Ok(())
+    }
+
+    /// Initialize ZMQ PUB socket for publishing signals
+    async fn init_zmq_pub(port: u16) -> Result<PubSocket> {
+        let mut socket = PubSocket::new();
+        let addr = format!("tcp://*:{}", port);
+        socket.bind(&addr).await?;
+        Ok(socket)
     }
 
     pub async fn add_game(
@@ -352,6 +430,8 @@ impl GameShard {
         let espn_cb = self.espn_circuit_breaker.clone();
         let gid = game_id.clone();
         let sp = sport.clone();
+        let zmq_pub = self.zmq_pub.clone();
+        let zmq_seq = self.zmq_seq.clone();
 
         let task = tokio::spawn(async move {
             monitor_game(
@@ -365,6 +445,8 @@ impl GameShard {
                 market_prices,
                 min_edge,
                 espn_cb,
+                zmq_pub,
+                zmq_seq,
             )
             .await;
         });
@@ -502,7 +584,7 @@ impl GameShard {
                     Ok(p) => p,
                     Err(json_err) => {
                         // P0-5: Track and log parsing failures properly
-                        let failure_count = self.price_stats.parse_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let failure_count = self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
                         // Log at warn level for visibility, but rate-limit to avoid spam
                         if failure_count <= 10 || failure_count % 100 == 0 {
@@ -525,53 +607,8 @@ impl GameShard {
                 },
             };
 
-            // Check if contract_team is present
-            let team = match &price.contract_team {
-                Some(t) => t,
-                None => {
-                    self.price_stats.no_team_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug!("Skipping price message without contract_team: game={}", game_id);
-                    continue;
-                }
-            };
-
-            // Skip prices with no real liquidity (bid=0, ask=1 gives fake 50% mid)
-            let has_liquidity = price.yes_bid > 0.01 || price.yes_ask < 0.99;
-            if !has_liquidity {
-                self.price_stats.no_liquidity_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                debug!(
-                    "Skipping price with no liquidity: game={} team={} bid={} ask={}",
-                    game_id, team, price.yes_bid, price.yes_ask
-                );
-                continue;
-            }
-
-            let mid = price
-                .mid_price
-                .or(price.implied_probability)
-                .unwrap_or((price.yes_bid + price.yes_ask) / 2.0);
-
-            let data = MarketPriceData {
-                market_id: price.market_id.clone(),
-                platform: price.platform.clone(),
-                contract_team: team.clone(),
-                yes_bid: price.yes_bid,
-                yes_ask: price.yes_ask,
-                mid_price: mid,
-                timestamp: Utc::now(),
-                yes_bid_size: price.yes_bid_size,
-                yes_ask_size: price.yes_ask_size,
-                total_liquidity: price.liquidity,
-            };
-
-            let mut prices = self.market_prices.write().await;
-            let game_prices = prices.entry(game_id.clone()).or_insert_with(HashMap::new);
-            // Store with team|platform key to support multiple platforms per team
-            let key = format!("{}|{}", team, price.platform.to_lowercase());
-            game_prices.insert(key, data);
-
-            // Track successful processing
-            self.price_stats.messages_processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Use shared price processing logic
+            self.process_incoming_price(price).await;
 
             // Periodically log stats for monitoring
             if last_stats_log.elapsed() >= stats_log_interval {
@@ -598,6 +635,192 @@ impl GameShard {
         }
 
         Ok(())
+    }
+
+    /// ZMQ-based price listener for low-latency price updates
+    async fn zmq_price_listener_loop(&self) -> Result<()> {
+        info!("Starting ZMQ price listener loop...");
+
+        // Create ZMQ SUB socket
+        let mut socket = SubSocket::new();
+
+        // Connect to all endpoints
+        for endpoint in &self.zmq_sub_endpoints {
+            match socket.connect(endpoint).await {
+                Ok(_) => info!("ZMQ connected to {}", endpoint),
+                Err(e) => {
+                    warn!("Failed to connect to ZMQ endpoint {}: {}", endpoint, e);
+                }
+            }
+        }
+
+        // Subscribe to price topics
+        socket.subscribe("prices.").await?;
+        info!("ZMQ subscribed to prices.*");
+
+        // Track last stats log time
+        let mut last_stats_log = Instant::now();
+        let stats_log_interval = Duration::from_secs(60);
+        let mut zmq_messages_received: u64 = 0;
+
+        loop {
+            // Receive with timeout
+            let recv_result = tokio::time::timeout(
+                Duration::from_secs(30),
+                socket.recv(),
+            ).await;
+
+            match recv_result {
+                Ok(Ok(msg)) => {
+                    zmq_messages_received += 1;
+
+                    // ZMQ multipart: [topic, payload]
+                    let parts: Vec<_> = msg.iter().collect();
+                    if parts.len() < 2 {
+                        continue;
+                    }
+
+                    let topic = String::from_utf8_lossy(parts[0].as_ref());
+                    let payload_bytes = parts[1].as_ref();
+
+                    // Parse envelope
+                    let envelope: ZmqEnvelope = match serde_json::from_slice(payload_bytes) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed);
+                            debug!("Failed to parse ZMQ price message: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Extract price data from payload
+                    let price: IncomingMarketPrice = match serde_json::from_value(envelope.payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed);
+                            debug!("Failed to parse ZMQ price payload: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Process the price (same logic as Redis path)
+                    self.process_incoming_price(price).await;
+
+                    // Log ZMQ latency periodically
+                    if zmq_messages_received % 1000 == 0 {
+                        let now_ms = Utc::now().timestamp_millis();
+                        let latency_ms = now_ms - envelope.timestamp_ms;
+                        debug!("ZMQ price #{}: latency={}ms topic={}", zmq_messages_received, latency_ms, topic);
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("ZMQ receive error: {}. Reconnecting...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Reconnect
+                    for endpoint in &self.zmq_sub_endpoints {
+                        let _ = socket.connect(endpoint).await;
+                    }
+                }
+                Err(_) => {
+                    // Timeout - normal for low-traffic periods
+                    debug!("No ZMQ price message in 30s");
+                }
+            }
+
+            // Periodic stats logging
+            if last_stats_log.elapsed() >= stats_log_interval {
+                info!(
+                    "ZMQ price listener: received={} messages",
+                    zmq_messages_received
+                );
+                last_stats_log = Instant::now();
+            }
+        }
+    }
+
+    /// Process an incoming price message (shared between Redis and ZMQ paths)
+    async fn process_incoming_price(&self, price: IncomingMarketPrice) {
+        self.price_stats.messages_received.fetch_add(1, Ordering::Relaxed);
+
+        let game_id = price.game_id.clone();
+
+        // Check if contract_team is present
+        let team = match &price.contract_team {
+            Some(t) => t,
+            None => {
+                self.price_stats.no_team_skipped.fetch_add(1, Ordering::Relaxed);
+                debug!("Skipping price message without contract_team: game={}", game_id);
+                return;
+            }
+        };
+
+        // Skip prices with no real liquidity
+        let has_liquidity = price.yes_bid > 0.01 || price.yes_ask < 0.99;
+        if !has_liquidity {
+            self.price_stats.no_liquidity_skipped.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "Skipping price with no liquidity: game={} team={} bid={} ask={}",
+                game_id, team, price.yes_bid, price.yes_ask
+            );
+            return;
+        }
+
+        let mid = price
+            .mid_price
+            .or(price.implied_probability)
+            .unwrap_or((price.yes_bid + price.yes_ask) / 2.0);
+
+        let data = MarketPriceData {
+            market_id: price.market_id.clone(),
+            platform: price.platform.clone(),
+            contract_team: team.clone(),
+            yes_bid: price.yes_bid,
+            yes_ask: price.yes_ask,
+            mid_price: mid,
+            timestamp: Utc::now(),
+            yes_bid_size: price.yes_bid_size,
+            yes_ask_size: price.yes_ask_size,
+            total_liquidity: price.liquidity,
+        };
+
+        let mut prices = self.market_prices.write().await;
+        let game_prices = prices.entry(game_id.clone()).or_insert_with(HashMap::new);
+        let key = format!("{}|{}", team, price.platform.to_lowercase());
+        game_prices.insert(key, data);
+
+        self.price_stats.messages_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publish a trading signal via ZMQ for low-latency consumers
+    async fn publish_signal_zmq(&self, signal: &TradingSignal) {
+        if let Some(ref zmq_pub) = self.zmq_pub {
+            let topic = format!("signals.trade.{}", signal.signal_id);
+            let seq = self.zmq_seq.fetch_add(1, Ordering::Relaxed);
+
+            let envelope = ZmqEnvelope {
+                seq,
+                timestamp_ms: Utc::now().timestamp_millis(),
+                source: Some("game_shard".to_string()),
+                payload: serde_json::to_value(signal).unwrap_or_default(),
+            };
+
+            let payload = match serde_json::to_vec(&envelope) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to serialize ZMQ signal envelope: {}", e);
+                    return;
+                }
+            };
+
+            let mut socket = zmq_pub.lock().await;
+            let mut msg = ZmqMessage::from(topic.as_bytes().to_vec());
+            msg.push_back(payload.into());
+            if let Err(e) = socket.send(msg).await {
+                warn!("Failed to publish signal via ZMQ: {}", e);
+            } else {
+                debug!("Published signal {} via ZMQ (seq={})", signal.signal_id, seq);
+            }
+        }
     }
 
     async fn heartbeat_loop(&self) -> Result<()> {
@@ -637,6 +860,8 @@ async fn monitor_game(
     market_prices: Arc<RwLock<HashMap<String, HashMap<String, MarketPriceData>>>>,
     min_edge_pct: f64,
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
+    zmq_pub: Option<Arc<Mutex<PubSocket>>>,
+    zmq_seq: Arc<AtomicU64>,
 ) {
     let sport_enum = match parse_sport(&sport) {
         Some(s) => s,
@@ -805,7 +1030,8 @@ async fn monitor_game(
                     if should_emit_arb {
                         if emit_arb_signal(
                             &redis, &game_id, sport_enum, &game.home_team,
-                            arb_mask, profit, home_kalshi.unwrap(), home_poly.unwrap()
+                            arb_mask, profit, home_kalshi.unwrap(), home_poly.unwrap(),
+                            &zmq_pub, &zmq_seq
                         ).await {
                             last_signal_times.insert(arb_key, Instant::now());
                         }
@@ -821,7 +1047,8 @@ async fn monitor_game(
                     if should_emit_arb {
                         if emit_arb_signal(
                             &redis, &game_id, sport_enum, &game.away_team,
-                            arb_mask, profit, away_kalshi.unwrap(), away_poly.unwrap()
+                            arb_mask, profit, away_kalshi.unwrap(), away_poly.unwrap(),
+                            &zmq_pub, &zmq_seq
                         ).await {
                             last_signal_times.insert(arb_key, Instant::now());
                         }
@@ -857,7 +1084,8 @@ async fn monitor_game(
                                 );
                                 if emit_latency_signal(
                                     &redis, &game_id, sport_enum, &game.home_team,
-                                    SignalDirection::Buy, price, platform, home_win_prob
+                                    SignalDirection::Buy, price, platform, home_win_prob,
+                                    &zmq_pub, &zmq_seq
                                 ).await {
                                     last_signal_times.insert(signal_key, Instant::now());
                                 }
@@ -882,7 +1110,8 @@ async fn monitor_game(
                                 );
                                 if emit_latency_signal(
                                     &redis, &game_id, sport_enum, &game.away_team,
-                                    SignalDirection::Buy, price, platform, 1.0 - home_win_prob
+                                    SignalDirection::Buy, price, platform, 1.0 - home_win_prob,
+                                    &zmq_pub, &zmq_seq
                                 ).await {
                                     last_signal_times.insert(signal_key, Instant::now());
                                 }
@@ -987,6 +1216,8 @@ async fn monitor_game(
                                 platform,
                                 old_p,
                                 min_edge_pct,
+                                &zmq_pub,
+                                &zmq_seq,
                             )
                             .await
                             {
@@ -1110,6 +1341,42 @@ fn find_team_price<'a>(
     select_best_price(kalshi, poly).map(|(p, _)| p)
 }
 
+/// Publish a signal via ZMQ for low-latency consumers
+async fn publish_signal_zmq_fn(
+    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
+    zmq_seq: &Arc<AtomicU64>,
+    signal: &TradingSignal,
+) {
+    if let Some(ref pub_socket) = zmq_pub {
+        let topic = format!("signals.trade.{}", signal.signal_id);
+        let seq = zmq_seq.fetch_add(1, Ordering::Relaxed);
+
+        let envelope = ZmqEnvelope {
+            seq,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            source: Some("game_shard".to_string()),
+            payload: serde_json::to_value(signal).unwrap_or_default(),
+        };
+
+        let payload = match serde_json::to_vec(&envelope) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to serialize ZMQ signal envelope: {}", e);
+                return;
+            }
+        };
+
+        let mut socket = pub_socket.lock().await;
+        let mut msg = ZmqMessage::from(topic.as_bytes().to_vec());
+        msg.push_back(payload.into());
+        if let Err(e) = socket.send(msg).await {
+            warn!("Failed to publish signal via ZMQ: {}", e);
+        } else {
+            debug!("Published signal {} via ZMQ (seq={})", signal.signal_id, seq);
+        }
+    }
+}
+
 /// Returns true if a signal was emitted, false otherwise
 async fn check_and_emit_signal(
     redis: &RedisBus,
@@ -1121,6 +1388,8 @@ async fn check_and_emit_signal(
     selected_platform: Platform,
     _old_prob: Option<f64>,
     min_edge_pct: f64,
+    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
+    zmq_seq: &Arc<AtomicU64>,
 ) -> bool {
     let (direction, signal_type, net_edge_pct, gross_edge_pct_abs, market_yes_mid) =
         compute_team_net_edge(model_prob, market_price, selected_platform);
@@ -1232,14 +1501,16 @@ async fn check_and_emit_signal(
         selected_platform
     );
 
-    // Publish signal
-    match redis.publish(channels::SIGNALS_NEW, &signal).await {
-        Ok(_) => true,
-        Err(e) => {
-            error!("Failed to publish signal: {}", e);
-            false
-        }
+    // Publish signal via ZMQ for low-latency consumers
+    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+
+    // Publish signal via Redis (for backward compatibility)
+    let redis_result = redis.publish(channels::SIGNALS_NEW, &signal).await;
+    if let Err(e) = &redis_result {
+        error!("Failed to publish signal via Redis: {}", e);
     }
+
+    redis_result.is_ok()
 }
 
 async fn fetch_game_state(
@@ -1441,6 +1712,8 @@ async fn emit_arb_signal(
     profit_cents: i16,
     kalshi_price: &MarketPriceData,
     poly_price: &MarketPriceData,
+    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
+    zmq_seq: &Arc<AtomicU64>,
 ) -> bool {
     let arb_types = decode_arb_mask(arb_mask);
     let arb_type_str = arb_types.first().unwrap_or(&"Unknown");
@@ -1491,10 +1764,14 @@ async fn emit_arb_signal(
         team, arb_type_str, profit_cents, buy_platform, sell_platform
     );
 
+    // Publish via ZMQ for low-latency consumers
+    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+
+    // Publish via Redis (backward compatibility)
     match redis.publish(channels::SIGNALS_NEW, &signal).await {
         Ok(_) => true,
         Err(e) => {
-            error!("Failed to publish arb signal: {}", e);
+            error!("Failed to publish arb signal via Redis: {}", e);
             false
         }
     }
@@ -1511,6 +1788,8 @@ async fn emit_latency_signal(
     market_price: &MarketPriceData,
     platform: Platform,
     model_prob: f64,
+    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
+    zmq_seq: &Arc<AtomicU64>,
 ) -> bool {
     // For a BUY signal, we expect the price to go UP after the score
     // Edge is the expected price movement (model prob - current market price)
@@ -1548,10 +1827,14 @@ async fn emit_latency_signal(
         play_id: None,
     };
 
+    // Publish via ZMQ for low-latency consumers
+    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+
+    // Publish via Redis (backward compatibility)
     match redis.publish(channels::SIGNALS_NEW, &signal).await {
         Ok(_) => true,
         Err(e) => {
-            error!("Failed to publish latency signal: {}", e);
+            error!("Failed to publish latency signal via Redis: {}", e);
             false
         }
     }

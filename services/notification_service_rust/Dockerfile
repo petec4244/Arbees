@@ -16,6 +16,7 @@ COPY services/execution_service_rust /build/services/execution_service_rust
 COPY services/signal_processor_rust /build/services/signal_processor_rust
 COPY services/position_tracker_rust /build/services/position_tracker_rust
 COPY services/notification_service_rust /build/services/notification_service_rust
+COPY services/zmq_listener_rust /build/services/zmq_listener_rust
 
 # Build release binary
 RUN cargo build --release --bin notification_service

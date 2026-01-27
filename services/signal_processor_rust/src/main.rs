@@ -912,6 +912,7 @@ impl SignalProcessorState {
             platform,
             market_id: market.market_id.clone(),
             contract_team: market.contract_team.clone(),
+            token_id: None, // Resolved by execution_service if needed
             side,
             limit_price,
             size,

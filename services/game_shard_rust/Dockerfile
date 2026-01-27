@@ -14,6 +14,7 @@ COPY services/execution_service_rust ./services/execution_service_rust
 COPY services/signal_processor_rust ./services/signal_processor_rust
 COPY services/position_tracker_rust ./services/position_tracker_rust
 COPY services/notification_service_rust ./services/notification_service_rust
+COPY services/zmq_listener_rust ./services/zmq_listener_rust
 
 # Build specific member
 # Limit parallel jobs to avoid memory exhaustion (use 2 jobs or number of CPUs, whichever is less)

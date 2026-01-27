@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     info!("Starting GameShard Rust Service...");
 
     let shard_id = env::var("SHARD_ID").unwrap_or_else(|_| "default_shard".to_string());
-    let shard = GameShard::new(shard_id).await?;
+    let mut shard = GameShard::new(shard_id).await?;
 
     shard.start().await?;
 

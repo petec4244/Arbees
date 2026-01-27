@@ -17,12 +17,12 @@ COPY services/notification_service_rust ./services/notification_service_rust
 COPY services/zmq_listener_rust ./services/zmq_listener_rust
 
 # Build specific member
-RUN cargo build --release --package execution_service_rust
+RUN cargo build --release --package zmq_listener_rust
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates libssl-dev && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/execution_service_rust /usr/local/bin/execution_service_rust
+COPY --from=builder /app/target/release/zmq_listener_rust /usr/local/bin/zmq_listener_rust
 
-CMD ["execution_service_rust"]
+CMD ["zmq_listener_rust"]

@@ -40,6 +40,32 @@ services:
       retries: 5
 
   # ==========================================================================
+  # ZMQ Listener (Rust) - Bridges ZMQ messages to Redis for backward compatibility
+  # ==========================================================================
+  # This service subscribes to ZMQ publishers (kalshi_monitor, polymarket_monitor,
+  # game_shard) and mirrors messages to Redis streams/pub-sub for services that
+  # don't use ZMQ directly.
+  # ==========================================================================
+  zmq_listener:
+    build:
+      context: .
+      dockerfile: services/zmq_listener_rust/Dockerfile
+    container_name: arbees-zmq-listener
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_KALSHI_ENDPOINT: "tcp://kalshi_monitor:5555"
+      ZMQ_POLYMARKET_ENDPOINT: "tcp://vpn:5556"
+      ZMQ_GAME_SHARD_ENDPOINT: "tcp://game_shard:5558"
+    restart: unless-stopped
+    profiles:
+      - full
+
+  # ==========================================================================
   # Notifications (Rust) - Signal via signal-cli-rest-api sidecar
   # ==========================================================================
   signal-cli-rest-api:
@@ -142,6 +168,13 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      # ZMQ configuration for low-latency messaging
+      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://polymarket_monitor:5556"
+      ZMQ_PUB_PORT: "5558"
+    expose:
+      - "5558"
     ports:
       - "8001:80"
     volumes:
@@ -210,6 +243,10 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      # ZMQ configuration for low-latency signal reception
+      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_SUB_ENDPOINT: "tcp://game_shard:5558"
     volumes:
       - ./:/app
     profiles:
@@ -380,6 +417,9 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    # Expose ZMQ port for polymarket_monitor (uses network_mode: service:vpn)
+    expose:
+      - "5556"
     env_file:
       - .env
     environment:
@@ -425,6 +465,11 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      # ZMQ configuration for low-latency price publishing
+      # Note: Since using network_mode: service:vpn, port 5556 is exposed via vpn container
+      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_PUB_PORT: "5556"
     volumes:
       # DEBUG MODE: write NDJSON instrumentation to the host workspace file
       - ./.cursor:/app/.cursor
@@ -445,6 +490,12 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      # ZMQ configuration for low-latency price publishing
+      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_PUB_PORT: "5555"
+    expose:
+      - "5555"
     restart: unless-stopped
     profiles:
       - full

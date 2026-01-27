@@ -25,3 +25,4 @@ env_logger = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
+zeromq = { workspace = true }

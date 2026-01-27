@@ -33,6 +33,15 @@ from arbees_shared.health.heartbeat import HeartbeatPublisher
 from arbees_shared.models.health import ServiceStatus
 from markets.polymarket.hybrid_client import HybridPolymarketClient
 
+# Optional ZMQ support for low-latency messaging
+try:
+    import zmq
+    import zmq.asyncio
+    ZMQ_AVAILABLE = True
+except ImportError:
+    ZMQ_AVAILABLE = False
+    logger.warning("pyzmq not installed - ZMQ publishing disabled")
+
 
 class PolymarketMonitor:
     """
@@ -76,6 +85,13 @@ class PolymarketMonitor:
         # Heartbeat publisher for health monitoring
         self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
+        # ZMQ publisher for low-latency messaging (hot path)
+        self._zmq_enabled = os.environ.get("ZMQ_ENABLED", "false").lower() in ("true", "1", "yes")
+        self._zmq_context: Optional["zmq.asyncio.Context"] = None
+        self._zmq_pub: Optional["zmq.asyncio.Socket"] = None
+        self._zmq_seq = 0
+        self._zmq_pub_port = int(os.environ.get("ZMQ_PUB_PORT", "5556"))
+
     # region agent log (helper)
     def _agent_dbg(self, hypothesisId: str, location: str, message: str, data: dict) -> None:
         """Write a single NDJSON debug line to the host-mounted .cursor/debug.log (DEBUG MODE ONLY)."""
@@ -112,6 +128,20 @@ class PolymarketMonitor:
         logger.info("Polymarket client connected")
 
         self._running = True
+
+        # Initialize ZMQ publisher if enabled
+        if self._zmq_enabled and ZMQ_AVAILABLE:
+            try:
+                self._zmq_context = zmq.asyncio.Context()
+                self._zmq_pub = self._zmq_context.socket(zmq.PUB)
+                self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
+                logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port}")
+            except Exception as e:
+                logger.error(f"Failed to initialize ZMQ: {e}")
+                self._zmq_enabled = False
+        elif self._zmq_enabled and not ZMQ_AVAILABLE:
+            logger.warning("ZMQ_ENABLED=true but pyzmq not installed")
+            self._zmq_enabled = False
 
         # Setup signal handlers
         loop = asyncio.get_event_loop()
@@ -153,6 +183,12 @@ class PolymarketMonitor:
         # Stop heartbeat publisher
         if self._heartbeat_publisher:
             await self._heartbeat_publisher.stop()
+
+        # Close ZMQ socket
+        if self._zmq_pub:
+            self._zmq_pub.close()
+        if self._zmq_context:
+            self._zmq_context.term()
 
         await self.poly_client.disconnect()
         await self.redis.disconnect()
@@ -450,11 +486,46 @@ class PolymarketMonitor:
         self._prices_published += 1
         self._last_price_time = datetime.utcnow()
 
+        # Publish to ZMQ for low-latency consumers (hot path)
+        if self._zmq_enabled and self._zmq_pub:
+            await self._publish_zmq_price(condition_id, game_id, normalized_price)
+
         logger.debug(
             f"Published Polymarket price: {condition_id[:12]}... team='{contract_team}' "
             f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
             f"game={game_id}"
         )
+
+    async def _publish_zmq_price(self, condition_id: str, game_id: str, price: MarketPrice):
+        """Publish price to ZMQ PUB socket for low-latency consumers."""
+        if not self._zmq_pub:
+            return
+
+        try:
+            topic = f"prices.poly.{condition_id}".encode()
+            envelope = {
+                "seq": self._zmq_seq,
+                "timestamp_ms": int(time.time() * 1000),
+                "source": "polymarket_monitor",
+                "payload": {
+                    "market_id": price.market_id,
+                    "platform": "polymarket",
+                    "game_id": game_id,
+                    "contract_team": price.contract_team,
+                    "yes_bid": price.yes_bid,
+                    "yes_ask": price.yes_ask,
+                    "mid_price": price.mid_price,
+                    "yes_bid_size": price.yes_bid_size,
+                    "yes_ask_size": price.yes_ask_size,
+                    "volume": price.volume,
+                    "liquidity": price.liquidity,
+                    "timestamp": price.timestamp.isoformat() if price.timestamp else None,
+                },
+            }
+            self._zmq_seq += 1
+            await self._zmq_pub.send_multipart([topic, json.dumps(envelope).encode()])
+        except Exception as e:
+            logger.warning(f"Failed to publish to ZMQ: {e}")
 
     async def _rest_poll_loop(self) -> None:
         """
