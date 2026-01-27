@@ -573,6 +573,14 @@ async fn monitor_game(
                 continue;
             }
 
+            // Skip signal generation if score is 0-0 (no real game information yet)
+            // At 0-0, our model only has home advantage - not team strength
+            // This leads to bad signals against favored away teams
+            if game.home_score == 0 && game.away_score == 0 {
+                debug!("SCORELESS: Skipping signals for {} (0-0)", game_id);
+                continue;
+            }
+
             // Get market prices for this game
             // FIX: Only emit ONE signal per game - the team with the strongest edge
             // This prevents betting on both teams to win the same game!
