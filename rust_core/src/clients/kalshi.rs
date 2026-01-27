@@ -10,7 +10,7 @@ use crate::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use log::{debug, info, warn};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::pss::{Signature, SigningKey};
 use rsa::sha2::Sha256;
@@ -18,12 +18,16 @@ use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::league_config::LEAGUE_CONFIGS;
 
 const KALSHI_API_PROD: &str = "https://api.elections.kalshi.com/trade-api/v2";
 const KALSHI_API_DEMO: &str = "https://demo-api.kalshi.co/trade-api/v2";
+
+/// Atomic counter for generating unique order IDs
+static ORDER_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Kalshi client with optional authentication for trading
 #[derive(Clone)]
@@ -73,6 +77,24 @@ pub struct KalshiOrder {
     pub created_time: Option<String>,
 }
 
+impl KalshiOrder {
+    /// Returns the number of contracts that were filled
+    pub fn filled_count(&self) -> i32 {
+        self.count - self.remaining_count.unwrap_or(0)
+    }
+
+    /// Returns true if the order was fully filled
+    pub fn is_filled(&self) -> bool {
+        self.remaining_count.unwrap_or(0) == 0
+    }
+
+    /// Returns true if the order was partially filled
+    pub fn is_partial(&self) -> bool {
+        let remaining = self.remaining_count.unwrap_or(0);
+        remaining > 0 && remaining < self.count
+    }
+}
+
 /// Order placement request
 #[derive(Debug, Clone, Serialize)]
 pub struct KalshiOrderRequest {
@@ -86,6 +108,10 @@ pub struct KalshiOrderRequest {
     pub yes_price: Option<i32>,  // Price in cents (for limit orders on yes side)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_price: Option<i32>,   // Price in cents (for limit orders on no side)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<String>,  // "immediate_or_cancel", "good_til_canceled", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,  // Unique client-assigned order ID
 }
 
 /// Order placement response
@@ -251,54 +277,83 @@ impl KalshiClient {
     }
 
     /// Make an authenticated request to Kalshi API
+    ///
+    /// Includes automatic retry with exponential backoff for rate limits (429)
     async fn authenticated_request(
         &self,
         method: &str,
         endpoint: &str,
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let api_key = self.api_key.as_ref()
-            .ok_or_else(|| anyhow!("No API key configured"))?;
+        const MAX_RETRIES: u32 = 5;
+        let mut retries = 0;
 
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        loop {
+            let api_key = self.api_key.as_ref()
+                .ok_or_else(|| anyhow!("No API key configured"))?;
 
-        // Path for signature includes the full API path
-        let full_path = format!("/trade-api/v2{}", endpoint);
-        let signature = self.generate_signature(timestamp_ms, method, &full_path)?;
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
 
-        let url = format!("{}{}", self.base_url, endpoint);
+            // Path for signature includes the full API path
+            let full_path = format!("/trade-api/v2{}", endpoint);
+            let signature = self.generate_signature(timestamp_ms, method, &full_path)?;
 
-        let mut request = match method {
-            "GET" => self.client.get(&url),
-            "POST" => self.client.post(&url),
-            "DELETE" => self.client.delete(&url),
-            _ => return Err(anyhow!("Unsupported HTTP method: {}", method)),
-        };
+            let url = format!("{}{}", self.base_url, endpoint);
 
-        request = request
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header("KALSHI-ACCESS-KEY", api_key)
-            .header("KALSHI-ACCESS-TIMESTAMP", timestamp_ms.to_string())
-            .header("KALSHI-ACCESS-SIGNATURE", signature);
+            let mut request = match method {
+                "GET" => self.client.get(&url),
+                "POST" => self.client.post(&url),
+                "DELETE" => self.client.delete(&url),
+                _ => return Err(anyhow!("Unsupported HTTP method: {}", method)),
+            };
 
-        if let Some(json_body) = body {
-            request = request.json(&json_body);
-        }
+            request = request
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("KALSHI-ACCESS-KEY", api_key)
+                .header("KALSHI-ACCESS-TIMESTAMP", timestamp_ms.to_string())
+                .header("KALSHI-ACCESS-SIGNATURE", signature);
 
-        let resp = request.send().await?;
+            if let Some(ref json_body) = body {
+                request = request.json(json_body);
+            }
 
-        if !resp.status().is_success() {
+            let resp = request.send().await?;
             let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow!("Kalshi API error ({}): {}", status, error_text));
-        }
 
-        let data: serde_json::Value = resp.json().await?;
-        Ok(data)
+            // Handle rate limiting separately from other errors
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                retries += 1;
+                if retries > MAX_RETRIES {
+                    return Err(anyhow!(
+                        "Kalshi API rate limited after {} retries",
+                        MAX_RETRIES
+                    ));
+                }
+
+                // Exponential backoff: 4s, 8s, 16s, 32s, 64s
+                let backoff_ms = 2000 * (1 << retries);
+                warn!(
+                    "Kalshi rate limit hit on {} {}, backing off {}ms (retry {}/{})",
+                    method, endpoint, backoff_ms, retries, MAX_RETRIES
+                );
+
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                continue; // Retry without affecting circuit breaker
+            }
+
+            // Other errors are treated as failures
+            if !status.is_success() {
+                let error_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                return Err(anyhow!("Kalshi API error ({}): {}", status, error_text));
+            }
+
+            let data: serde_json::Value = resp.json().await?;
+            return Ok(data);
+        }
     }
 
     // ==========================================================================
@@ -431,6 +486,8 @@ impl KalshiClient {
             count: quantity,
             yes_price: if side_lower == "yes" { Some(price_cents) } else { None },
             no_price: if side_lower == "no" { Some(price_cents) } else { None },
+            time_in_force: None,  // Regular order - can rest on book
+            client_order_id: None,  // No client ID for regular orders
         };
 
         info!(
@@ -447,6 +504,98 @@ impl KalshiClient {
             .context("Failed to parse order response")?;
 
         info!("Order placed successfully: {}", order_resp.order.order_id);
+
+        Ok(order_resp.order)
+    }
+
+    /// Generate a unique client order ID
+    ///
+    /// Format: "arb{timestamp}{counter}"
+    /// Example: "arb1706370000123"
+    fn generate_order_id() -> String {
+        let counter = ORDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        format!("arb{}{}", ts, counter)
+    }
+
+    /// Place an IOC (Immediate-or-Cancel) order
+    ///
+    /// IOC orders fill immediately or cancel - they never rest on the book.
+    /// This eliminates one-sided fill risk in arbitrage trading.
+    ///
+    /// # Arguments
+    /// * `ticker` - Market ticker (e.g., "KXNBAGAME-2024-01-15-MIA-v-BOS")
+    /// * `side` - "yes" or "no"
+    /// * `price` - Price in dollars (0.01 to 0.99)
+    /// * `quantity` - Number of contracts
+    ///
+    /// # Returns
+    /// * `Ok(KalshiOrder)` - The placed order (check `remaining_count` to see if fully filled)
+    /// * `Err` - If order placement fails
+    pub async fn place_ioc_order(
+        &self,
+        ticker: &str,
+        side: &str,
+        price: f64,
+        quantity: i32,
+    ) -> Result<KalshiOrder> {
+        if !self.has_credentials() {
+            return Err(anyhow!("Cannot place order: no credentials configured"));
+        }
+
+        let side_lower = side.to_lowercase();
+        if side_lower != "yes" && side_lower != "no" {
+            return Err(anyhow!("Invalid side '{}': must be 'yes' or 'no'", side));
+        }
+
+        // Convert price to cents (Kalshi uses integer cents)
+        let price_cents = (price * 100.0).round() as i32;
+        if price_cents < 1 || price_cents > 99 {
+            return Err(anyhow!("Invalid price {}: must be between 0.01 and 0.99", price));
+        }
+
+        let client_order_id = Self::generate_order_id();
+
+        // Build IOC order request
+        let order_req = KalshiOrderRequest {
+            ticker: ticker.to_string(),
+            action: "buy".to_string(),
+            side: side_lower.clone(),
+            order_type: "limit".to_string(),
+            count: quantity,
+            yes_price: if side_lower == "yes" { Some(price_cents) } else { None },
+            no_price: if side_lower == "no" { Some(price_cents) } else { None },
+            time_in_force: Some("immediate_or_cancel".to_string()),
+            client_order_id: Some(client_order_id.clone()),
+        };
+
+        info!(
+            "Placing IOC order ({}): {} {} x{} @ {}c on {}",
+            client_order_id,
+            order_req.action, order_req.side, order_req.count,
+            if side_lower == "yes" { price_cents } else { 100 - price_cents },
+            ticker
+        );
+
+        let body = serde_json::to_value(&order_req)?;
+        let resp = self.authenticated_request("POST", "/portfolio/orders", Some(body)).await?;
+
+        let order_resp: KalshiOrderResponse = serde_json::from_value(resp)
+            .context("Failed to parse order response")?;
+
+        let filled_count = order_resp.order.count -
+            order_resp.order.remaining_count.unwrap_or(0);
+
+        info!(
+            "IOC order {} placed: {} (filled: {}/{})",
+            client_order_id,
+            order_resp.order.order_id,
+            filled_count,
+            order_resp.order.count
+        );
 
         Ok(order_resp.order)
     }

@@ -291,35 +291,41 @@ impl ExecutionEngine {
         }
 
         info!(
-            "Placing Kalshi live order: {} {} x{} @ {:.2} on {}",
+            "Placing Kalshi IOC order: {} {} x{} @ {:.2} on {}",
             "buy", side_str, quantity, request.limit_price, request.market_id
         );
 
-        // Place the order
+        // Place IOC (Immediate-or-Cancel) order
+        // IOC orders fill immediately or cancel - they never rest on the book
+        // This eliminates one-sided fill risk in arbitrage trading
         match self
             .kalshi
-            .place_order(&request.market_id, side_str, request.limit_price, quantity)
+            .place_ioc_order(&request.market_id, side_str, request.limit_price, quantity)
             .await
         {
             Ok(order) => {
                 let executed_at = Utc::now();
                 let latency_ms = (executed_at - start_time).num_milliseconds() as f64;
 
-                // Determine fill status
-                let filled_qty = (order.count - order.remaining_count.unwrap_or(0)) as f64;
-                let status = if filled_qty >= quantity as f64 {
+                // For IOC orders, determine fill status
+                let filled_qty = order.filled_count() as f64;
+                let status = if order.is_filled() {
                     ExecutionStatus::Filled
-                } else if filled_qty > 0.0 {
+                } else if order.is_partial() {
+                    // IOC partial fills are rare but possible
+                    warn!("IOC order {} partially filled: {}/{}", order.order_id, filled_qty, quantity);
                     ExecutionStatus::Partial
                 } else {
-                    ExecutionStatus::Accepted // Order accepted but not yet filled
+                    // IOC order didn't fill at all - this is normal (no liquidity)
+                    info!("IOC order {} did not fill (no liquidity)", order.order_id);
+                    ExecutionStatus::Cancelled
                 };
 
                 // Calculate fees based on filled quantity
                 let fees = calculate_fee(Platform::Kalshi, request.limit_price, filled_qty);
 
                 info!(
-                    "Kalshi order {} status: {:?}, filled: {}/{}, fees: ${:.4}",
+                    "Kalshi IOC order {} status: {:?}, filled: {}/{}, fees: ${:.4}",
                     order.order_id, status, filled_qty, quantity, fees
                 );
 
