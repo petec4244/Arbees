@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to initialize TeamMatchingClient")?;
 
-    let kalshi_client = KalshiClient::new();
+    let kalshi_client = KalshiClient::new()?;
 
     // Managers
     let shard_manager = Arc::new(ShardManager::new(config.clone()));

@@ -192,3 +192,145 @@ jobs:
     - NAT Gateway: ~$32/mo (Use single NAT for dev/test to save costs)
     - Fargate: Pay per vCPU/GB usage.
     - RDS/Redis: Instance hourly rates.
+
+---
+
+## 9. Fargate Limitations for VPN (P3-3)
+
+### The Problem
+
+AWS Fargate does **NOT** support VPN containers because:
+
+1. **NET_ADMIN capability not allowed**: Fargate's security model prohibits the `NET_ADMIN` Linux capability required to create virtual network interfaces.
+
+2. **No /dev/net/tun access**: VPN software (OpenVPN, WireGuard) requires the TUN/TAP device, which is not exposed in Fargate.
+
+3. **No privileged containers**: Fargate doesn't support `--privileged` mode.
+
+**Impact**: The `polymarket_monitor` service cannot run through a VPN container (gluetun) on Fargate.
+
+### Alternatives
+
+| Option | Pros | Cons | Best For |
+|--------|------|------|----------|
+| **EC2 for VPN** | Full VPN support, same Docker pattern | Must manage EC2 instance | Production |
+| **EU Proxy** | All services on Fargate | Added latency, single point of failure | Dev/Test |
+| **EU Region Deploy** | No VPN needed, low Polymarket latency | Cross-region Redis complexity | High volume |
+
+### Recommended: Hybrid Approach
+
+Deploy most services on **Fargate** (us-east-1), but run **polymarket_monitor + gluetun VPN** on a small **EC2 instance** (eu-central-1):
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      us-east-1 (Fargate)                     │
+│  orchestrator, game_shard, signal_processor, execution,     │
+│  position_tracker, kalshi_monitor, api, frontend            │
+│                           │                                  │
+│                    Redis (ElastiCache)                       │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                     Cross-region
+                            │
+┌──────────────────────────────────────────────────────────────┐
+│                    eu-central-1 (EC2 t3.small)               │
+│  ┌─────────────┐    ┌─────────────────────────────┐         │
+│  │   gluetun   │───▶│    polymarket_monitor       │         │
+│  │    (VPN)    │    │  (network_mode: container)  │         │
+│  └─────────────┘    └─────────────────────────────┘         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### EC2 Task Definition for VPN
+
+```json
+{
+  "family": "arbees-polymarket-vpn",
+  "requiresCompatibilities": ["EC2"],
+  "networkMode": "bridge",
+  "containerDefinitions": [
+    {
+      "name": "vpn",
+      "image": "qmcgaw/gluetun:latest",
+      "essential": true,
+      "portMappings": [{"containerPort": 8888, "hostPort": 8888}],
+      "linuxParameters": {
+        "capabilities": {"add": ["NET_ADMIN"]},
+        "devices": [{"hostPath": "/dev/net/tun", "containerPath": "/dev/net/tun"}]
+      },
+      "environment": [
+        {"name": "VPN_SERVICE_PROVIDER", "value": "nordvpn"},
+        {"name": "SERVER_COUNTRIES", "value": "Netherlands,Germany,Belgium"}
+      ],
+      "secrets": [
+        {"name": "OPENVPN_USER", "valueFrom": "arn:aws:secretsmanager:..."},
+        {"name": "OPENVPN_PASSWORD", "valueFrom": "arn:aws:secretsmanager:..."}
+      ],
+      "healthCheck": {
+        "command": ["CMD", "wget", "-q", "--spider", "http://ipinfo.io/json"],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 5
+      }
+    },
+    {
+      "name": "polymarket_monitor",
+      "image": "${ECR_REGISTRY}/arbees-polymarket_monitor:latest",
+      "essential": true,
+      "links": ["vpn:vpn"],
+      "networkMode": "container:vpn",
+      "dependsOn": [{"containerName": "vpn", "condition": "HEALTHY"}],
+      "environment": [
+        {"name": "REDIS_URL", "value": "redis://arbees-redis.xxx.use1.cache.amazonaws.com:6379"}
+      ]
+    }
+  ]
+}
+```
+
+### Cost Impact
+
+| Component | Monthly Cost |
+|-----------|--------------|
+| Fargate services (6x 0.25vCPU/512MB) | ~$30 |
+| EC2 t3.small (eu-central-1) | ~$15 |
+| Cross-region data transfer | ~$5 |
+| **VPN overhead total** | **~$20** |
+
+### Monitoring VPN Health
+
+```bash
+# CloudWatch alarm for VPN container health
+aws cloudwatch put-metric-alarm \
+  --alarm-name arbees-vpn-health \
+  --metric-name CPUUtilization \
+  --namespace AWS/ECS \
+  --dimensions Name=ServiceName,Value=polymarket-vpn \
+  --statistic Average \
+  --period 60 \
+  --evaluation-periods 3 \
+  --threshold 0 \
+  --comparison-operator LessThanOrEqualToThreshold \
+  --treat-missing-data breaching \
+  --alarm-actions arn:aws:sns:us-east-1:xxx:arbees-alerts
+```
+
+### Failover Configuration
+
+The gluetun VPN container supports automatic server failover:
+
+```yaml
+# docker-compose.yml (for reference)
+vpn:
+  environment:
+    - SERVER_COUNTRIES=Netherlands,Germany,Belgium,France
+    - PUBLICIP_API=ipinfo.io
+    - PUBLICIP_PERIOD=60s
+  deploy:
+    restart_policy:
+      condition: any
+      delay: 10s
+      max_attempts: 10
+```
+
+This configuration is already in place in the local docker-compose.yml and should be replicated in the EC2 deployment.

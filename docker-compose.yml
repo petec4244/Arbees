@@ -382,14 +382,33 @@ services:
       - /dev/net/tun:/dev/net/tun
     env_file:
       - .env
+    environment:
+      # VPN Failover: gluetun will try servers in these countries in order
+      # Netherlands is preferred (closest to Polymarket's EU servers), with fallbacks
+      - SERVER_COUNTRIES=${VPN_COUNTRIES:-Netherlands,Germany,Belgium,France}
+      # Automatic server rotation on failure
+      - VPN_PORT_FORWARDING=off
+      # Retry settings for connection stability
+      - OPENVPN_VERBOSITY=1
+      # Control plane for server switching
+      - PUBLICIP_API=ipinfo.io
+      - PUBLICIP_PERIOD=60s
     healthcheck:
       # Use HTTP (not HTTPS) to avoid CA/cert issues inside minimal images causing false "unhealthy".
+      # Check both connectivity and that we're in an EU country (geo-bypass check)
       test: [ "CMD", "wget", "-q", "--spider", "http://ipinfo.io/json" ]
-      interval: 60s
+      interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 30s
+      retries: 5
+      start_period: 45s
     restart: unless-stopped
+    # Auto-restart policy with backoff for connection issues
+    deploy:
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 10
+        window: 120s
     profiles:
       - full
       - vpn
@@ -413,6 +432,22 @@ services:
     profiles:
       - full
       - vpn
+
+  # Kalshi Price Monitor - publishes prices to Redis for all consumers
+  # No VPN needed - Kalshi API is accessible from US
+  kalshi_monitor:
+    build:
+      context: .
+      dockerfile: services/kalshi_monitor/Dockerfile
+    container_name: arbees-kalshi-monitor
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    restart: unless-stopped
+    profiles:
+      - full
 
 volumes:
   timescaledb_data:

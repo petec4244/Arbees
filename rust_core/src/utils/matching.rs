@@ -1,6 +1,26 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use strsim::jaro_winkler;
+
+/// Type alias for the team aliases cache structure
+type AliasMap = HashMap<&'static str, Vec<&'static str>>;
+type SportAliasCache = HashMap<&'static str, AliasMap>;
+
+/// Global cache for team aliases, initialized once on first access
+static TEAM_ALIASES_CACHE: OnceLock<SportAliasCache> = OnceLock::new();
+
+/// Initialize the global team aliases cache with all sports
+fn init_team_aliases_cache() -> SportAliasCache {
+    let mut cache = HashMap::new();
+
+    // Pre-populate cache for all supported sports
+    for sport in &["nba", "nfl", "nhl", "mlb", "ncaab", "ncaaf", "soccer", "mma", "tennis"] {
+        cache.insert(*sport, build_team_aliases(sport));
+    }
+
+    cache
+}
 
 /// Match confidence level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -146,10 +166,35 @@ impl From<&MatchResult> for NameMatchSummary {
     }
 }
 
-/// Get team aliases for a sport. Returns a map from canonical name -> list of aliases.
+/// Get team aliases for a sport from the cached global map.
+/// Returns a reference to the cached map for the given sport.
+/// All names are lowercase.
+fn get_team_aliases(sport: &str) -> &'static AliasMap {
+    static EMPTY_MAP: OnceLock<AliasMap> = OnceLock::new();
+
+    let cache = TEAM_ALIASES_CACHE.get_or_init(init_team_aliases_cache);
+
+    // Normalize sport name for lookup
+    let sport_lower = sport.to_lowercase();
+    let sport_key = match sport_lower.as_str() {
+        "nba" => "nba",
+        "nfl" => "nfl",
+        "nhl" => "nhl",
+        "mlb" => "mlb",
+        "ncaab" | "ncaaf" => "ncaab", // Share college aliases
+        "soccer" | "mls" => "soccer",
+        "mma" | "ufc" => "mma",
+        "tennis" | "atp" | "wta" => "tennis",
+        _ => return EMPTY_MAP.get_or_init(HashMap::new),
+    };
+
+    cache.get(sport_key).unwrap_or_else(|| EMPTY_MAP.get_or_init(HashMap::new))
+}
+
+/// Build team aliases for a sport. Called once during cache initialization.
 /// All names should be lowercase.
-fn get_team_aliases(sport: &str) -> HashMap<&'static str, Vec<&'static str>> {
-    let mut map: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+fn build_team_aliases(sport: &str) -> AliasMap {
+    let mut map: AliasMap = HashMap::new();
 
     match sport {
         "nba" => {

@@ -3,6 +3,14 @@ name = "execution_service_rust"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "execution_service_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "execution_service_rust"
+path = "src/main.rs"
+
 [dependencies]
 arbees_rust_core = { path = "../../rust_core" }
 tokio = { workspace = true }

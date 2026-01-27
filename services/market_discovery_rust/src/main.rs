@@ -237,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let poly_client = PolymarketClient::new();
-    let kalshi_client = KalshiClient::new();
+    let kalshi_client = KalshiClient::new()?;
     let espn_client = EspnClient::new();
 
     // Optional: background polling cycle (can be disabled for lowest latency / least load)

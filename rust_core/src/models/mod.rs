@@ -273,6 +273,185 @@ impl TradingSignal {
         
         ((p * b - q) / b).max(0.0)
     }
+
+    /// Calculate signal confidence level based on edge and liquidity
+    pub fn confidence_level(&self) -> SignalConfidence {
+        let edge = self.edge_pct.abs();
+        let liquidity = self.liquidity_available;
+
+        // Very high: edge >= 20% AND good liquidity
+        if edge >= 20.0 && liquidity >= 500.0 {
+            return SignalConfidence::VeryHigh;
+        }
+        // High: edge >= 15% AND decent liquidity
+        if edge >= 15.0 && liquidity >= 200.0 {
+            return SignalConfidence::High;
+        }
+        // Medium: edge >= 10% OR moderate liquidity
+        if edge >= 10.0 && liquidity >= 50.0 {
+            return SignalConfidence::Medium;
+        }
+        // Low: everything else
+        SignalConfidence::Low
+    }
+}
+
+// ============================================================================
+// Signal Confidence Level
+// ============================================================================
+
+/// Confidence level for trading signals
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SignalConfidence {
+    VeryHigh,
+    High,
+    Medium,
+    Low,
+}
+
+impl SignalConfidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SignalConfidence::VeryHigh => "VERY_HIGH",
+            SignalConfidence::High => "HIGH",
+            SignalConfidence::Medium => "MEDIUM",
+            SignalConfidence::Low => "LOW",
+        }
+    }
+
+    /// Numeric rank for sorting/comparison (higher = more confident)
+    pub fn rank(&self) -> u8 {
+        match self {
+            SignalConfidence::VeryHigh => 4,
+            SignalConfidence::High => 3,
+            SignalConfidence::Medium => 2,
+            SignalConfidence::Low => 1,
+        }
+    }
+}
+
+// ============================================================================
+// Mean Reversion Signal (Analytics)
+// ============================================================================
+
+/// Tracks mean reversion opportunities based on price Z-scores
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeanReversionSignal {
+    /// Z-score of current price vs rolling mean
+    /// Positive = price above mean, negative = below
+    pub z_score: f64,
+    /// Price is significantly above mean (potential sell opportunity)
+    pub is_overbought: bool,
+    /// Price is significantly below mean (potential buy opportunity)
+    pub is_oversold: bool,
+    /// Rolling mean price used for comparison
+    pub mean_price: f64,
+    /// Standard deviation of prices in the window
+    pub std_dev: f64,
+    /// Suggested direction based on mean reversion theory
+    pub suggested_direction: SignalDirection,
+}
+
+impl MeanReversionSignal {
+    /// Create from price history
+    /// Returns None if not enough data for meaningful calculation
+    pub fn from_prices(prices: &[f64], current_price: f64, z_threshold: f64) -> Option<Self> {
+        if prices.len() < 5 {
+            return None;
+        }
+
+        let mean: f64 = prices.iter().sum::<f64>() / prices.len() as f64;
+        let variance: f64 = prices.iter()
+            .map(|p| (p - mean).powi(2))
+            .sum::<f64>() / prices.len() as f64;
+        let std_dev = variance.sqrt();
+
+        if std_dev < 0.001 {
+            return None; // Not enough variance
+        }
+
+        let z_score = (current_price - mean) / std_dev;
+        let is_overbought = z_score > z_threshold;
+        let is_oversold = z_score < -z_threshold;
+
+        let suggested_direction = if is_overbought {
+            SignalDirection::Sell
+        } else if is_oversold {
+            SignalDirection::Buy
+        } else {
+            SignalDirection::Hold
+        };
+
+        Some(Self {
+            z_score,
+            is_overbought,
+            is_oversold,
+            mean_price: mean,
+            std_dev,
+            suggested_direction,
+        })
+    }
+}
+
+// ============================================================================
+// Impact Analysis (Analytics)
+// ============================================================================
+
+/// Analyzes the impact of a play/event on win probability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactAnalysis {
+    /// Probability change caused by the event (positive = good for team)
+    pub prob_change: f64,
+    /// Whether this change is statistically significant
+    pub is_significant: bool,
+    /// Edge vs market at time of analysis
+    pub market_edge: f64,
+    /// The event/play that caused the change
+    pub trigger_event: Option<String>,
+    /// Time of the event
+    pub event_time: Option<DateTime<Utc>>,
+    /// Whether market has caught up (edge diminished)
+    pub market_adjusted: bool,
+}
+
+impl ImpactAnalysis {
+    /// Determine if a probability change is significant
+    /// Based on sport-specific volatility expectations
+    pub fn is_change_significant(prob_change: f64, sport: &Sport) -> bool {
+        let threshold = match sport {
+            Sport::NBA | Sport::NCAAB => 0.03,  // 3% for high-scoring
+            Sport::NFL | Sport::NCAAF => 0.05,  // 5% for football
+            Sport::NHL => 0.07,                  // 7% for hockey
+            Sport::MLB => 0.05,                  // 5% for baseball
+            Sport::MLS | Sport::Soccer => 0.07, // 7% for soccer
+            Sport::Tennis => 0.04,               // 4% for tennis
+            Sport::MMA => 0.10,                  // 10% for MMA
+        };
+        prob_change.abs() >= threshold
+    }
+
+    /// Create from before/after probabilities
+    pub fn from_prob_change(
+        prob_before: f64,
+        prob_after: f64,
+        market_prob: f64,
+        sport: &Sport,
+        trigger: Option<String>,
+    ) -> Self {
+        let prob_change = prob_after - prob_before;
+        let is_significant = Self::is_change_significant(prob_change, sport);
+        let market_edge = prob_after - market_prob;
+
+        Self {
+            prob_change,
+            is_significant,
+            market_edge,
+            trigger_event: trigger,
+            event_time: Some(Utc::now()),
+            market_adjusted: market_edge.abs() < 0.02, // Within 2% = adjusted
+        }
+    }
 }
 
 // ============================================================================
@@ -424,16 +603,54 @@ impl PaperTrade {
         }
     }
 
+    /// Calculate P&L with proper rounding to avoid floating-point precision errors.
+    ///
+    /// P0-1 Fix: Uses integer arithmetic (cents) internally, then converts back to dollars.
+    /// This prevents accumulated rounding errors when summing P&L across many trades.
     pub fn pnl(&self) -> Option<f64> {
         if self.exit_price.is_none() || self.status != TradeStatus::Closed {
             return None;
         }
         let exit = self.exit_price.unwrap();
-        let gross_pnl = match self.side {
-            TradeSide::Buy => self.size * (exit - self.entry_price),
-            TradeSide::Sell => self.size * (self.entry_price - exit),
+
+        // Convert to cents for precision
+        let size_cents = (self.size * 100.0).round() as i64;
+        let entry_fee_cents = (self.entry_fees * 100.0).round() as i64;
+        let exit_fee_cents = (self.exit_fees * 100.0).round() as i64;
+
+        // Calculate gross P&L in cents
+        // Price difference * size gives P&L (prices are probabilities 0-1)
+        let price_diff = match self.side {
+            TradeSide::Buy => exit - self.entry_price,
+            TradeSide::Sell => self.entry_price - exit,
         };
-        Some(gross_pnl - self.entry_fees - self.exit_fees)
+        let gross_pnl_cents = (price_diff * size_cents as f64).round() as i64;
+
+        // Net P&L in cents
+        let net_pnl_cents = gross_pnl_cents - entry_fee_cents - exit_fee_cents;
+
+        // Convert back to dollars
+        Some(net_pnl_cents as f64 / 100.0)
+    }
+
+    /// Calculate holding time in seconds
+    /// Returns None if trade is still open
+    pub fn holding_time_seconds(&self) -> Option<i64> {
+        self.exit_time.map(|exit| (exit - self.entry_time).num_seconds())
+    }
+
+    /// Calculate holding time as a human-readable duration string
+    /// Returns None if trade is still open
+    pub fn holding_time_display(&self) -> Option<String> {
+        self.holding_time_seconds().map(|secs| {
+            if secs < 60 {
+                format!("{}s", secs)
+            } else if secs < 3600 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+            }
+        })
     }
 }
 

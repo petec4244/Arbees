@@ -60,7 +60,7 @@ impl ExecutionEngine {
             }
             Err(e) => {
                 warn!("Failed to initialize Kalshi client from env: {}. Using read-only client.", e);
-                KalshiClient::new()
+                KalshiClient::new().expect("Failed to create Kalshi client")
             }
         };
 

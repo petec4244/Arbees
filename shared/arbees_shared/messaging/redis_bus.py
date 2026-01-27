@@ -1,6 +1,7 @@
 """Type-safe Redis pub/sub messaging bus with msgpack serialization."""
 
 import asyncio
+import logging
 import os
 from datetime import datetime
 from enum import Enum
@@ -9,6 +10,8 @@ from typing import Any, Callable, Coroutine, Generic, Optional, TypeVar
 import msgpack
 import redis.asyncio as redis
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from arbees_shared.models.game import GameState, Play
 from arbees_shared.models.market import MarketPrice
@@ -283,7 +286,7 @@ class RedisBus:
                         try:
                             await callback(channel, payload)
                         except Exception as e:
-                            print(f"Callback error: {e}")
+                            logger.error("Pattern subscription callback error on %s", pattern, exc_info=True)
 
                 # Handle regular subscriptions
                 elif msg_type == "message" and channel in self._subscriptions:
@@ -291,12 +294,12 @@ class RedisBus:
                         try:
                             await callback(payload)
                         except Exception as e:
-                            print(f"Callback error: {e}")
+                            logger.error("Subscription callback error on %s", channel, exc_info=True)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Listener error: {e}")
+                logger.error("Redis listener error", exc_info=True)
                 await asyncio.sleep(1)
 
     # ==========================================================================
@@ -433,7 +436,7 @@ class TypedSubscriber(Generic[T]):
                 for cb in self._callbacks:
                     await cb(model)
             except Exception as e:
-                print(f"Typed subscriber error: {e}")
+                logger.error("Typed subscriber error for %s", self.model_class.__name__, exc_info=True)
 
         await self.bus.subscribe(self.channel, wrapper)
 

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::league_config::LEAGUE_CONFIGS;
 
 const KALSHI_API_PROD: &str = "https://api.elections.kalshi.com/trade-api/v2";
 const KALSHI_API_DEMO: &str = "https://demo-api.kalshi.co/trade-api/v2";
@@ -107,23 +108,30 @@ impl KalshiClient {
     }
 
     /// Create a new client without authentication (read-only operations)
-    pub fn new() -> Self {
+    ///
+    /// Returns Result to allow proper error handling if HTTP client creation fails.
+    /// P1-1 Fix: Removed unsafe unwrap pattern.
+    pub fn new() -> Result<Self> {
         let base_url = env::var("KALSHI_BASE_URL")
             .unwrap_or_else(|_| KALSHI_API_PROD.to_string());
 
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("Failed to create HTTP client for Kalshi")?;
+
+        Ok(Self {
+            client,
             base_url,
             api_key: None,
             private_key: None,
             circuit_breaker: Self::create_circuit_breaker(),
-        }
+        })
     }
 
     /// Create a new client with authentication for trading
+    ///
+    /// P1-1 Fix: Proper error handling for HTTP client creation.
     pub fn with_credentials(api_key: String, private_key_pem: &str) -> Result<Self> {
         let base_url = env::var("KALSHI_BASE_URL")
             .unwrap_or_else(|_| KALSHI_API_PROD.to_string());
@@ -131,14 +139,17 @@ impl KalshiClient {
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_key_pem)
             .context("Failed to parse Kalshi private key PEM")?;
 
-        info!("Kalshi client initialized with credentials (API key: {}...)",
-              &api_key[..api_key.len().min(8)]);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("Failed to create HTTP client for Kalshi")?;
+
+        // Redact API key in logs - show only last 4 chars for identification
+        let key_suffix = if api_key.len() > 4 { &api_key[api_key.len()-4..] } else { &api_key };
+        info!("Kalshi client initialized with credentials (API key: ...{})", key_suffix);
 
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client,
             base_url,
             api_key: Some(api_key),
             private_key: Some(Arc::new(private_key)),
@@ -177,6 +188,11 @@ impl KalshiClient {
             None
         };
 
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("Failed to create HTTP client for Kalshi")?;
+
         if api_key.is_some() && private_key.is_some() {
             info!("Kalshi client initialized with credentials from environment");
         } else {
@@ -184,10 +200,7 @@ impl KalshiClient {
         }
 
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client,
             base_url,
             api_key,
             private_key: private_key.map(Arc::new),
@@ -324,7 +337,18 @@ impl KalshiClient {
 
         let series_ticker;
         if let Some(s) = sport {
-            series_ticker = s.to_uppercase();
+            if let Some(cfg) = LEAGUE_CONFIGS
+                .iter()
+                .find(|cfg| cfg.league_code.eq_ignore_ascii_case(s))
+            {
+                series_ticker = cfg.kalshi_series_game.to_string();
+            } else {
+                warn!(
+                    "Unknown Kalshi series for sport '{}', using uppercase fallback",
+                    s
+                );
+                series_ticker = s.to_uppercase();
+            }
             params.push(("series_ticker", &series_ticker));
         }
 
@@ -474,7 +498,7 @@ impl KalshiClient {
 
 impl Default for KalshiClient {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("Failed to create default KalshiClient")
     }
 }
 
@@ -484,7 +508,7 @@ mod tests {
 
     #[test]
     fn test_client_creation() {
-        let client = KalshiClient::new();
+        let client = KalshiClient::new().expect("Failed to create client");
         assert!(!client.has_credentials());
     }
 

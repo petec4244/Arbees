@@ -5,6 +5,58 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Allowed ESPN sport values (prevent path traversal/injection)
+const ALLOWED_SPORTS: &[&str] = &[
+    "football", "basketball", "hockey", "baseball", "soccer", "tennis", "mma",
+];
+
+/// Allowed ESPN league values (prevent path traversal/injection)
+const ALLOWED_LEAGUES: &[&str] = &[
+    "nfl", "nba", "nhl", "mlb", "mls",
+    "college-football", "mens-college-basketball", "womens-college-basketball",
+    "eng.1", "usa.1", "ger.1", "esp.1", "ita.1", "fra.1", // Soccer leagues
+    "atp", "wta", // Tennis
+    "ufc", // MMA
+];
+
+/// Validates that a string contains only alphanumeric characters, hyphens, and periods.
+/// Returns true if valid, false if contains potentially dangerous characters.
+fn is_safe_path_segment(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+}
+
+/// Validates sport parameter against allowed values
+fn validate_sport(sport: &str) -> Result<()> {
+    let sport_lower = sport.to_lowercase();
+    if !is_safe_path_segment(&sport_lower) {
+        return Err(anyhow!("Invalid sport parameter: contains disallowed characters"));
+    }
+    if !ALLOWED_SPORTS.contains(&sport_lower.as_str()) {
+        return Err(anyhow!(
+            "Invalid sport '{}'. Allowed: {:?}",
+            sport,
+            ALLOWED_SPORTS
+        ));
+    }
+    Ok(())
+}
+
+/// Validates league parameter against allowed values
+fn validate_league(league: &str) -> Result<()> {
+    let league_lower = league.to_lowercase();
+    if !is_safe_path_segment(&league_lower) {
+        return Err(anyhow!("Invalid league parameter: contains disallowed characters"));
+    }
+    if !ALLOWED_LEAGUES.contains(&league_lower.as_str()) {
+        return Err(anyhow!(
+            "Invalid league '{}'. Allowed: {:?}",
+            league,
+            ALLOWED_LEAGUES
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct EspnClient {
     client: Client,
@@ -88,6 +140,10 @@ impl EspnClient {
     }
 
     pub async fn get_games(&self, sport: &str, league: &str) -> Result<Vec<Game>> {
+        // Validate inputs to prevent path traversal/injection
+        validate_sport(sport)?;
+        validate_league(league)?;
+
         // Check circuit breaker before making request
         if !self.circuit_breaker.is_available() {
             return Err(anyhow!(
@@ -99,7 +155,7 @@ impl EspnClient {
 
         let url = format!(
             "http://site.api.espn.com/apis/site/v2/sports/{}/{}/scoreboard",
-            sport, league
+            sport.to_lowercase(), league.to_lowercase()
         );
 
         let result = self.fetch_games_internal(&url).await;
