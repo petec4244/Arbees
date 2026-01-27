@@ -44,6 +44,9 @@ struct Config {
     exit_team_match_min_confidence: f64,
     /// Percentage of profits to save in piggybank (0.0 to 1.0)
     piggybank_pct: f64,
+    /// Slippage buffer percentage for exit prices (0.5% default)
+    /// Accounts for market impact and execution slippage
+    slippage_buffer_pct: f64,
 }
 
 impl Default for Config {
@@ -87,6 +90,12 @@ impl Default for Config {
             // Piggybank: percentage of profits to save (0.0 to 1.0)
             // Default: 0.5 = 50% of profits go to protected savings
             piggybank_pct: env::var("PIGGYBANK_PCT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5),
+            // Slippage buffer for exit prices - accounts for market impact
+            // Default: 0.5% buffer to ensure realistic exit assumptions
+            slippage_buffer_pct: env::var("EXIT_SLIPPAGE_BUFFER_PCT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.5),
@@ -928,9 +937,13 @@ impl PositionTrackerState {
 
             // Calculate mark price (mid for P&L, bid/ask for execution)
             let mark_price = (price.yes_bid + price.yes_ask) / 2.0;
+
+            // Apply slippage buffer to execution price for realistic exit assumptions
+            // This accounts for market impact and execution slippage
+            let slippage = self.config.slippage_buffer_pct / 100.0;
             let exec_price = match position.side {
-                TradeSide::Buy => price.yes_bid,  // Sell at bid
-                TradeSide::Sell => price.yes_ask, // Cover at ask
+                TradeSide::Buy => price.yes_bid * (1.0 - slippage),   // Worse sell price
+                TradeSide::Sell => price.yes_ask * (1.0 + slippage), // Worse cover price
             };
 
             // Evaluate exit
@@ -1226,6 +1239,13 @@ async fn heartbeat_loop(
         );
         metrics.insert("current_balance".to_string(), state.current_balance);
         metrics.insert("piggybank_balance".to_string(), state.piggybank_balance);
+
+        // Connection pool metrics for monitoring
+        let pool_size = state.pool.size() as f64;
+        let pool_idle = state.pool.num_idle() as f64;
+        metrics.insert("db_pool_size".to_string(), pool_size);
+        metrics.insert("db_pool_idle".to_string(), pool_idle);
+        metrics.insert("db_pool_active".to_string(), pool_size - pool_idle);
 
         let heartbeat = Heartbeat {
             service: "position_tracker_rust".to_string(),

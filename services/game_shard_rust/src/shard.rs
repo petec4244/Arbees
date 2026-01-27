@@ -1,8 +1,10 @@
 use anyhow::Result;
 use arbees_rust_core::atomic_orderbook::kalshi_fee_cents;
+use arbees_rust_core::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
-    channels, GameState, Platform, SignalDirection, SignalType, Sport, TradingSignal,
+    channels, FootballState, GameState, Platform, SignalDirection, SignalType, Sport,
+    SportSpecificState, TradingSignal,
 };
 use arbees_rust_core::redis::bus::RedisBus;
 use arbees_rust_core::simd::{check_arbs_simd, calculate_profit_cents, decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
@@ -140,6 +142,8 @@ pub struct GameShard {
     min_edge_pct: f64,
     /// Statistics for monitoring price message processing
     price_stats: Arc<PriceListenerStats>,
+    /// Circuit breaker for ESPN API calls
+    espn_circuit_breaker: Arc<ApiCircuitBreaker>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +245,29 @@ impl GameShard {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(DEFAULT_MIN_EDGE_PCT);
 
+        // ESPN API circuit breaker configuration
+        let espn_circuit_breaker = Arc::new(ApiCircuitBreaker::new(
+            "espn_api",
+            ApiCircuitBreakerConfig {
+                failure_threshold: env::var("ESPN_CB_FAILURE_THRESHOLD")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5),
+                recovery_timeout: std::time::Duration::from_secs(
+                    env::var("ESPN_CB_RECOVERY_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30),
+                ),
+                success_threshold: 2,
+            },
+        ));
+        info!(
+            "ESPN circuit breaker configured: failure_threshold={}, recovery_timeout={}s",
+            espn_circuit_breaker.failure_count(),
+            30 // Can't easily get config back, log default
+        );
+
         Ok(Self {
             shard_id,
             redis,
@@ -253,6 +280,7 @@ impl GameShard {
             max_games,
             min_edge_pct,
             price_stats: Arc::new(PriceListenerStats::default()),
+            espn_circuit_breaker,
         })
     }
 
@@ -321,6 +349,7 @@ impl GameShard {
         let poll_interval = self.poll_interval;
         let market_prices = self.market_prices.clone();
         let min_edge = self.min_edge_pct;
+        let espn_cb = self.espn_circuit_breaker.clone();
         let gid = game_id.clone();
         let sp = sport.clone();
 
@@ -335,6 +364,7 @@ impl GameShard {
                 last_prob_clone,
                 market_prices,
                 min_edge,
+                espn_cb,
             )
             .await;
         });
@@ -606,6 +636,7 @@ async fn monitor_game(
     last_home_win_prob: Arc<RwLock<Option<f64>>>,
     market_prices: Arc<RwLock<HashMap<String, HashMap<String, MarketPriceData>>>>,
     min_edge_pct: f64,
+    espn_circuit_breaker: Arc<ApiCircuitBreaker>,
 ) {
     let sport_enum = match parse_sport(&sport) {
         Some(s) => s,
@@ -633,8 +664,8 @@ async fn monitor_game(
     let mut prev_away_score: Option<u16> = None;
 
     loop {
-        // Fetch game state from ESPN
-        if let Some((game, state)) = fetch_game_state(&espn, &game_id, &sport).await {
+        // Fetch game state from ESPN (with circuit breaker protection)
+        if let Some((game, state)) = fetch_game_state(&espn, &game_id, &sport, &espn_circuit_breaker).await {
             // Calculate win probability
             let home_win_prob = calculate_win_probability(&state, true);
 
@@ -1106,7 +1137,7 @@ async fn check_and_emit_signal(
             market_price
                 .yes_ask_size
                 .or(market_price.total_liquidity)
-                .unwrap_or(10000.0),
+                .unwrap_or(100.0),
         ),
         SignalDirection::Sell => {
             let no_ask = (1.0 - market_price.yes_bid).clamp(0.0, 1.0);
@@ -1117,7 +1148,7 @@ async fn check_and_emit_signal(
                 market_price
                     .yes_bid_size
                     .or(market_price.total_liquidity)
-                    .unwrap_or(10000.0),
+                    .unwrap_or(100.0),
             )
         }
         SignalDirection::Hold => (market_price.mid_price, market_price.mid_price, 0.0),
@@ -1150,7 +1181,8 @@ async fn check_and_emit_signal(
             selected_platform
         ),
         created_at: Utc::now(),
-        expires_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+        // Increased from 30s to 60s for better signal processing time
+        expires_at: Some(Utc::now() + chrono::Duration::seconds(60)),
         play_id: None,
     };
 
@@ -1185,13 +1217,31 @@ async fn fetch_game_state(
     espn: &EspnClient,
     game_id: &str,
     sport: &str,
+    espn_circuit_breaker: &ApiCircuitBreaker,
 ) -> Option<(EspnGame, GameState)> {
     let (espn_sport, espn_league) = espn_sport_league(sport)?;
 
+    // Check circuit breaker before making ESPN API call
+    if !espn_circuit_breaker.is_available() {
+        debug!(
+            "ESPN circuit breaker OPEN - skipping fetch for game {}",
+            game_id
+        );
+        return None;
+    }
+
     let games = match espn.get_games(espn_sport, espn_league).await {
-        Ok(g) => g,
+        Ok(g) => {
+            espn_circuit_breaker.record_success();
+            g
+        }
         Err(e) => {
-            warn!("ESPN fetch error: {}", e);
+            espn_circuit_breaker.record_failure();
+            warn!(
+                "ESPN fetch error (failures: {}): {}",
+                espn_circuit_breaker.failure_count(),
+                e
+            );
             return None;
         }
     };
@@ -1199,6 +1249,23 @@ async fn fetch_game_state(
     let game = games.into_iter().find(|g| g.id == game_id)?;
 
     let sport_enum = parse_sport(sport)?;
+
+    // Build sport-specific state based on sport type
+    let sport_specific = match sport_enum {
+        Sport::NFL | Sport::NCAAF => SportSpecificState::Football(FootballState {
+            down: game.down,
+            yards_to_go: game.yards_to_go,
+            yard_line: game.yard_line,
+            is_redzone: game.is_redzone,
+            timeouts_home: 3, // Default to full timeouts (ESPN doesn't always provide)
+            timeouts_away: 3,
+        }),
+        Sport::NBA | Sport::NCAAB => SportSpecificState::Basketball(Default::default()),
+        Sport::NHL => SportSpecificState::Hockey(Default::default()),
+        Sport::MLB => SportSpecificState::Baseball(Default::default()),
+        Sport::MLS | Sport::Soccer => SportSpecificState::Soccer(Default::default()),
+        Sport::Tennis | Sport::MMA => SportSpecificState::Other,
+    };
 
     let state = GameState {
         game_id: game.id.clone(),
@@ -1210,10 +1277,8 @@ async fn fetch_game_state(
         period: game.period,
         time_remaining_seconds: game.time_remaining_seconds,
         possession: game.possession.clone(),
-        down: game.down,
-        yards_to_go: game.yards_to_go,
-        yard_line: game.yard_line,
-        is_redzone: game.is_redzone,
+        pregame_home_prob: None,
+        sport_specific,
     };
 
     Some((game, state))
@@ -1441,7 +1506,7 @@ async fn emit_latency_signal(
         platform_sell: None,
         buy_price: Some(current_price),
         sell_price: None,
-        liquidity_available: market_price.yes_ask_size.or(market_price.total_liquidity).unwrap_or(10000.0),
+        liquidity_available: market_price.yes_ask_size.or(market_price.total_liquidity).unwrap_or(100.0),
         reason: format!(
             "LATENCY: Score detected! Current={:.1}% → Expected={:.1}% (move={:.1}%)",
             current_price * 100.0,

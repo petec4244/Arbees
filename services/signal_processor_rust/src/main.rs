@@ -58,6 +58,10 @@ struct Config {
     team_match_min_confidence: f64,
     /// Price staleness TTL in seconds - prices older than this are ignored
     price_staleness_secs: f64,
+    /// Minimum liquidity threshold to trade ($10 default)
+    liquidity_min_threshold: f64,
+    /// Maximum percentage of available liquidity to use (80% default)
+    liquidity_max_position_pct: f64,
 }
 
 impl Default for Config {
@@ -129,6 +133,17 @@ impl Default for Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30.0),
+            // Minimum liquidity threshold - don't trade if less than this available ($10 default)
+            liquidity_min_threshold: env::var("LIQUIDITY_MIN_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10.0),
+            // Maximum percentage of available liquidity to use (80% default)
+            // This prevents taking the entire book and ensures we can exit
+            liquidity_max_position_pct: env::var("LIQUIDITY_MAX_POSITION_PCT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(80.0),
         }
     }
 }
@@ -226,8 +241,9 @@ struct SignalProcessorState {
     approved_count: u64,
     rejected_counts: HashMap<String, u64>,
 
-    // Cooldown tracking: game_id -> (last_trade_time, was_win)
-    game_cooldowns: HashMap<String, (DateTime<Utc>, bool)>,
+    // Cooldown tracking: "game_id:team" -> (last_trade_time, was_win)
+    // Team-specific cooldowns allow trading the OTHER team in a game while one team is in cooldown
+    team_cooldowns: HashMap<String, (DateTime<Utc>, bool)>,
 
     // In-flight dedupe: idempotency_key -> timestamp
     in_flight: HashMap<String, DateTime<Utc>>,
@@ -259,7 +275,7 @@ impl SignalProcessorState {
             signal_count: 0,
             approved_count: 0,
             rejected_counts,
-            game_cooldowns: HashMap::new(),
+            team_cooldowns: HashMap::new(),
             in_flight: HashMap::new(),
             rules: Vec::new(),
             rules_last_updated: None,
@@ -620,8 +636,11 @@ impl SignalProcessorState {
         RuleDecision::default()
     }
 
-    fn is_game_in_cooldown(&self, game_id: &str) -> (bool, Option<String>) {
-        if let Some((last_trade_time, was_win)) = self.game_cooldowns.get(game_id) {
+    /// Check if a specific team is in cooldown for a game.
+    /// Team-specific cooldowns allow trading the OTHER team in a game while one team is in cooldown.
+    fn is_team_in_cooldown(&self, game_id: &str, team: &str) -> (bool, Option<String>) {
+        let cooldown_key = format!("{}:{}", game_id, team);
+        if let Some((last_trade_time, was_win)) = self.team_cooldowns.get(&cooldown_key) {
             let elapsed = (Utc::now() - *last_trade_time).num_seconds() as f64;
             let cooldown = if *was_win {
                 self.config.win_cooldown_seconds
@@ -635,13 +654,19 @@ impl SignalProcessorState {
                 return (
                     true,
                     Some(format!(
-                        "{} cooldown ({:.0}s remaining)",
-                        cooldown_type, remaining
+                        "{} {} cooldown ({:.0}s remaining)",
+                        team, cooldown_type, remaining
                     )),
                 );
             }
         }
         (false, None)
+    }
+
+    /// Record a trade cooldown for a specific team in a game.
+    fn record_team_cooldown(&mut self, game_id: &str, team: &str, was_win: bool) {
+        let cooldown_key = format!("{}:{}", game_id, team);
+        self.team_cooldowns.insert(cooldown_key, (Utc::now(), was_win));
     }
 
     async fn get_open_position_for_game(&self, game_id: &str) -> Result<Option<OpenPositionRow>> {
@@ -795,11 +820,57 @@ impl SignalProcessorState {
         // Use current balance from database, not initial_bankroll
         let current_balance = self.get_available_balance().await?;
 
+        // Estimate round-trip fees (entry + exit) and reserve balance for them
+        // Kalshi: ~0.7% entry + ~0.7% exit = 1.4% round-trip
+        // Polymarket: ~2% entry + ~2% exit = 4% round-trip
+        let fee_rate = match signal.platform_buy.unwrap_or(Platform::Kalshi) {
+            Platform::Kalshi | Platform::Paper => 0.014, // ~1.4% round-trip
+            Platform::Polymarket => 0.04,                // ~4% round-trip
+        };
+        let available_after_fees = current_balance / (1.0 + fee_rate);
+
         let kelly = signal.kelly_fraction();
         let fractional_kelly = kelly * self.config.kelly_fraction;
         let position_pct = (fractional_kelly * 100.0).min(self.config.max_position_pct);
-        let position_size = current_balance * (position_pct / 100.0);
+        let position_size = available_after_fees * (position_pct / 100.0);
         Ok(position_size.max(1.0))
+    }
+
+    /// Validate that proposed position size doesn't exceed available liquidity.
+    /// Returns the validated (possibly reduced) position size, or an error if insufficient liquidity.
+    fn validate_liquidity(
+        &self,
+        signal: &TradingSignal,
+        proposed_size: f64,
+        market_price: &MarketPriceRow,
+    ) -> Result<f64, String> {
+        // Get available liquidity based on trade direction
+        let available = match signal.direction {
+            SignalDirection::Buy => market_price.yes_ask_size.unwrap_or(0.0),
+            SignalDirection::Sell => market_price.yes_bid_size.unwrap_or(0.0),
+            SignalDirection::Hold => return Ok(proposed_size),
+        };
+
+        // Check minimum liquidity threshold
+        if available < self.config.liquidity_min_threshold {
+            return Err(format!(
+                "insufficient_liquidity: ${:.2} available < ${:.2} minimum",
+                available, self.config.liquidity_min_threshold
+            ));
+        }
+
+        // Cap position at configured percentage of available liquidity
+        let max_position = available * (self.config.liquidity_max_position_pct / 100.0);
+        let validated_size = proposed_size.min(max_position);
+
+        if validated_size < proposed_size {
+            info!(
+                "Position capped by liquidity: ${:.2} -> ${:.2} ({:.0}% of ${:.2} available)",
+                proposed_size, validated_size, self.config.liquidity_max_position_pct, available
+            );
+        }
+
+        Ok(validated_size)
     }
 
     fn create_execution_request(
@@ -906,8 +977,8 @@ impl SignalProcessorState {
             }
         }
 
-        // Cooldown check
-        let (in_cooldown, reason) = self.is_game_in_cooldown(&signal.game_id);
+        // Team-specific cooldown check (allows trading opposite team while one is in cooldown)
+        let (in_cooldown, reason) = self.is_team_in_cooldown(&signal.game_id, &signal.team);
         if in_cooldown {
             *self
                 .rejected_counts
@@ -968,7 +1039,8 @@ impl SignalProcessorState {
                         yes_bid_size: Some(0.0),
                         yes_ask_size: Some(0.0),
                         volume: Some(0.0),
-                        liquidity: Some(10000.0),
+                        // Conservative fallback - use smaller amount when liquidity unknown
+                        liquidity: Some(100.0),
                         time: Utc::now(),
                     }
                 } else {
@@ -982,8 +1054,24 @@ impl SignalProcessorState {
             }
         };
 
-        // Estimate position size
+        // Estimate position size (with fee reservation)
         let proposed_size = self.estimate_position_size(&signal).await?;
+
+        // Validate liquidity and cap position if needed
+        let proposed_size = match self.validate_liquidity(&signal, proposed_size, &market) {
+            Ok(size) => size,
+            Err(reason) => {
+                *self
+                    .rejected_counts
+                    .entry("insufficient_liquidity".to_string())
+                    .or_insert(0) += 1;
+                warn!(
+                    "LIQUIDITY REJECTED: {} {} - {}",
+                    signal.game_id, signal.team, reason
+                );
+                return Ok(());
+            }
+        };
 
         // Risk check - MUST pass before execution
         let (approved, rejection, snapshot) = self.check_risk_limits(&signal, proposed_size).await?;
@@ -1119,6 +1207,13 @@ async fn heartbeat_loop(
         let mut metrics = HashMap::new();
         metrics.insert("signals_received".to_string(), state.signal_count as f64);
         metrics.insert("signals_approved".to_string(), state.approved_count as f64);
+
+        // Connection pool metrics for monitoring
+        let pool_size = state.pool.size() as f64;
+        let pool_idle = state.pool.num_idle() as f64;
+        metrics.insert("db_pool_size".to_string(), pool_size);
+        metrics.insert("db_pool_idle".to_string(), pool_idle);
+        metrics.insert("db_pool_active".to_string(), pool_size - pool_idle);
 
         let heartbeat = Heartbeat {
             service: "signal_processor_rust".to_string(),
