@@ -183,7 +183,11 @@ pub struct GameState {
     pub period: u8,
     pub time_remaining_seconds: u32,
     pub possession: Option<String>,
-    
+
+    // Timestamp when this game state was fetched
+    #[serde(default = "default_timestamp")]
+    pub fetched_at: DateTime<Utc>,
+
     // Pre-game expectation
     #[serde(default)]
     pub pregame_home_prob: Option<f64>,
@@ -191,6 +195,10 @@ pub struct GameState {
     // Sport-specific details
     #[serde(flatten)]
     pub sport_specific: SportSpecificState,
+}
+
+fn default_timestamp() -> DateTime<Utc> {
+    Utc::now()
 }
 
 impl GameState {
@@ -826,6 +834,7 @@ pub fn get_stop_loss_for_sport(sport: &Sport) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn make_game_state(sport: Sport, period: u8, time_remaining_seconds: u32, sport_specific: SportSpecificState) -> GameState {
         GameState {
@@ -838,6 +847,7 @@ mod tests {
             period,
             time_remaining_seconds,
             possession: None,
+            fetched_at: Utc::now(),
             pregame_home_prob: None,
             sport_specific,
         }

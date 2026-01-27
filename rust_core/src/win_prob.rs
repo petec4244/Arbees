@@ -411,7 +411,8 @@ fn calculate_soccer_win_prob(state: &GameState, for_home: bool) -> f64 {
 
 /// Calculate win probability for a team in the current game state
 pub fn calculate_win_probability(state: &GameState, for_home: bool) -> f64 {
-    match state.sport {
+    // Calculate base live win probability from current game state
+    let base_prob = match state.sport {
         Sport::NFL | Sport::NCAAF => {
             // Extract football state from sport_specific
             match &state.sport_specific {
@@ -437,7 +438,50 @@ pub fn calculate_win_probability(state: &GameState, for_home: bool) -> f64 {
             let volatility = 3.0;
             logistic(score_diff / volatility)
         }
+    };
+
+    // If we have pregame probability, blend it with live model
+    // This is useful early in games when score doesn't tell the full story
+    if let Some(pregame_prob) = state.pregame_home_prob {
+        let pregame_for_team = if for_home { pregame_prob } else { 1.0 - pregame_prob };
+        blend_pregame_and_live_prob(pregame_for_team, base_prob, state)
+    } else {
+        base_prob
     }
+}
+
+/// Blend pregame probability with live win probability
+///
+/// Early in the game, pregame expectations (team strength, home advantage, etc.) matter more.
+/// As the game progresses, the actual score and game state become more important.
+///
+/// Weight formula:
+/// - At game start: 50% pregame, 50% live model
+/// - At halftime: 25% pregame, 75% live model
+/// - At end: 5% pregame, 95% live model
+///
+/// This helps avoid overreacting to small early leads/deficits.
+fn blend_pregame_and_live_prob(pregame_prob: f64, live_prob: f64, state: &GameState) -> f64 {
+    // Clamp pregame probability to valid range
+    let pregame_prob = pregame_prob.clamp(0.01, 0.99);
+
+    // Calculate how far into the game we are (0.0 = start, 1.0 = end)
+    let total_seconds = state.sport.total_seconds() as f64;
+    let elapsed = total_seconds - state.total_time_remaining() as f64;
+    let game_progress = (elapsed / total_seconds).clamp(0.0, 1.0);
+
+    // Pregame weight decreases as game progresses
+    // Start at 0.5, decay exponentially to ~0.05 by game end
+    let pregame_weight = 0.5 * (-2.5 * game_progress).exp();
+    let live_weight = 1.0 - pregame_weight;
+
+    // Blend in log-odds space for better mathematical properties
+    let pregame_log_odds = prob_to_log_odds(pregame_prob);
+    let live_log_odds = prob_to_log_odds(live_prob);
+
+    let blended_log_odds = pregame_weight * pregame_log_odds + live_weight * live_log_odds;
+
+    logistic(blended_log_odds)
 }
 
 /// Calculate win probability change from a state transition
@@ -492,6 +536,7 @@ pub fn expected_points_from_field_position(yard_line: u8, down: u8, yards_to_go:
 mod tests {
     use super::*;
     use crate::models::BasketballState;
+    use chrono::Utc;
 
     fn make_nba_state(home_score: u16, away_score: u16, period: u8, time_remaining: u32) -> GameState {
         GameState {
@@ -504,6 +549,7 @@ mod tests {
             period,
             time_remaining_seconds: time_remaining,
             possession: None,
+            fetched_at: Utc::now(),
             pregame_home_prob: None,
             sport_specific: SportSpecificState::Basketball(BasketballState::default()),
         }
@@ -592,6 +638,7 @@ mod tests {
             period: 1,
             time_remaining_seconds: 720,
             possession: None,
+            fetched_at: Utc::now(),
             pregame_home_prob: None,
             sport_specific: SportSpecificState::Basketball(BasketballState::default()),
         };
@@ -747,5 +794,151 @@ mod tests {
             market_prob * 100.0,
             edge
         );
+    }
+
+    // ========== PREGAME PROBABILITY BLENDING TESTS ==========
+
+    #[test]
+    fn test_pregame_blending_early_game() {
+        // Early in the game with small lead, pregame expectations should matter
+        // Scenario: Strong team (65% pregame) is down 2 points early in Q1
+        let mut state = make_nba_state(8, 10, 1, 660); // Q1, ~11 min left, down 2
+        state.pregame_home_prob = Some(0.65); // Strong favorite at home
+
+        let home_prob = calculate_win_probability(&state, true);
+
+        // Without pregame: down 2 early might be ~45-48%
+        // With pregame (65%): should blend to ~55-58%
+        // The model should recognize that a strong team down 2 early is still favored
+        assert!(
+            home_prob > 0.52,
+            "Strong team down 2 early should still be favored: got {:.1}%",
+            home_prob * 100.0
+        );
+
+        // But not as favored as pregame suggested (pregame weight decays)
+        assert!(
+            home_prob < 0.65,
+            "Should be less than pure pregame prob: got {:.1}%",
+            home_prob * 100.0
+        );
+    }
+
+    #[test]
+    fn test_pregame_blending_late_game() {
+        // Late in the game, live score should dominate over pregame expectations
+        // Scenario: Underdog (35% pregame) is up 8 points with 2 minutes left
+        let mut state = make_nba_state(98, 90, 4, 120); // Q4, 2 min left, up 8
+        state.pregame_home_prob = Some(0.35); // Big underdog
+
+        let home_prob = calculate_win_probability(&state, true);
+
+        // Up 8 with 2 min left should be ~90-95% regardless of pregame expectations
+        // Pregame weight should be minimal late in the game
+        assert!(
+            home_prob > 0.88,
+            "Up 8 with 2 min left should be very high probability: got {:.1}%",
+            home_prob * 100.0
+        );
+    }
+
+    #[test]
+    fn test_pregame_blending_vs_no_pregame() {
+        // Compare same game state with and without pregame probability
+        let mut state_with_pregame = make_nba_state(15, 12, 1, 600); // Q1, 10 min left, up 3
+        state_with_pregame.pregame_home_prob = Some(0.70); // Strong favorite
+
+        let state_without_pregame = make_nba_state(15, 12, 1, 600);
+
+        let prob_with = calculate_win_probability(&state_with_pregame, true);
+        let prob_without = calculate_win_probability(&state_without_pregame, true);
+
+        // With pregame info, probability should be higher (team is a strong favorite)
+        assert!(
+            prob_with > prob_without,
+            "Pregame info should boost probability: with={:.1}% without={:.1}%",
+            prob_with * 100.0,
+            prob_without * 100.0
+        );
+
+        // Difference should be meaningful but not huge (blend, not replace)
+        let diff = prob_with - prob_without;
+        assert!(
+            diff > 0.02 && diff < 0.15,
+            "Pregame impact should be moderate early game: diff={:.1}%",
+            diff * 100.0
+        );
+    }
+
+    #[test]
+    fn test_pregame_weight_decays() {
+        // Verify that pregame weight decreases as game progresses
+        // Use away team probability to avoid home court advantage confounding the test
+        let mut early_state = make_nba_state(20, 20, 1, 660); // Q1, tied
+        early_state.pregame_home_prob = Some(0.70); // Home team favored
+
+        let mut mid_state = make_nba_state(50, 50, 2, 600); // Q2, tied
+        mid_state.pregame_home_prob = Some(0.70);
+
+        let mut late_state = make_nba_state(90, 90, 4, 120); // Q4, tied
+        late_state.pregame_home_prob = Some(0.70);
+
+        // Calculate for AWAY team (so pregame_prob = 1 - 0.70 = 0.30)
+        // This way we can see pregame influence without home court advantage interference
+        let early_away = calculate_win_probability(&early_state, false);
+        let mid_away = calculate_win_probability(&mid_state, false);
+        let late_away = calculate_win_probability(&late_state, false);
+
+        // Away team has 30% pregame probability
+        // As game progresses with score tied, they should drift toward 50%
+
+        // Early: strong pregame influence keeps them low
+        assert!(
+            early_away < 0.40,
+            "Early tied game with 30% pregame should be low for away: {:.1}%",
+            early_away * 100.0
+        );
+
+        // Mid: moderate influence, getting closer to 50%
+        assert!(
+            mid_away > early_away && mid_away < 0.45,
+            "Mid-game should drift toward 50%: {:.1}%",
+            mid_away * 100.0
+        );
+
+        // Late: minimal pregame influence, very close to 50%
+        assert!(
+            late_away > mid_away && late_away > 0.45,
+            "Late tied game should be close to 50%: {:.1}%",
+            late_away * 100.0
+        );
+
+        // Verify monotonic increase toward 50% as pregame influence fades
+        assert!(
+            early_away < mid_away && mid_away < late_away,
+            "Probability should monotonically approach 50%: early={:.1}% < mid={:.1}% < late={:.1}%",
+            early_away * 100.0,
+            mid_away * 100.0,
+            late_away * 100.0
+        );
+    }
+
+    #[test]
+    fn test_prob_to_log_odds_inverse_of_logistic() {
+        // Test that prob_to_log_odds and logistic are inverses
+        let test_probs = vec![0.1, 0.25, 0.5, 0.75, 0.9];
+
+        for prob in test_probs {
+            let log_odds = prob_to_log_odds(prob);
+            let recovered_prob = logistic(log_odds);
+
+            assert!(
+                (prob - recovered_prob).abs() < 0.0001,
+                "Conversion should be reversible: {:.4} -> {:.4} -> {:.4}",
+                prob,
+                log_odds,
+                recovered_prob
+            );
+        }
     }
 }

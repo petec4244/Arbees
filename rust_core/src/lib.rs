@@ -303,6 +303,33 @@ fn convert_game_state(state: &GameState) -> models::GameState {
         Sport::MMA => models::Sport::MMA,
     };
 
+    // Build sport-specific state based on sport type
+    let sport_specific = match sport {
+        models::Sport::NFL | models::Sport::NCAAF => {
+            models::SportSpecificState::Football(models::FootballState {
+                down: state.down,
+                yards_to_go: state.yards_to_go,
+                yard_line: state.yard_line,
+                is_redzone: state.is_redzone,
+                timeouts_home: 3, // Default to full timeouts
+                timeouts_away: 3,
+            })
+        }
+        models::Sport::NBA | models::Sport::NCAAB => {
+            models::SportSpecificState::Basketball(models::BasketballState::default())
+        }
+        models::Sport::NHL => {
+            models::SportSpecificState::Hockey(models::HockeyState::default())
+        }
+        models::Sport::MLB => {
+            models::SportSpecificState::Baseball(models::BaseballState::default())
+        }
+        models::Sport::MLS | models::Sport::Soccer => {
+            models::SportSpecificState::Soccer(models::SoccerState::default())
+        }
+        models::Sport::Tennis | models::Sport::MMA => models::SportSpecificState::Other,
+    };
+
     models::GameState {
         game_id: state.game_id.clone(),
         sport,
@@ -313,10 +340,8 @@ fn convert_game_state(state: &GameState) -> models::GameState {
         period: state.period,
         time_remaining_seconds: state.time_remaining_seconds,
         possession: state.possession.clone(),
-        down: state.down,
-        yards_to_go: state.yards_to_go,
-        yard_line: state.yard_line,
-        is_redzone: state.is_redzone,
+        pregame_home_prob: None,
+        sport_specific,
     }
 }
 
