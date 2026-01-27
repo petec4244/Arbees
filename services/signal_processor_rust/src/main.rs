@@ -65,14 +65,13 @@ impl Default for Config {
         Self {
             // Minimum edge must account for round-trip fees:
             // Kalshi: ~0.7% entry + ~0.7% exit = 1.4% fees
-            // Polymarket: ~2% entry + ~2% exit = 4% fees
-            // Default 5.0% ensures positive expected value after fees with margin
-            // and filters out marginal opportunities
+            // Data shows: 5-10% edge = 36% win rate, 15%+ edge = 87.5% win rate
+            // Default 15.0% for higher win rate (~90%)
             // NOTE: This default matches game_shard_rust for consistency
             min_edge_pct: env::var("MIN_EDGE_PCT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5.0),
+                .unwrap_or(15.0),
             kelly_fraction: env::var("KELLY_FRACTION")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -392,6 +391,25 @@ impl SignalProcessorState {
         Ok(row.get::<i64, _>("count"))
     }
 
+    /// Count active games for a sport (games currently in progress)
+    /// Used to calculate dynamic per-game exposure limit
+    async fn count_active_games(&self, sport: Sport) -> Result<i64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(DISTINCT game_id) as count
+            FROM game_states
+            WHERE sport = $1::text::sport_enum
+              AND status IN ('STATUS_IN_PROGRESS', 'in')
+              AND time > NOW() - INTERVAL '10 minutes'
+            "#,
+        )
+        .bind(sport.as_str().to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get::<i64, _>("count").max(1)) // At least 1 to avoid division by zero
+    }
+
     /// Check if we have an existing position on this team in the OPPOSITE direction
     /// This prevents flip-flopping between buy and sell on the same team
     async fn has_opposing_position(
@@ -427,7 +445,7 @@ impl SignalProcessorState {
 
     /// Master risk check - returns (approved, rejection_reason, snapshot)
     ///
-    /// PERFORMANCE: All 6 DB queries run in parallel using tokio::join!
+    /// PERFORMANCE: All 7 DB queries run in parallel using tokio::join!
     /// to reduce latency from ~300-600ms (sequential) to ~50-100ms (parallel)
     async fn check_risk_limits(
         &self,
@@ -442,13 +460,15 @@ impl SignalProcessorState {
             sport_exposure_result,
             position_count_result,
             has_opposing_result,
+            active_games_result,
         ) = tokio::join!(
             self.get_available_balance(),
             self.get_daily_loss(),
             self.get_game_exposure(&signal.game_id),
             self.get_sport_exposure(signal.sport),
             self.count_game_positions(&signal.game_id),
-            self.has_opposing_position(&signal.game_id, &signal.team, signal.direction)
+            self.has_opposing_position(&signal.game_id, &signal.team, signal.direction),
+            self.count_active_games(signal.sport)
         );
 
         // Unwrap results (propagate first error if any)
@@ -458,6 +478,11 @@ impl SignalProcessorState {
         let sport_exposure = sport_exposure_result?;
         let position_count = position_count_result?;
         let has_opposing = has_opposing_result?;
+        let active_games = active_games_result?;
+
+        // Dynamic game exposure: divide sport budget by number of active games
+        // This allows bigger bets when fewer games, spreads risk when many games
+        let dynamic_max_game_exposure = self.config.max_sport_exposure / active_games as f64;
 
         let snapshot = RiskSnapshot {
             balance,
@@ -491,13 +516,13 @@ impl SignalProcessorState {
             ));
         }
 
-        // 3. Check game exposure limit
-        if game_exposure + proposed_size > self.config.max_game_exposure {
+        // 3. Check game exposure limit (dynamic: sport_budget / active_games)
+        if game_exposure + proposed_size > dynamic_max_game_exposure {
             return Ok((
                 false,
                 Some(format!(
-                    "Game exposure limit: ${:.2} + ${:.2} > ${:.2}",
-                    game_exposure, proposed_size, self.config.max_game_exposure
+                    "Game exposure limit: ${:.2} + ${:.2} > ${:.2} ({} active games)",
+                    game_exposure, proposed_size, dynamic_max_game_exposure, active_games
                 )),
                 snapshot,
             ));
@@ -543,8 +568,8 @@ impl SignalProcessorState {
             SignalDirection::Hold => "hold",
         };
         info!(
-            "OPEN: {} {} - ${:.2} (balance=${:.2}, game_exp=${:.2})",
-            signal.team, direction_str, proposed_size, balance, game_exposure
+            "OPEN: {} {} - ${:.2} (balance=${:.2}, game_exp=${:.2}, max=${:.2}, {} games)",
+            signal.team, direction_str, proposed_size, balance, game_exposure, dynamic_max_game_exposure, active_games
         );
         Ok((true, None, snapshot))
     }

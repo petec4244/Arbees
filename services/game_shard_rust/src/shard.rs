@@ -22,8 +22,8 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 /// Default minimum edge percentage to generate a signal (can be overridden via MIN_EDGE_PCT env var)
-/// Matches signal_processor_rust default (5.0%) to ensure consistency across services
-const DEFAULT_MIN_EDGE_PCT: f64 = 5.0;
+/// Data shows: 5-10% edge = 36% win rate, 15%+ edge = 87.5% win rate
+const DEFAULT_MIN_EDGE_PCT: f64 = 15.0;
 /// Maximum probability to buy (avoid buying near-certain outcomes)
 const MAX_BUY_PROB: f64 = 0.95;
 /// Minimum probability to buy (avoid buying very unlikely outcomes)
