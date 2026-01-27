@@ -307,6 +307,9 @@ fn calculate_basketball_win_prob(state: &GameState, for_home: bool) -> f64 {
 /// Calculate NHL win probability
 ///
 /// Hockey is low-scoring with strong home ice advantage.
+/// Model calibrated to match market expectations:
+/// - Team down 2-0 in 2nd period should be ~15-20%, not 40%
+/// - Goals are rare and each one is highly deterministic
 fn calculate_hockey_win_prob(state: &GameState, for_home: bool) -> f64 {
     let score_diff = if for_home {
         state.home_score as f64 - state.away_score as f64
@@ -314,17 +317,26 @@ fn calculate_hockey_win_prob(state: &GameState, for_home: bool) -> f64 {
         state.away_score as f64 - state.home_score as f64
     };
 
-    // Home ice advantage: ~3-4% edge
-    let home_adj = if for_home { 0.15 } else { -0.15 };
+    // Home ice advantage: ~3% edge (reduced from 0.15, more conservative)
+    let home_adj = if for_home { 0.10 } else { -0.10 };
 
     let total_seconds = state.sport.total_seconds() as f64;
     let remaining = state.total_time_remaining() as f64;
     let time_fraction = remaining / total_seconds;
 
-    // Hockey volatility: ~2.5 goals per team per game
-    let volatility: f64 = 2.5 * time_fraction.sqrt();
+    // Hockey is LOW volatility - goals are rare (~3 per team per game)
+    // Reduced from 2.5 to 1.2 to match market expectations
+    // A 2-goal lead should be very significant
+    let base_volatility = 1.2;
 
-    let log_odds = (score_diff + home_adj) / volatility.max(0.5);
+    // Further reduce volatility in late game (goals matter more)
+    let late_game_factor = if time_fraction < 0.33 { 0.7 } // 3rd period
+        else if time_fraction < 0.5 { 0.85 } // late 2nd
+        else { 1.0 };
+
+    let volatility = base_volatility * time_fraction.sqrt() * late_game_factor;
+
+    let log_odds = (score_diff + home_adj) / volatility.max(0.3);
     logistic(log_odds)
 }
 
