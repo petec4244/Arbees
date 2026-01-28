@@ -278,7 +278,12 @@ class PolymarketWebSocketClient:
                             logger.error(f"Polymarket WebSocket error: {event}")
                     
                 except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON from Polymarket WebSocket: {message}")
+                    # Polymarket sometimes sends non-JSON responses like "INVALID OPERATION"
+                    # This is usually non-fatal - REST poll fallback handles pricing
+                    if "INVALID" in str(message).upper():
+                        logger.debug(f"Polymarket WS returned non-JSON: {message} (REST fallback active)")
+                    else:
+                        logger.warning(f"Invalid JSON from Polymarket WebSocket: {message}")
                 except Exception as e:
                     logger.error(f"Error processing Polymarket WebSocket message: {e}")
         
