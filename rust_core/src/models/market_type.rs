@@ -120,7 +120,8 @@ mod tests {
         let market_type = MarketType::sport(Sport::NBA);
         let json = serde_json::to_string(&market_type).unwrap();
         assert!(json.contains("\"type\":\"sport\""));
-        assert!(json.contains("\"sport\":\"nba\""));
+        // Sport enum serializes as UPPERCASE (NBA, NFL, etc.)
+        assert!(json.contains("\"sport\":\"NBA\""));
 
         let deserialized: MarketType = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, market_type);

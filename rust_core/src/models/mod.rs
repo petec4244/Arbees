@@ -1064,6 +1064,15 @@ mod tests {
 
     fn make_game_state(sport: Sport, period: u8, time_remaining_seconds: u32, sport_specific: SportSpecificState) -> GameState {
         GameState {
+            // Universal fields (new)
+            event_id: "test".to_string(),
+            market_type: Some(MarketType::sport(sport)),
+            entity_a: Some("HOME".to_string()),
+            entity_b: Some("AWAY".to_string()),
+            event_start: Some(Utc::now()),
+            event_end: None,
+            resolution_criteria: None,
+            // Legacy fields
             game_id: "test".to_string(),
             sport,
             home_team: "HOME".to_string(),
@@ -1076,6 +1085,7 @@ mod tests {
             fetched_at: Utc::now(),
             pregame_home_prob: None,
             sport_specific,
+            market_specific: None,
         }
     }
 

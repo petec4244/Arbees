@@ -19,6 +19,7 @@ pub mod win_prob;
 pub mod clients;
 pub mod db;
 pub mod models;
+pub mod providers;
 pub mod redis;
 pub mod utils;
 
