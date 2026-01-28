@@ -27,3 +27,4 @@ log = { workspace = true }
 env_logger = { workspace = true }
 hostname = { workspace = true }
 async-trait = { workspace = true }
+zeromq = { workspace = true }

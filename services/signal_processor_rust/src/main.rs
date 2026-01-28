@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use arbees_rust_core::models::{
     channels, ExecutionRequest, ExecutionSide, NotificationEvent, NotificationPriority,
     NotificationType, Platform, RuleDecision, RuleDecisionType, SignalDirection, Sport,
-    TradingSignal,
+    TradingSignal, TransportMode,
 };
 use arbees_rust_core::redis::RedisBus;
 use arbees_rust_core::utils::matching::match_team_in_text;
@@ -23,9 +23,24 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use zeromq::{PubSocket, Socket, SocketRecv, SocketSend, SubSocket};
 use uuid::Uuid;
+
+// ============================================================================
+// ZMQ Message Format
+// ============================================================================
+
+/// ZMQ message envelope format (matches game_shard and execution_service)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ZmqEnvelope {
+    seq: u64,
+    timestamp_ms: i64,
+    source: Option<String>,
+    payload: serde_json::Value,
+}
 
 // ============================================================================
 // Configuration
@@ -236,6 +251,11 @@ struct SignalProcessorState {
     pool: PgPool,
     redis: RedisBus,
 
+    // Transport configuration
+    transport_mode: TransportMode,
+    zmq_pub: Option<Arc<Mutex<PubSocket>>>,
+    zmq_seq: Arc<AtomicU64>,
+
     // Counters
     signal_count: u64,
     approved_count: u64,
@@ -254,7 +274,13 @@ struct SignalProcessorState {
 }
 
 impl SignalProcessorState {
-    async fn new(config: Config, pool: PgPool, redis: RedisBus) -> Self {
+    async fn new(
+        config: Config,
+        pool: PgPool,
+        redis: RedisBus,
+        transport_mode: TransportMode,
+        zmq_pub: Option<Arc<Mutex<PubSocket>>>,
+    ) -> Self {
         let mut rejected_counts = HashMap::new();
         for key in &[
             "edge",
@@ -272,6 +298,9 @@ impl SignalProcessorState {
             config,
             pool,
             redis,
+            transport_mode,
+            zmq_pub,
+            zmq_seq: Arc::new(AtomicU64::new(0)),
             signal_count: 0,
             approved_count: 0,
             rejected_counts,
@@ -1128,16 +1157,26 @@ impl SignalProcessorState {
         self.in_flight
             .insert(exec_request.idempotency_key.clone(), Utc::now());
 
-        // Publish to execution channel
-        self.redis
-            .publish(channels::EXECUTION_REQUESTS, &exec_request)
-            .await?;
+        // Publish to execution channel based on transport mode
+        if self.transport_mode.use_redis() {
+            self.redis
+                .publish(channels::EXECUTION_REQUESTS, &exec_request)
+                .await?;
+        }
+
+        if self.transport_mode.use_zmq() {
+            self.publish_zmq(&exec_request).await;
+        }
 
         self.approved_count += 1;
 
         info!(
-            "Emitted ExecutionRequest: {} ({:?} {} @ {:.3})",
-            exec_request.request_id, signal.direction, signal.team, exec_request.limit_price
+            "Emitted ExecutionRequest: {} ({:?} {} @ {:.3}) via {:?}",
+            exec_request.request_id,
+            signal.direction,
+            signal.team,
+            exec_request.limit_price,
+            self.transport_mode
         );
 
         Ok(())
@@ -1146,6 +1185,36 @@ impl SignalProcessorState {
     async fn cleanup_stale_inflight(&mut self) {
         let cutoff = Utc::now() - Duration::minutes(5);
         self.in_flight.retain(|_, v| *v > cutoff);
+    }
+
+    /// Publish ExecutionRequest via ZMQ
+    async fn publish_zmq(&self, exec_request: &ExecutionRequest) {
+        if let Some(ref zmq_pub) = self.zmq_pub {
+            let topic = format!("execution.request.{}", exec_request.request_id);
+            let seq = self.zmq_seq.fetch_add(1, Ordering::Relaxed);
+
+            let envelope = ZmqEnvelope {
+                seq,
+                timestamp_ms: Utc::now().timestamp_millis(),
+                source: Some("signal_processor".to_string()),
+                payload: serde_json::to_value(exec_request).unwrap_or_default(),
+            };
+
+            let payload = match serde_json::to_vec(&envelope) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to serialize ZMQ execution request envelope: {}", e);
+                    return;
+                }
+            };
+
+            let mut socket = zmq_pub.lock().await;
+            let mut msg = zeromq::ZmqMessage::from(topic.into_bytes());
+            msg.push_back(payload.into());
+            if let Err(e) = socket.send(msg).await {
+                warn!("Failed to publish execution request via ZMQ: {}", e);
+            }
+        }
     }
 }
 
@@ -1236,6 +1305,102 @@ async fn heartbeat_loop(
 }
 
 // ============================================================================
+// ZMQ Signal Listener
+// ============================================================================
+
+/// ZMQ listener for receiving TradingSignal from game_shard
+async fn zmq_listener_loop(
+    state: Arc<RwLock<SignalProcessorState>>,
+    endpoint: String,
+) -> Result<()> {
+    info!("Starting ZMQ listener for signals from {}", endpoint);
+
+    loop {
+        // Create ZMQ SUB socket
+        let mut socket = SubSocket::new();
+
+        // Connect with retry
+        match socket.connect(&endpoint).await {
+            Ok(_) => info!("ZMQ connected to {}", endpoint),
+            Err(e) => {
+                warn!("Failed to connect to ZMQ {}: {}. Retrying in 5s...", endpoint, e);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+        }
+
+        // Subscribe to signal topics
+        if let Err(e) = socket.subscribe("signals.trade.").await {
+            warn!("Failed to subscribe to signals: {}", e);
+        }
+        info!("ZMQ subscribed to signals.trade.*");
+
+        // Message processing loop
+        loop {
+            let recv_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                socket.recv(),
+            )
+            .await;
+
+            match recv_result {
+                Ok(Ok(msg)) => {
+                    // ZMQ multipart: [topic, payload]
+                    let parts: Vec<_> = msg.iter().collect();
+                    if parts.len() < 2 {
+                        debug!("ZMQ message with {} parts, expected 2+", parts.len());
+                        continue;
+                    }
+
+                    let topic = String::from_utf8_lossy(parts[0].as_ref());
+                    let payload_bytes = parts[1].as_ref();
+
+                    // Parse envelope
+                    let envelope: ZmqEnvelope = match serde_json::from_slice(payload_bytes) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            debug!("Failed to parse ZMQ envelope: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Parse TradingSignal from envelope payload
+                    let signal: TradingSignal = match serde_json::from_value(envelope.payload) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            debug!("Failed to parse TradingSignal from ZMQ: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Calculate signal latency
+                    let now_ms = Utc::now().timestamp_millis();
+                    let latency_ms = now_ms - envelope.timestamp_ms;
+                    debug!("ZMQ signal received: topic={} latency={}ms", topic, latency_ms);
+
+                    // Process signal
+                    let mut s = state.write().await;
+                    if let Err(e) = s.handle_signal(signal).await {
+                        error!("Error handling ZMQ signal: {}", e);
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("ZMQ receive error: {}. Reconnecting...", e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - normal for low-traffic periods
+                    debug!("No ZMQ signal in 30s");
+                }
+            }
+        }
+
+        // Brief delay before reconnect
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1261,6 +1426,31 @@ async fn main() -> Result<()> {
     let redis = RedisBus::new().await?;
     info!("Connected to Redis");
 
+    // Transport mode configuration
+    let transport_mode = TransportMode::from_env();
+    info!("Transport mode: {:?}", transport_mode);
+
+    // Setup ZMQ publisher if needed
+    let zmq_pub = if transport_mode.use_zmq() {
+        let zmq_port = env::var("ZMQ_PUB_PORT").unwrap_or_else(|_| "5559".to_string());
+        let zmq_addr = format!("tcp://0.0.0.0:{}", zmq_port);
+
+        let mut socket = PubSocket::new();
+        match socket.bind(&zmq_addr).await {
+            Ok(_) => {
+                info!("ZMQ publisher bound to {}", zmq_addr);
+                Some(Arc::new(Mutex::new(socket)))
+            }
+            Err(e) => {
+                error!("Failed to bind ZMQ publisher to {}: {}", zmq_addr, e);
+                None
+            }
+        }
+    } else {
+        info!("ZMQ publishing disabled (transport_mode={:?})", transport_mode);
+        None
+    };
+
     // Configuration
     let config = Config::default();
     info!(
@@ -1270,7 +1460,7 @@ async fn main() -> Result<()> {
 
     // Initialize state
     let state = Arc::new(RwLock::new(
-        SignalProcessorState::new(config, pool, redis.clone()).await,
+        SignalProcessorState::new(config, pool, redis.clone(), transport_mode, zmq_pub).await,
     ));
 
     // Load rules from DB
@@ -1281,7 +1471,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Subscribe to signals
+    // Spawn ZMQ listener if enabled
+    if transport_mode.use_zmq() {
+        let zmq_endpoint = env::var("ZMQ_SUB_ENDPOINT")
+            .unwrap_or_else(|_| "tcp://game_shard:5558".to_string());
+        let state_zmq = state.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = zmq_listener_loop(state_zmq, zmq_endpoint).await {
+                error!("ZMQ listener error: {}", e);
+            }
+        });
+        info!("ZMQ signal listener started");
+    }
+
+    // Subscribe to Redis signals if enabled
+    if !transport_mode.use_redis() {
+        info!("Redis signal subscription disabled (transport_mode={:?})", transport_mode);
+        // Keep service running with ZMQ only
+        tokio::signal::ctrl_c().await?;
+        return Ok(());
+    }
+
     let mut pubsub = redis.subscribe(channels::SIGNALS_NEW).await?;
     info!("Subscribed to {}", channels::SIGNALS_NEW);
 

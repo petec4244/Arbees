@@ -10,6 +10,11 @@ pub struct Config {
     pub scheduled_sync_interval_secs: u64,
     pub pregame_discovery_window_hours: i64,
     pub market_discovery_mode: String,
+    pub resync_debounce_secs: u64,
+    pub resync_rate_limit_games_per_sec: u64,
+    pub assignment_circuit_failure_threshold: u32,
+    pub assignment_circuit_half_open_timeout_secs: u64,
+    pub assignment_circuit_success_threshold: u32,
 }
 
 impl Config {
@@ -39,6 +44,26 @@ impl Config {
                 .unwrap(),
             market_discovery_mode: env::var("MARKET_DISCOVERY_MODE")
                 .unwrap_or_else(|_| "rust".to_string()),
+            resync_debounce_secs: env::var("RESYNC_DEBOUNCE_SECS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .unwrap(),
+            resync_rate_limit_games_per_sec: env::var("RESYNC_RATE_LIMIT_GAMES_PER_SEC")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .unwrap(),
+            assignment_circuit_failure_threshold: env::var("ASSIGNMENT_CIRCUIT_FAILURE_THRESHOLD")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse()
+                .unwrap(),
+            assignment_circuit_half_open_timeout_secs: env::var("ASSIGNMENT_CIRCUIT_HALF_OPEN_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap(),
+            assignment_circuit_success_threshold: env::var("ASSIGNMENT_CIRCUIT_SUCCESS_THRESHOLD")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse()
+                .unwrap(),
         }
     }
 }

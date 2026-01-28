@@ -1,96 +1,95 @@
 use crate::config::Config;
+use crate::managers::service_registry::ServiceRegistry;
 use crate::state::ShardInfo;
-use chrono::{Utc, DateTime};
-use std::collections::HashMap;
+use chrono::Utc;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
+/// ShardManager acts as a facade/adapter over ServiceRegistry for backward compatibility.
+/// It provides shard-specific methods while delegating to the comprehensive ServiceRegistry.
 pub struct ShardManager {
-    shards: Arc<RwLock<HashMap<String, ShardInfo>>>,
+    service_registry: Arc<ServiceRegistry>,
     config: Config,
 }
 
 impl ShardManager {
-    pub fn new(config: Config) -> Self {
+    pub fn new(service_registry: Arc<ServiceRegistry>, config: Config) -> Self {
         Self {
-            shards: Arc::new(RwLock::new(HashMap::new())),
+            service_registry,
             config,
         }
     }
 
+    /// Handle shard heartbeat by delegating to ServiceRegistry
     pub async fn handle_heartbeat(&self, payload: serde_json::Value) {
-        // Expected payload: { "shard_id": "...", "game_count": 5, "max_games": 20, "games": [...] }
-        let shard_id = match payload.get("shard_id").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => return,
-        };
-
-        let game_count = payload.get("game_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let max_games = payload.get("max_games").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-        let games: Vec<String> = payload.get("games")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-
-        let mut shards = self.shards.write().await;
-        
-        let should_log_discovery = !shards.contains_key(&shard_id);
-        
-        shards.insert(shard_id.clone(), ShardInfo {
-            shard_id: shard_id.clone(),
-            game_count,
-            max_games,
-            games,
-            last_heartbeat: Utc::now(),
-            is_healthy: true,
-        });
-
-        if should_log_discovery {
-            info!("Discovered new shard: {}", shard_id);
+        if let Err(e) = self.service_registry.handle_heartbeat(payload).await {
+            tracing::warn!("Failed to handle shard heartbeat: {}", e);
         }
     }
 
+    /// Get the best shard for assignment
+    /// Filters by: GameShard type, Healthy status, Circuit Closed, Has Capacity
     pub async fn get_best_shard(&self) -> Option<ShardInfo> {
-        let shards = self.shards.read().await;
-        let now = Utc::now();
-        let timeout_secs = self.config.shard_timeout_secs as i64;
-        
-        let healthy_shards: Vec<&ShardInfo> = shards.values()
-            .filter(|s| {
-                let age = now.signed_duration_since(s.last_heartbeat).num_seconds();
-                age < timeout_secs && s.available_capacity() > 0
-            })
-            .collect();
-            
+        let healthy_shards = self.service_registry.get_healthy_shards().await;
+
         if healthy_shards.is_empty() {
             return None;
         }
-        
-        // Return shard with most capacity
-        healthy_shards.into_iter()
-            .max_by_key(|s| s.available_capacity())
-            .map(|s| s.clone())
+
+        // Convert ServiceState to ShardInfo and find shard with most capacity
+        let best_state = healthy_shards
+            .iter()
+            .filter(|s| s.available_capacity() > 0)
+            .max_by_key(|s| s.available_capacity())?;
+
+        // Extract game count and max_games from metrics
+        let max_games = best_state
+            .metrics
+            .get("max_games")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20) as usize;
+
+        let game_count = best_state.assigned_games.len();
+
+        Some(ShardInfo {
+            shard_id: best_state.instance_id.clone(),
+            game_count,
+            max_games,
+            games: best_state.assigned_games.iter().cloned().collect(),
+            last_heartbeat: best_state.last_heartbeat,
+            is_healthy: true, // Already filtered by healthy status
+        })
     }
 
+    /// Check health of all services (delegated to ServiceRegistry)
     pub async fn check_health(&self) {
-        let mut shards = self.shards.write().await;
-        let now = Utc::now();
-        let timeout_secs = self.config.shard_timeout_secs as i64;
-        
-        for (id, shard) in shards.iter_mut() {
-            let age = now.signed_duration_since(shard.last_heartbeat).num_seconds();
-            if age >= timeout_secs && shard.is_healthy {
-                warn!("Shard {} is unhealthy (last heartbeat {}s ago)", id, age);
-                shard.is_healthy = false;
-            } else if age < timeout_secs && !shard.is_healthy {
-                info!("Shard {} recovered", id);
-                shard.is_healthy = true;
-            }
-        }
+        self.service_registry.check_health().await;
     }
-    
+
+    /// Get snapshot of all shards for monitoring/debugging
     pub async fn get_shards_snapshot(&self) -> Vec<ShardInfo> {
-        self.shards.read().await.values().cloned().collect()
+        let shards = self.service_registry.get_healthy_shards().await;
+
+        shards
+            .iter()
+            .map(|state| {
+                let max_games = state
+                    .metrics
+                    .get("max_games")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20) as usize;
+
+                let game_count = state.assigned_games.len();
+
+                ShardInfo {
+                    shard_id: state.instance_id.clone(),
+                    game_count,
+                    max_games,
+                    games: state.assigned_games.iter().cloned().collect(),
+                    last_heartbeat: state.last_heartbeat,
+                    is_healthy: true,
+                }
+            })
+            .collect()
     }
 }

@@ -11,6 +11,7 @@
 //! ```
 
 use anyhow::Result;
+use arbees_rust_core::models::TransportMode;
 use chrono::Utc;
 use dotenv::dotenv;
 use log::{debug, error, info, warn};
@@ -448,16 +449,23 @@ async fn main() -> Result<()> {
 
     info!("Starting ZMQ Listener Rust Service...");
 
-    // Check if ZMQ is enabled
-    let zmq_enabled = env::var("ZMQ_ENABLED")
-        .map(|v| v.to_lowercase() == "true" || v == "1")
-        .unwrap_or(true);
+    // Check transport mode - zmq_listener only needed for bridging ZMQ to Redis
+    let transport_mode = TransportMode::from_env();
+    info!("Transport mode: {:?}", transport_mode);
 
-    if !zmq_enabled {
-        info!("ZMQ_ENABLED=false, service will not start");
+    if transport_mode == TransportMode::ZmqOnly {
+        info!("ZMQ_TRANSPORT_MODE=zmq_only, zmq_listener not needed (no bridging required)");
+        info!("Services communicate directly via ZMQ - zmq_listener exiting gracefully");
         return Ok(());
     }
 
+    if transport_mode == TransportMode::RedisOnly {
+        info!("ZMQ_TRANSPORT_MODE=redis_only, zmq_listener not needed (ZMQ disabled)");
+        return Ok(());
+    }
+
+    // transport_mode == Both: Bridge ZMQ messages to Redis
+    info!("ZMQ_TRANSPORT_MODE=both, starting ZMQ→Redis bridge");
     let listener = ZmqListener::new().await?;
     listener.start().await?;
 

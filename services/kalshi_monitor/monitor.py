@@ -182,7 +182,8 @@ class KalshiMonitor:
         self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
         # ZMQ publisher for low-latency messaging (hot path)
-        self._zmq_enabled = os.environ.get("ZMQ_ENABLED", "false").lower() in ("true", "1", "yes")
+        transport_mode = os.environ.get("ZMQ_TRANSPORT_MODE", "redis_only").lower()
+        self._zmq_enabled = transport_mode in ("zmq_only", "both")
         self._zmq_context: Optional["zmq.asyncio.Context"] = None
         self._zmq_pub: Optional["zmq.asyncio.Socket"] = None
         self._zmq_seq = 0
@@ -232,7 +233,7 @@ class KalshiMonitor:
                 logger.error(f"Failed to initialize ZMQ: {e}")
                 self._zmq_enabled = False
         elif self._zmq_enabled and not ZMQ_AVAILABLE:
-            logger.warning("ZMQ_ENABLED=true but pyzmq not installed")
+            logger.warning(f"ZMQ_TRANSPORT_MODE={transport_mode} but pyzmq not installed")
             self._zmq_enabled = False
 
         # Setup signal handlers

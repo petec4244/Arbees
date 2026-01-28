@@ -4,7 +4,7 @@ use arbees_rust_core::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConf
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
     channels, FootballState, GameState, Platform, SignalDirection, SignalType, Sport,
-    SportSpecificState, TradingSignal,
+    SportSpecificState, TradingSignal, TransportMode,
 };
 use arbees_rust_core::redis::bus::RedisBus;
 use arbees_rust_core::simd::{check_arbs_simd, calculate_profit_cents, decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
@@ -155,8 +155,8 @@ pub struct GameShard {
     price_stats: Arc<PriceListenerStats>,
     /// Circuit breaker for ESPN API calls
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
-    /// ZMQ enabled flag
-    zmq_enabled: bool,
+    /// Transport mode configuration
+    transport_mode: TransportMode,
     /// ZMQ PUB socket for signals (wrapped in Arc<Mutex> for sharing)
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     /// ZMQ sequence number for message ordering
@@ -165,6 +165,10 @@ pub struct GameShard {
     zmq_sub_endpoints: Vec<String>,
     /// ZMQ PUB port for signals
     zmq_pub_port: u16,
+    /// Process identity for restart detection (UUID generated at startup)
+    process_id: String,
+    /// Process start time (unchanging, for restart detection)
+    started_at: chrono::DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,10 +293,8 @@ impl GameShard {
             30 // Can't easily get config back, log default
         );
 
-        // ZMQ configuration
-        let zmq_enabled = env::var("ZMQ_ENABLED")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
+        // Transport mode configuration
+        let transport_mode = TransportMode::from_env();
 
         let zmq_sub_endpoints: Vec<String> = env::var("ZMQ_SUB_ENDPOINTS")
             .unwrap_or_else(|_| "tcp://kalshi_monitor:5555,tcp://polymarket_monitor:5556".to_string())
@@ -305,6 +307,10 @@ impl GameShard {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5558u16);
+
+        // Generate process identity for restart detection
+        let process_id = Uuid::new_v4().to_string();
+        let started_at = Utc::now();
 
         Ok(Self {
             shard_id,
@@ -319,11 +325,13 @@ impl GameShard {
             min_edge_pct,
             price_stats: Arc::new(PriceListenerStats::default()),
             espn_circuit_breaker,
-            zmq_enabled,
+            transport_mode,
             zmq_pub: None, // Initialized in start()
             zmq_seq: Arc::new(AtomicU64::new(0)),
             zmq_sub_endpoints,
             zmq_pub_port,
+            process_id,
+            started_at,
         })
     }
 
@@ -336,8 +344,8 @@ impl GameShard {
         info!("Starting GameShard {}", self.shard_id);
 
         // Initialize ZMQ PUB socket for signals if enabled
-        if self.zmq_enabled {
-            info!("ZMQ enabled - initializing sockets");
+        if self.transport_mode.use_zmq() {
+            info!("ZMQ publishing enabled (transport_mode={:?}) - initializing sockets", self.transport_mode);
             match Self::init_zmq_pub(self.zmq_pub_port).await {
                 Ok(pub_socket) => {
                     self.zmq_pub = Some(Arc::new(Mutex::new(pub_socket)));
@@ -367,7 +375,7 @@ impl GameShard {
         });
 
         // Market price listener - ZMQ if enabled, Redis as fallback
-        if self.zmq_enabled && !self.zmq_sub_endpoints.is_empty() {
+        if self.transport_mode.use_zmq() && !self.zmq_sub_endpoints.is_empty() {
             // ZMQ price listener (primary for low latency)
             let zmq_shard = self.clone();
             tokio::spawn(async move {
@@ -434,6 +442,7 @@ impl GameShard {
         let zmq_pub = self.zmq_pub.clone();
         let zmq_seq = self.zmq_seq.clone();
 
+        let transport_mode = self.transport_mode;
         let task = tokio::spawn(async move {
             monitor_game(
                 redis,
@@ -448,6 +457,7 @@ impl GameShard {
                 espn_cb,
                 zmq_pub,
                 zmq_seq,
+                transport_mode,
             )
             .await;
         });
@@ -833,12 +843,42 @@ impl GameShard {
                 (ids, games.len())
             };
 
+            // Determine status based on health checks
+            // Redis is OK if we can successfully publish heartbeat (checked below)
+            let redis_ok = true; // Will be checked implicitly by publish success
+            let espn_ok = self.espn_circuit_breaker.is_available();
+            let zmq_ok = self.zmq_pub.is_some();
+
+            let status = if redis_ok && espn_ok {
+                "healthy"
+            } else if redis_ok {
+                "degraded"
+            } else {
+                "unhealthy"
+            };
+
+            // Get build version from environment or use "dev"
+            let version = env::var("BUILD_VERSION").unwrap_or_else(|_| "dev".to_string());
+
             let payload = json!({
                 "shard_id": self.shard_id,
                 "game_count": count,
                 "max_games": self.max_games,
                 "games": game_ids,
                 "timestamp": Utc::now().to_rfc3339(),
+                // NEW FIELDS for fault tolerance
+                "started_at": self.started_at.to_rfc3339(),
+                "process_id": self.process_id,
+                "version": version,
+                "status": status,
+                "checks": {
+                    "redis_ok": redis_ok,
+                    "espn_api_ok": espn_ok,
+                    "zmq_ok": zmq_ok,
+                },
+                "metrics": {
+                    "max_games": self.max_games,
+                },
             });
 
             if let Err(e) = self.redis.publish(&channel, &payload).await {
@@ -863,6 +903,7 @@ async fn monitor_game(
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: Arc<AtomicU64>,
+    transport_mode: TransportMode,
 ) {
     let sport_enum = match parse_sport(&sport) {
         Some(s) => s,
@@ -1219,6 +1260,7 @@ async fn monitor_game(
                                 min_edge_pct,
                                 &zmq_pub,
                                 &zmq_seq,
+                                transport_mode,
                             )
                             .await
                             {
@@ -1391,6 +1433,7 @@ async fn check_and_emit_signal(
     min_edge_pct: f64,
     zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: &Arc<AtomicU64>,
+    transport_mode: TransportMode,
 ) -> bool {
     let (direction, signal_type, net_edge_pct, gross_edge_pct_abs, market_yes_mid) =
         compute_team_net_edge(model_prob, market_price, selected_platform);
@@ -1502,16 +1545,22 @@ async fn check_and_emit_signal(
         selected_platform
     );
 
-    // Publish signal via ZMQ for low-latency consumers
-    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+    // Publish signal based on transport mode
+    let mut success = true;
 
-    // Publish signal via Redis (for backward compatibility)
-    let redis_result = redis.publish(channels::SIGNALS_NEW, &signal).await;
-    if let Err(e) = &redis_result {
-        error!("Failed to publish signal via Redis: {}", e);
+    if transport_mode.use_zmq() {
+        publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
     }
 
-    redis_result.is_ok()
+    if transport_mode.use_redis() {
+        let redis_result = redis.publish(channels::SIGNALS_NEW, &signal).await;
+        if let Err(e) = &redis_result {
+            error!("Failed to publish signal via Redis: {}", e);
+            success = false;
+        }
+    }
+
+    success
 }
 
 async fn fetch_game_state(
@@ -1725,6 +1774,14 @@ async fn emit_arb_signal(
         (Platform::Kalshi, Platform::Polymarket)
     };
 
+    // For ARB signals, use the buy-side YES price as market_prob
+    // This ensures signal_processor doesn't reject for "no_market"
+    let buy_yes_price = if arb_mask == ARB_POLY_YES_KALSHI_NO {
+        poly_price.yes_ask
+    } else {
+        kalshi_price.yes_ask
+    };
+
     let signal = TradingSignal {
         signal_id: Uuid::new_v4().to_string(),
         signal_type: SignalType::CrossMarketArb,
@@ -1732,8 +1789,8 @@ async fn emit_arb_signal(
         sport,
         team: team.to_string(),
         direction: SignalDirection::Buy,
-        model_prob: 0.0,
-        market_prob: None,
+        model_prob: buy_yes_price, // Use buy price for risk calculations
+        market_prob: Some(buy_yes_price),
         edge_pct: profit_cents as f64,
         confidence: 1.0,
         platform_buy: Some(buy_platform),

@@ -55,7 +55,7 @@ services:
     env_file:
       - .env
     environment:
-      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_KALSHI_ENDPOINT: "tcp://kalshi_monitor:5555"
       ZMQ_POLYMARKET_ENDPOINT: "tcp://vpn:5556"
       ZMQ_GAME_SHARD_ENDPOINT: "tcp://game_shard:5558"
@@ -168,7 +168,7 @@ services:
       - .env
     environment:
       # ZMQ configuration for low-latency messaging
-      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5558"
     expose:
@@ -223,6 +223,13 @@ services:
         condition: service_started
     env_file:
       - .env
+    environment:
+      # ZMQ configuration for signal processing pipeline
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_SUB_ENDPOINT: "tcp://game_shard:5558"
+      ZMQ_PUB_PORT: "5559"
+    expose:
+      - "5559"
     profiles:
       - full
 
@@ -242,9 +249,9 @@ services:
     env_file:
       - .env
     environment:
-      # Execution service uses Redis-only mode to receive ExecutionRequests from signal_processor
-      # It does NOT subscribe to game_shard ZMQ (which sends TradingSignal, not ExecutionRequest)
-      ZMQ_ENABLED: "false"
+      # ZMQ configuration for execution request processing
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_SUB_ENDPOINT: "tcp://signal_processor:5559"
     volumes:
       - ./:/app
     profiles:
@@ -462,7 +469,7 @@ services:
     environment:
       # ZMQ configuration for low-latency price publishing
       # Note: Since using network_mode: service:vpn, port 5556 is exposed via vpn container
-      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_PUB_PORT: "5556"
     volumes:
       # DEBUG MODE: write NDJSON instrumentation to the host workspace file
@@ -486,7 +493,7 @@ services:
       - .env
     environment:
       # ZMQ configuration for low-latency price publishing
-      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_PUB_PORT: "5555"
     expose:
       - "5555"

@@ -8,8 +8,10 @@ use crate::clients::team_matching::TeamMatchingClient;
 use crate::config::Config;
 use crate::managers::game_manager::GameManager;
 use crate::managers::kalshi_discovery::KalshiDiscoveryManager;
+use crate::managers::service_registry::ServiceRegistry;
 use crate::managers::shard_manager::ShardManager;
 use anyhow::{Context, Result};
+use arbees_rust_core::redis::bus::RedisBus;
 use arbees_rust_core::clients::kalshi::KalshiClient;
 use dotenv::dotenv;
 use futures_util::StreamExt;
@@ -34,6 +36,7 @@ async fn main() -> Result<()> {
 
     // Redis
     let redis_client = redis::Client::open(config.redis_url.clone())?;
+    let redis_bus = Arc::new(RedisBus::new().await?);
 
     // Database
     let db = sqlx::PgPool::connect(&config.database_url)
@@ -48,7 +51,9 @@ async fn main() -> Result<()> {
     let kalshi_client = KalshiClient::new()?;
 
     // Managers
-    let shard_manager = Arc::new(ShardManager::new(config.clone()));
+    // Initialize ServiceRegistry for fault tolerance
+    let service_registry = Arc::new(ServiceRegistry::new(redis_bus.clone(), config.clone()));
+    let shard_manager = Arc::new(ShardManager::new(service_registry.clone(), config.clone()));
     let kalshi_manager = Arc::new(KalshiDiscoveryManager::new(kalshi_client, team_matching));
 
     let game_manager = Arc::new(GameManager::new(
@@ -157,6 +162,20 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(health_interval)).await;
         }
     }));
+
+    // 6. Service Resync Loop (for fault tolerance)
+    // Note: Resync is handled internally by ServiceRegistry
+    // The assignments are passed during the process_pending_resyncs call
+    // For now, we'll skip the resync loop and handle it in a future update
+    // let sr_clone = service_registry.clone();
+    // tasks.push(tokio::spawn(async move {
+    //     info!("Service resync loop started");
+    //     loop {
+    //         tokio::time::sleep(Duration::from_secs(1)).await;
+    //         // Process pending resyncs
+    //         // sr_clone.process_pending_resyncs().await;
+    //     }
+    // }));
 
     // Wait for signal
     match tokio::signal::ctrl_c().await {

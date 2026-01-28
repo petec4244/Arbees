@@ -4,7 +4,7 @@ mod polymarket_executor;
 use anyhow::Result;
 use arbees_rust_core::models::{
     channels, ExecutionRequest, ExecutionResult, ExecutionStatus, NotificationEvent,
-    NotificationPriority, NotificationType,
+    NotificationPriority, NotificationType, TransportMode,
 };
 use arbees_rust_core::redis::bus::RedisBus;
 use chrono::Utc;
@@ -57,28 +57,33 @@ async fn main() -> Result<()> {
     let engine = ExecutionEngine::new(paper_trading).await;
     let redis = RedisBus::new().await?;
 
-    // ZMQ configuration
-    let zmq_enabled = env::var("ZMQ_ENABLED")
-        .map(|v| v.to_lowercase() == "true" || v == "1")
-        .unwrap_or(false);
+    // Transport mode configuration
+    let transport_mode = TransportMode::from_env();
 
     let zmq_endpoint = env::var("ZMQ_SUB_ENDPOINT")
-        .unwrap_or_else(|_| "tcp://game_shard:5558".to_string());
+        .unwrap_or_else(|_| "tcp://signal_processor:5559".to_string());
 
     info!(
-        "Execution Service ready (Paper Trading: {}, Kalshi Live: {}, Polymarket Live: {}, ZMQ: {})",
+        "Execution Service ready (Paper Trading: {}, Kalshi Live: {}, Polymarket Live: {}, Transport: {:?})",
         paper_trading,
         engine.kalshi_live_enabled(),
         engine.polymarket_live_enabled(),
-        zmq_enabled
+        transport_mode
     );
 
-    if zmq_enabled {
-        // Run with both ZMQ and Redis listeners
-        run_with_zmq(engine, redis, zmq_endpoint).await
-    } else {
-        // Run with Redis only (backward compatible)
-        run_redis_only(engine, redis).await
+    match transport_mode {
+        TransportMode::ZmqOnly => {
+            // ZMQ only mode
+            run_zmq_only(engine, redis, zmq_endpoint).await
+        }
+        TransportMode::Both => {
+            // Run with both ZMQ and Redis listeners
+            run_with_zmq(engine, redis, zmq_endpoint).await
+        }
+        TransportMode::RedisOnly => {
+            // Run with Redis only (backward compatible)
+            run_redis_only(engine, redis).await
+        }
     }
 }
 
@@ -111,6 +116,18 @@ async fn run_redis_only(engine: ExecutionEngine, redis: RedisBus) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Run with ZMQ only (lowest latency mode)
+async fn run_zmq_only(engine: ExecutionEngine, redis: RedisBus, zmq_endpoint: String) -> Result<()> {
+    info!("Running in ZMQ-only mode");
+
+    let engine = Arc::new(engine);
+    let redis = Arc::new(redis);
+    let zmq_stats = Arc::new(ZmqStats::new());
+
+    // Run ZMQ listener
+    zmq_listener_loop(engine, redis, zmq_endpoint, zmq_stats).await
 }
 
 /// Run with both ZMQ (primary, low-latency) and Redis (fallback) listeners
@@ -183,11 +200,11 @@ async fn zmq_listener_loop(
             }
         }
 
-        // Subscribe to signal topics
-        if let Err(e) = socket.subscribe("signals.trade.").await {
-            warn!("Failed to subscribe to signals: {}", e);
+        // Subscribe to execution request topics
+        if let Err(e) = socket.subscribe("execution.request.").await {
+            warn!("Failed to subscribe to execution requests: {}", e);
         }
-        info!("ZMQ subscribed to signals.trade.*");
+        info!("ZMQ subscribed to execution.request.*");
 
         // Message processing loop
         loop {

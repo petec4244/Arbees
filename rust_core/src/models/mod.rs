@@ -112,6 +112,36 @@ impl Sport {
 }
 
 // ============================================================================
+// Transport Mode Configuration
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    ZmqOnly,
+    RedisOnly,
+    Both,
+}
+
+impl TransportMode {
+    pub fn from_env() -> Self {
+        match std::env::var("ZMQ_TRANSPORT_MODE").ok().as_deref() {
+            Some("zmq_only") => TransportMode::ZmqOnly,
+            Some("both") => TransportMode::Both,
+            _ => TransportMode::RedisOnly, // default
+        }
+    }
+
+    pub fn use_zmq(&self) -> bool {
+        matches!(self, TransportMode::ZmqOnly | TransportMode::Both)
+    }
+
+    pub fn use_redis(&self) -> bool {
+        matches!(self, TransportMode::RedisOnly | TransportMode::Both)
+    }
+}
+
+// ============================================================================
 // Game State (for win probability calculation)
 // ============================================================================
 
