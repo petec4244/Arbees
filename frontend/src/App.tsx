@@ -20,11 +20,10 @@ function NavLink({ to, children, onClick }: { to: string; children: React.ReactN
     <Link
       to={to}
       onClick={onClick}
-      className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-        isActive
+      className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${isActive
           ? 'bg-gray-700 text-white'
           : 'text-gray-300 hover:bg-gray-700 hover:text-white'
-      }`}
+        }`}
     >
       {children}
     </Link>
@@ -39,11 +38,10 @@ function MobileNavLink({ to, children, onClick }: { to: string; children: React.
     <Link
       to={to}
       onClick={onClick}
-      className={`block px-3 py-3 rounded-md text-base font-medium transition-colors ${
-        isActive
+      className={`block px-3 py-3 rounded-md text-base font-medium transition-colors ${isActive
           ? 'bg-gray-700 text-white'
           : 'text-gray-300 hover:bg-gray-700 hover:text-white'
-      }`}
+        }`}
     >
       {children}
     </Link>
@@ -84,8 +82,8 @@ function App() {
                 <NavLink to="/">Dashboard</NavLink>
                 <NavLink to="/analytics">Analytics</NavLink>
                 <NavLink to="/opportunities">Opportunities</NavLink>
-                <NavLink to="/live-games">Live Games</NavLink>
-                <NavLink to="/upcoming-games">Upcoming</NavLink>
+                <NavLink to="/upcoming-games">Markets</NavLink>
+                <NavLink to="/live-games">Live Events</NavLink>
                 <NavLink to="/futures">Futures</NavLink>
                 <NavLink to="/historical">Historical</NavLink>
                 <NavLink to="/paper-trading">Paper Trading</NavLink>
@@ -113,10 +111,10 @@ function App() {
               <MobileNavLink to="/" onClick={closeMobileMenu}>Dashboard</MobileNavLink>
               <MobileNavLink to="/analytics" onClick={closeMobileMenu}>Analytics</MobileNavLink>
               <MobileNavLink to="/opportunities" onClick={closeMobileMenu}>Opportunities</MobileNavLink>
-              <MobileNavLink to="/live-games" onClick={closeMobileMenu}>Live Games</MobileNavLink>
-              <MobileNavLink to="/upcoming-games" onClick={closeMobileMenu}>Upcoming Games</MobileNavLink>
+              <MobileNavLink to="/upcoming-games" onClick={closeMobileMenu}>Markets</MobileNavLink>
+              <MobileNavLink to="/live-games" onClick={closeMobileMenu}>Live Events</MobileNavLink>
               <MobileNavLink to="/futures" onClick={closeMobileMenu}>Futures</MobileNavLink>
-              <MobileNavLink to="/historical" onClick={closeMobileMenu}>Historical Games</MobileNavLink>
+              <MobileNavLink to="/historical" onClick={closeMobileMenu}>Historical</MobileNavLink>
               <MobileNavLink to="/paper-trading" onClick={closeMobileMenu}>Paper Trading</MobileNavLink>
             </div>
             <div className="px-4 py-3 border-t border-gray-700">

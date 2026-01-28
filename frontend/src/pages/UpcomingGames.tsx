@@ -2,11 +2,11 @@ import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { Clock, Filter, Calendar, MapPin, Tv, ChevronDown, ChevronUp, AlertCircle, Timer, CalendarClock, LineChart, ArrowUpDown, Activity } from 'lucide-react'
-import { getSportConfig, SportBackground } from '../utils/sports'
+import { getMarketConfig, MarketBackground } from '../utils/board_config'
 
-interface UpcomingGame {
+interface UpcomingMarket {
   game_id: string
-  sport: string
+  sport: string // used as market type
   home_team: string
   away_team: string
   home_team_abbrev?: string
@@ -17,9 +17,10 @@ interface UpcomingGame {
   time_category: 'imminent' | 'soon' | 'upcoming' | 'future'
   time_until_start: string
   minutes_until_start: number
+  metadata?: any
 }
 
-interface UpcomingGamesStats {
+interface UpcomingMarketsStats {
   total_games: number
   by_category: {
     imminent: number
@@ -73,61 +74,66 @@ const HOURS_OPTIONS = [
   { value: 168, label: '1 week' },
 ]
 
-function StartedGamesList({ games }: { games: any[] }) {
-  if (!games || games.length === 0) return null
+function StartedMarketsList({ markets }: { markets: any[] }) {
+  if (!markets || markets.length === 0) return null
 
   return (
     <div className="bg-gradient-to-r from-red-900/10 to-transparent border-l-4 border-red-500/50 bg-gray-900/30 rounded-lg p-4 mb-6">
       <div className="flex items-center gap-2 mb-3">
         <Activity className="w-5 h-5 text-red-500 animate-pulse" />
-        <h2 className="text-lg font-bold text-gray-100">Live & Recent Games</h2>
+        <h2 className="text-lg font-bold text-gray-100">Live Markets</h2>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-        {games.map(game => (
-          <div key={game.game_id} className="bg-gray-800/80 rounded border border-gray-700 p-3 flex justify-between items-center group hover:bg-gray-800 transition-colors">
-            <div className="flex flex-col gap-1 flex-1">
-              <div className="flex justify-between items-center w-full">
-                <span className="text-gray-300 text-sm font-medium">{game.away_team_abbrev || game.away_team}</span>
-                <span className={`text-lg font-mono font-bold ${game.away_score > game.home_score ? 'text-white' : 'text-gray-500'}`}>{game.away_score}</span>
-              </div>
-              <div className="flex justify-between items-center w-full">
-                <span className="text-gray-300 text-sm font-medium">{game.home_team_abbrev || game.home_team}</span>
-                <span className={`text-lg font-mono font-bold ${game.home_score > game.away_score ? 'text-white' : 'text-gray-500'}`}>{game.home_score}</span>
-              </div>
-            </div>
+        {markets.map(market => {
+          // Helper to check if it's a sport or other market type
+          const isSport = !['crypto', 'economics', 'politics'].includes(market.sport?.toLowerCase());
 
-            <div className="border-l border-gray-700 pl-3 ml-3 flex flex-col items-end min-w-[60px]">
-              <span className="text-[10px] uppercase text-gray-500 font-bold mb-1">{game.sport}</span>
-              {game.status?.toLowerCase().includes('final') || game.status?.toLowerCase().includes('complete') ? (
-                <span className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-medium">FINAL</span>
-              ) : (
-                <>
-                  <span className="text-xs text-green-400 font-bold animate-pulse">LIVE</span>
-                  <span className="text-[10px] text-gray-400">{game.period ? `Q${game.period}` : ''} {game.time_remaining}</span>
-                </>
-              )}
+          return (
+            <div key={market.game_id} className="bg-gray-800/80 rounded border border-gray-700 p-3 flex justify-between items-center group hover:bg-gray-800 transition-colors">
+              <div className="flex flex-col gap-1 flex-1">
+                <div className="flex justify-between items-center w-full">
+                  <span className="text-gray-300 text-sm font-medium">{market.away_team_abbrev || market.away_team}</span>
+                  {isSport && <span className={`text-lg font-mono font-bold ${market.away_score > market.home_score ? 'text-white' : 'text-gray-500'}`}>{market.away_score}</span>}
+                </div>
+                <div className="flex justify-between items-center w-full">
+                  <span className="text-gray-300 text-sm font-medium">{market.home_team_abbrev || market.home_team}</span>
+                  {isSport && <span className={`text-lg font-mono font-bold ${market.home_score > market.away_score ? 'text-white' : 'text-gray-500'}`}>{market.home_score}</span>}
+                </div>
+              </div>
+
+              <div className="border-l border-gray-700 pl-3 ml-3 flex flex-col items-end min-w-[60px]">
+                <span className="text-[10px] uppercase text-gray-500 font-bold mb-1">{market.sport}</span>
+                {market.status?.toLowerCase().includes('final') || market.status?.toLowerCase().includes('complete') ? (
+                  <span className="text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded font-medium">FINAL</span>
+                ) : (
+                  <>
+                    <span className="text-xs text-green-400 font-bold animate-pulse">LIVE</span>
+                    {isSport && <span className="text-[10px] text-gray-400">{market.period ? `Q${market.period}` : ''} {market.time_remaining}</span>}
+                  </>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )
 }
 
 export default function UpcomingGames() {
-  const [selectedSport, setSelectedSport] = useState<string>('ALL')
+  const [selectedMarketType, setSelectedMarketType] = useState<string>('ALL')
   const [hoursAhead, setHoursAhead] = useState<number>(24)
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set())
-  const [sortBy, setSortBy] = useState<'time' | 'sport'>('time')
+  const [sortBy, setSortBy] = useState<'time' | 'market'>('time')
 
-  // Fetch started/live games (including recently finalized)
-  const { data: startedGames } = useQuery({
-    queryKey: ['startedGames', selectedSport],
+  // Fetch live markets
+  const { data: startedMarkets } = useQuery({
+    queryKey: ['startedMarkets', selectedMarketType],
     queryFn: async () => {
       let url = '/api/live-games?include_final=true&max_age_hours=3'
-      if (selectedSport !== 'ALL') {
-        url += `&sport=${selectedSport}`
+      if (selectedMarketType !== 'ALL') {
+        url += `&sport=${selectedMarketType}`
       }
       const res = await fetch(url)
       if (!res.ok) return []
@@ -136,25 +142,27 @@ export default function UpcomingGames() {
     refetchInterval: 10000,
   })
 
-  const { data: games, isLoading, isError } = useQuery<UpcomingGame[]>({
-    queryKey: ['upcomingGames', hoursAhead, selectedSport === 'ALL' ? undefined : selectedSport],
+  // Fetch upcoming markets
+  const { data: markets, isLoading, isError } = useQuery<UpcomingMarket[]>({
+    queryKey: ['upcomingMarkets', hoursAhead, selectedMarketType === 'ALL' ? undefined : selectedMarketType],
     queryFn: async () => {
       const params = new URLSearchParams({
         hours_ahead: hoursAhead.toString(),
         limit: '100',
       })
-      if (selectedSport !== 'ALL') {
-        params.append('sport', selectedSport.toLowerCase())
+      if (selectedMarketType !== 'ALL') {
+        params.append('sport', selectedMarketType.toLowerCase())
       }
       const res = await fetch(`/api/upcoming-games?${params}`)
-      if (!res.ok) throw new Error('Failed to fetch upcoming games')
+      if (!res.ok) throw new Error('Failed to fetch upcoming markets')
       return res.json()
     },
-    refetchInterval: 60000, // Refresh every minute
+    refetchInterval: 60000,
   })
 
-  const { data: stats } = useQuery<UpcomingGamesStats>({
-    queryKey: ['upcomingGamesStats', hoursAhead],
+  // Fetch stats separately if needed, or derived from markets
+  const { data: stats } = useQuery<UpcomingMarketsStats>({
+    queryKey: ['upcomingMarketsStats', hoursAhead],
     queryFn: async () => {
       const res = await fetch(`/api/upcoming-games/stats?hours_ahead=${hoursAhead}`)
       if (!res.ok) throw new Error('Failed to fetch stats')
@@ -163,7 +171,7 @@ export default function UpcomingGames() {
     refetchInterval: 60000,
   })
 
-  // Fetch futures games to identify which are being monitored
+  // Fetch monitored IDs
   const { data: futuresGames } = useQuery<{ game_id: string }[]>({
     queryKey: ['futuresGamesIds'],
     queryFn: async () => {
@@ -174,63 +182,53 @@ export default function UpcomingGames() {
     refetchInterval: 60000,
   })
 
-  // Set of game IDs being monitored by futures
   const futuresGameIds = useMemo(() => {
     return new Set(futuresGames?.map(g => g.game_id) || [])
   }, [futuresGames])
 
-  // Get unique sports from games or stats
-  const sports = useMemo(() => {
+  // Get unique market types
+  const marketTypes = useMemo(() => {
     if (stats?.by_sport) {
       return ['ALL', ...Object.keys(stats.by_sport).sort()]
     }
-    if (games) {
-      const distinct = new Set(games.map(g => g.sport))
+    if (markets) {
+      const distinct = new Set(markets.map(g => g.sport))
       return ['ALL', ...Array.from(distinct).sort()]
     }
     return ['ALL']
-  }, [games, stats])
+  }, [markets, stats])
 
-  // Group games by time category (or maintain flat list if sorting by sport)
-  const groupedGames = useMemo(() => {
-    if (!games) return {}
+  // Group markets
+  const groupedMarkets = useMemo(() => {
+    if (!markets) return {}
 
-    // Clone and sort games first
-    let sortedGames = [...games]
-    if (sortBy === 'sport') {
-      sortedGames.sort((a, b) => {
-        // Sort by sport, then by time
-        const sportDiff = a.sport.localeCompare(b.sport)
-        if (sportDiff !== 0) return sportDiff
+    let sorted = [...markets]
+    if (sortBy === 'market') {
+      sorted.sort((a, b) => {
+        const typeDiff = a.sport.localeCompare(b.sport)
+        if (typeDiff !== 0) return typeDiff
         return new Date(a.scheduled_time).getTime() - new Date(b.scheduled_time).getTime()
       })
     } else {
-      // Sort by time
-      sortedGames.sort((a, b) => new Date(a.scheduled_time).getTime() - new Date(b.scheduled_time).getTime())
+      sorted.sort((a, b) => new Date(a.scheduled_time).getTime() - new Date(b.scheduled_time).getTime())
     }
 
-    // If sorting by sport, we might want to group differently or just respect the grouping
-    // Current design is grouping by time category. Let's keep that but sorting inside categories?
-    // User asked "Sort by Sport". If we group by "Starting Soon", "Today" etc, sorting by sport INSIDE those makes sense.
-    // If user explicitly wants to just see all NBA games together regardless of time, that's different.
-    // Let's assume sorting inside the time groups for now to maintain layout structure.
-
-    const groups: Record<string, UpcomingGame[]> = {
+    const groups: Record<string, UpcomingMarket[]> = {
       imminent: [],
       soon: [],
       upcoming: [],
       future: [],
     }
 
-    sortedGames.forEach(game => {
-      const category = game.time_category || 'upcoming'
+    sorted.forEach(m => {
+      const category = m.time_category || 'upcoming'
       if (groups[category]) {
-        groups[category].push(game)
+        groups[category].push(m)
       }
     })
 
     return groups
-  }, [games, sortBy])
+  }, [markets, sortBy])
 
   const toggleCategory = (category: string) => {
     setCollapsedCategories(prev => {
@@ -251,24 +249,24 @@ export default function UpcomingGames() {
         <div>
           <h1 className="text-3xl font-bold flex items-center gap-3">
             <Calendar className="w-8 h-8 text-blue-400" />
-            Upcoming Games
+            Market Schedule
           </h1>
           <span className="text-sm text-gray-400">
-            {games?.length || 0} games in the next {hoursAhead} hours
+            {markets?.length || 0} events in the next {hoursAhead} hours
           </span>
         </div>
 
         {/* Filters */}
         <div className="flex items-center space-x-3 bg-gray-800 p-2 rounded-lg">
-          {/* Sport Filter */}
+          {/* Market Type Filter */}
           <div className="flex items-center space-x-2 px-2">
             <Filter className="w-4 h-4 text-gray-400" />
             <select
-              value={selectedSport}
-              onChange={(e) => setSelectedSport(e.target.value)}
+              value={selectedMarketType}
+              onChange={(e) => setSelectedMarketType(e.target.value)}
               className="bg-transparent text-sm focus:outline-none cursor-pointer"
             >
-              {sports.map((s) => (
+              {marketTypes.map((s) => (
                 <option key={s} value={s} className="bg-gray-800">
                   {s.toUpperCase()} {stats?.by_sport[s] ? `(${stats.by_sport[s]})` : ''}
                 </option>
@@ -298,17 +296,17 @@ export default function UpcomingGames() {
 
           {/* Sort Control */}
           <button
-            onClick={() => setSortBy(prev => prev === 'time' ? 'sport' : 'time')}
+            onClick={() => setSortBy(prev => prev === 'time' ? 'market' : 'time')}
             className="flex items-center space-x-2 px-2 text-gray-400 hover:text-white transition-colors"
           >
             <ArrowUpDown className="w-4 h-4" />
-            <span className="text-sm">{sortBy === 'time' ? 'Time' : 'Sport'}</span>
+            <span className="text-sm">{sortBy === 'time' ? 'Time' : 'Type'}</span>
           </button>
         </div>
       </div>
 
-      {/* Started/Live Games */}
-      <StartedGamesList games={startedGames} />
+      {/* Started/Live Markets */}
+      <StartedMarketsList markets={startedMarkets} />
 
       {/* Stats Summary */}
       {stats && (
@@ -332,31 +330,31 @@ export default function UpcomingGames() {
         </div>
       )}
 
-      {/* Games List */}
+      {/* Markets List */}
       <div className="flex-1 overflow-y-auto min-h-0 pr-2 custom-scrollbar space-y-4 pb-4">
         {isLoading && (
           <div className="flex items-center justify-center p-12 text-gray-400">
             <div className="animate-spin w-6 h-6 border-2 border-blue-400 border-t-transparent rounded-full mr-3" />
-            Loading upcoming games...
+            Loading markets...
           </div>
         )}
 
         {isError && (
           <div className="flex flex-col items-center justify-center p-12 text-red-400 bg-red-500/10 rounded-lg border border-red-500/30">
             <AlertCircle className="w-8 h-8 mb-2" />
-            <p>Failed to load upcoming games</p>
+            <p>Failed to load markets</p>
           </div>
         )}
 
-        {!isLoading && !isError && games?.length === 0 && (
+        {!isLoading && !isError && markets?.length === 0 && (
           <div className="flex flex-col items-center justify-center p-12 text-gray-500 bg-gray-800/50 rounded-lg border border-gray-700 border-dashed">
             <Calendar className="w-12 h-12 mb-4 opacity-20" />
-            <p>No upcoming games in the next {hoursAhead} hours</p>
+            <p>No events in the next {hoursAhead} hours</p>
           </div>
         )}
 
-        {!isLoading && !isError && Object.entries(groupedGames).map(([category, categoryGames]) => {
-          if (categoryGames.length === 0) return null
+        {!isLoading && !isError && Object.entries(groupedMarkets).map(([category, categoryMarkets]) => {
+          if (categoryMarkets.length === 0) return null
 
           const config = TIME_CATEGORY_CONFIG[category as keyof typeof TIME_CATEGORY_CONFIG]
           const Icon = config.icon
@@ -376,7 +374,7 @@ export default function UpcomingGames() {
                     <div className="text-xs text-gray-400">{config.description}</div>
                   </div>
                   <span className={`ml-2 px-2 py-0.5 rounded-full text-xs font-bold ${config.bgColor} ${config.color}`}>
-                    {categoryGames.length}
+                    {categoryMarkets.length}
                   </span>
                 </div>
                 {isCollapsed ? (
@@ -386,14 +384,14 @@ export default function UpcomingGames() {
                 )}
               </button>
 
-              {/* Games Grid */}
+              {/* Markets Grid */}
               {!isCollapsed && (
                 <div className="p-4 pt-0 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-                  {categoryGames.map((game) => (
-                    <GameCard
-                      key={game.game_id}
-                      game={game}
-                      isMonitoredByFutures={futuresGameIds.has(game.game_id)}
+                  {categoryMarkets.map((market) => (
+                    <MarketCard
+                      key={market.game_id}
+                      market={market}
+                      isMonitoredByFutures={futuresGameIds.has(market.game_id)}
                     />
                   ))}
                 </div>
@@ -406,20 +404,20 @@ export default function UpcomingGames() {
   )
 }
 
-function GameCard({ game, isMonitoredByFutures }: { game: UpcomingGame; isMonitoredByFutures?: boolean }) {
-  const config = TIME_CATEGORY_CONFIG[game.time_category]
-  const scheduledDate = new Date(game.scheduled_time)
-  const sportConfig = getSportConfig(game.sport)
+function MarketCard({ market, isMonitoredByFutures }: { market: UpcomingMarket; isMonitoredByFutures?: boolean }) {
+  const config = TIME_CATEGORY_CONFIG[market.time_category]
+  const scheduledDate = new Date(market.scheduled_time)
+  const marketConfig = getMarketConfig(market.sport)
 
   return (
-    <div className={`rounded-lg overflow-hidden relative group border ${sportConfig.colors} transition-colors`}>
-      <SportBackground sport={game.sport} />
+    <div className={`rounded-lg overflow-hidden relative group border ${marketConfig.colors} transition-colors`}>
+      <MarketBackground type={market.sport} />
       <div className="p-4 relative z-10">
         {/* Header */}
         <div className="flex justify-between items-start mb-3">
           <div className="flex items-center gap-2">
-            <span className={`text-xs font-bold px-2 py-0.5 rounded uppercase border ${sportConfig.badge}`}>
-              {game.sport}
+            <span className={`text-xs font-bold px-2 py-0.5 rounded uppercase border ${marketConfig.badge}`}>
+              {market.sport}
             </span>
             {isMonitoredByFutures && (
               <Link
@@ -433,27 +431,27 @@ function GameCard({ game, isMonitoredByFutures }: { game: UpcomingGame; isMonito
             )}
           </div>
           <span className={`text-xs font-bold px-2 py-0.5 rounded ${config.bgColor} ${config.color}`}>
-            {game.time_until_start}
+            {market.time_until_start}
           </span>
         </div>
 
-        {/* Teams */}
+        {/* Teams/Entities */}
         <div className="space-y-2 mb-3">
           <div className="flex justify-between items-center">
             <span className="text-gray-300 font-medium truncate max-w-[80%]">
-              {game.away_team_abbrev || game.away_team}
+              {market.away_team_abbrev || market.away_team}
             </span>
-            <span className="text-xs text-gray-500">AWAY</span>
+            <span className="text-xs text-gray-500">NO / AWAY</span>
           </div>
           <div className="flex justify-between items-center">
             <span className="text-white font-medium truncate max-w-[80%]">
-              {game.home_team_abbrev || game.home_team}
+              {market.home_team_abbrev || market.home_team}
             </span>
-            <span className="text-xs text-gray-500">HOME</span>
+            <span className="text-xs text-gray-500">YES / HOME</span>
           </div>
         </div>
 
-        {/* Game Time */}
+        {/* Market Time */}
         <div className="border-t border-gray-700 pt-3 space-y-1">
           <div className="flex items-center gap-2 text-xs text-gray-400">
             <Clock className="w-3 h-3" />
@@ -462,17 +460,17 @@ function GameCard({ game, isMonitoredByFutures }: { game: UpcomingGame; isMonito
             <span>{scheduledDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</span>
           </div>
 
-          {game.venue && (
+          {market.venue && (
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <MapPin className="w-3 h-3" />
-              <span className="truncate">{game.venue}</span>
+              <span className="truncate">{market.venue}</span>
             </div>
           )}
 
-          {game.broadcast && (
+          {market.broadcast && (
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Tv className="w-3 h-3" />
-              <span>{game.broadcast}</span>
+              <span>{market.broadcast}</span>
             </div>
           )}
         </div>

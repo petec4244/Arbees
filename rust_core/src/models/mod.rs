@@ -507,6 +507,19 @@ pub struct TradingSignal {
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
     pub play_id: Option<String>,
+
+    // ========== Universal Fields (New) ==========
+    /// Universal event identifier (same as game_id for sports)
+    #[serde(default)]
+    pub event_id: Option<String>,
+
+    /// Market type discriminator
+    #[serde(default)]
+    pub market_type: Option<MarketType>,
+
+    /// Entity the signal applies to (team for sports, asset for crypto, etc.)
+    #[serde(default)]
+    pub entity: Option<String>,
 }
 
 impl TradingSignal {
@@ -515,6 +528,30 @@ impl TradingSignal {
             self.signal_type,
             SignalType::CrossMarketArb | SignalType::CrossMarketArbNo
         )
+    }
+
+    // ========== Universal Field Accessors ==========
+
+    /// Get event ID (new field or fallback to game_id)
+    pub fn get_event_id(&self) -> &str {
+        self.event_id.as_deref().unwrap_or(&self.game_id)
+    }
+
+    /// Get entity (new field or fallback to team)
+    pub fn get_entity(&self) -> &str {
+        self.entity.as_deref().unwrap_or(&self.team)
+    }
+
+    /// Get market type (new field or construct from sport)
+    pub fn get_market_type(&self) -> MarketType {
+        self.market_type
+            .clone()
+            .unwrap_or_else(|| MarketType::sport(self.sport))
+    }
+
+    /// Check if this is a sports signal
+    pub fn is_sport_signal(&self) -> bool {
+        self.get_market_type().is_sport()
     }
 
     pub fn kelly_fraction(&self) -> f64 {
@@ -1183,5 +1220,111 @@ mod tests {
         // NCAAB OT (period 3)
         let ncaab_ot = make_game_state(Sport::NCAAB, 3, 300, SportSpecificState::Basketball(Default::default()));
         assert_eq!(ncaab_ot.total_time_remaining(), 300);
+    }
+
+    // ============================================================================
+    // TradingSignal Universal Field Tests
+    // ============================================================================
+
+    fn make_test_signal(sport: Sport) -> TradingSignal {
+        TradingSignal {
+            signal_id: "test-signal-1".to_string(),
+            signal_type: SignalType::ModelEdgeYes,
+            game_id: "game-123".to_string(),
+            sport,
+            team: "Lakers".to_string(),
+            direction: SignalDirection::Buy,
+            model_prob: 0.65,
+            market_prob: Some(0.55),
+            edge_pct: 10.0,
+            confidence: 0.8,
+            platform_buy: Some(Platform::Kalshi),
+            platform_sell: None,
+            buy_price: Some(0.55),
+            sell_price: None,
+            liquidity_available: 1000.0,
+            reason: "Model edge detected".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+            play_id: None,
+            // Universal fields (new)
+            event_id: None,
+            market_type: None,
+            entity: None,
+        }
+    }
+
+    #[test]
+    fn test_trading_signal_legacy_fallback() {
+        // Without universal fields, should fall back to legacy fields
+        let signal = make_test_signal(Sport::NBA);
+
+        assert_eq!(signal.get_event_id(), "game-123");
+        assert_eq!(signal.get_entity(), "Lakers");
+        assert!(signal.get_market_type().is_sport());
+        assert!(signal.is_sport_signal());
+    }
+
+    #[test]
+    fn test_trading_signal_universal_fields() {
+        let mut signal = make_test_signal(Sport::NBA);
+        signal.event_id = Some("btc-100k-2025".to_string());
+        signal.market_type = Some(MarketType::Crypto {
+            asset: "BTC".to_string(),
+            prediction_type: CryptoPredictionType::PriceTarget,
+        });
+        signal.entity = Some("bitcoin".to_string());
+
+        assert_eq!(signal.get_event_id(), "btc-100k-2025");
+        assert_eq!(signal.get_entity(), "bitcoin");
+        assert!(!signal.get_market_type().is_sport());
+        assert!(!signal.is_sport_signal());
+    }
+
+    #[test]
+    fn test_trading_signal_serialization_with_universal_fields() {
+        let mut signal = make_test_signal(Sport::NBA);
+        signal.event_id = Some("event-456".to_string());
+        signal.market_type = Some(MarketType::sport(Sport::NBA));
+        signal.entity = Some("Lakers".to_string());
+
+        let json = serde_json::to_string(&signal).unwrap();
+        assert!(json.contains("\"event_id\":\"event-456\""));
+        assert!(json.contains("\"entity\":\"Lakers\""));
+
+        // Verify deserialization
+        let deserialized: TradingSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_id, Some("event-456".to_string()));
+        assert_eq!(deserialized.entity, Some("Lakers".to_string()));
+    }
+
+    #[test]
+    fn test_trading_signal_backward_compatible_deserialization() {
+        // Test that old signals without universal fields still deserialize
+        let json = r#"{
+            "signal_id": "old-signal",
+            "signal_type": "model_edge_yes",
+            "game_id": "game-old",
+            "sport": "NBA",
+            "team": "Celtics",
+            "direction": "buy",
+            "model_prob": 0.6,
+            "market_prob": 0.5,
+            "edge_pct": 10.0,
+            "confidence": 0.7,
+            "platform_buy": "kalshi",
+            "liquidity_available": 500.0,
+            "reason": "test",
+            "created_at": "2025-01-15T12:00:00Z"
+        }"#;
+
+        let signal: TradingSignal = serde_json::from_str(json).unwrap();
+        assert!(signal.event_id.is_none());
+        assert!(signal.market_type.is_none());
+        assert!(signal.entity.is_none());
+
+        // Helpers should still work via fallback
+        assert_eq!(signal.get_event_id(), "game-old");
+        assert_eq!(signal.get_entity(), "Celtics");
     }
 }

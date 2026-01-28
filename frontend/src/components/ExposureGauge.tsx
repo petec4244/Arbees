@@ -63,7 +63,7 @@ export function ExposureBySport({ showHeader = true }: ExposureBySportProps) {
   if (!riskMetrics?.exposure_by_sport || Object.keys(riskMetrics.exposure_by_sport).length === 0) {
     return (
       <div className="bg-gray-800 rounded-lg p-4">
-        {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Sport</h3>}
+        {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Market</h3>}
         <p className="text-gray-500 text-sm">No open positions</p>
       </div>
     )
@@ -71,7 +71,7 @@ export function ExposureBySport({ showHeader = true }: ExposureBySportProps) {
 
   return (
     <div className="bg-gray-800 rounded-lg p-4">
-      {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Sport</h3>}
+      {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Market</h3>}
       <div className="space-y-3">
         {Object.entries(riskMetrics.exposure_by_sport).map(([sport, data]: [string, any]) => (
           <ExposureGauge
@@ -104,7 +104,7 @@ export function ExposureByGame({ showHeader = true, limit = 5 }: ExposureByGameP
   if (!riskMetrics?.exposure_by_game || Object.keys(riskMetrics.exposure_by_game).length === 0) {
     return (
       <div className="bg-gray-800 rounded-lg p-4">
-        {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Game</h3>}
+        {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Event</h3>}
         <p className="text-gray-500 text-sm">No open positions</p>
       </div>
     )
@@ -114,7 +114,7 @@ export function ExposureByGame({ showHeader = true, limit = 5 }: ExposureByGameP
 
   return (
     <div className="bg-gray-800 rounded-lg p-4">
-      {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Game</h3>}
+      {showHeader && <h3 className="text-lg font-semibold mb-3">Exposure by Event</h3>}
       <div className="overflow-x-auto">
         <table className="min-w-full">
           <thead>
@@ -134,9 +134,8 @@ export function ExposureByGame({ showHeader = true, limit = 5 }: ExposureByGameP
                 <td className="py-2 pl-4">
                   <div className="h-2 w-24 bg-gray-700 rounded-full overflow-hidden">
                     <div
-                      className={`h-full ${
-                        data.pct >= 90 ? 'bg-red-500' : data.pct >= 70 ? 'bg-yellow-500' : 'bg-green-500'
-                      }`}
+                      className={`h-full ${data.pct >= 90 ? 'bg-red-500' : data.pct >= 70 ? 'bg-yellow-500' : 'bg-green-500'
+                        }`}
                       style={{ width: `${Math.min(data.pct, 100)}%` }}
                     />
                   </div>

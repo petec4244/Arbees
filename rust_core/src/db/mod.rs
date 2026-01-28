@@ -4,6 +4,11 @@
 //! - Consistent timeout and connection settings across services
 //! - Configurable pool sizes based on service requirements
 //! - Health check and idle timeout management
+//! - Universal event state insertion for all market types
+
+pub mod event_state;
+
+pub use event_state::{insert_event_state, insert_from_event_state};
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;

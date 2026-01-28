@@ -1,3 +1,4 @@
+mod event_monitor;
 mod shard;
 
 use anyhow::Result;

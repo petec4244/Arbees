@@ -14,6 +14,10 @@ pub mod crypto;
 pub mod economics;
 pub mod espn;
 pub mod politics;
+pub mod registry;
+
+// Re-export registry for convenient access
+pub use registry::EventProviderRegistry;
 
 /// Universal event provider trait
 ///
