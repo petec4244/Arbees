@@ -8,11 +8,14 @@
 
 ## Executive Summary
 
-### Current State
+### Current State (Updated Jan 2026)
 - ✅ 97.9% win rate in paper trading
 - ✅ All infrastructure working locally
 - ✅ Rust services containerized and cloud-ready
-- ❌ **CRITICAL BLOCKER:** No real order execution (Polymarket not implemented)
+- ✅ **Multi-market expansion COMPLETE** (Sports, Politics, Economics, Crypto, Entertainment)
+- ✅ ZMQ transport mode implemented (~50% latency reduction)
+- ✅ Notification service with adaptive scheduling
+- ⚠️ Paper trading only (real order execution not yet implemented)
 - ⚠️ Running on local Windows PC with VPN
 
 ### Target State
@@ -31,8 +34,19 @@
 | Phase | Monthly Cost | Justification |
 |-------|--------------|---------------|
 | Local validation | $17 | Test system stability before AWS spend |
-| AWS (initial) | $260 | Full production deployment |
-| Break-even | Daily profit >$50 | 1.6 days of trading pays for AWS |
+| AWS (initial) | $280 | Full production deployment |
+| Break-even | Daily profit >$50 | 1.8 days of trading pays for AWS |
+
+### Transport Mode Configuration
+For AWS deployment, choose your transport mode:
+
+| Mode | ENV Variable | Use Case |
+|------|-------------|----------|
+| **redis_only** | `ZMQ_TRANSPORT_MODE=redis_only` | Simplest, most reliable, slight latency increase |
+| **zmq_only** | `ZMQ_TRANSPORT_MODE=zmq_only` | Lowest latency (~50% faster), requires ZMQ ports |
+| **both** | `ZMQ_TRANSPORT_MODE=both` | Redundant, useful for migration/testing |
+
+**Recommendation:** Use `redis_only` for initial AWS deployment (simpler networking), switch to `zmq_only` after validating latency requirements.
 
 ---
 
@@ -49,9 +63,11 @@
 4. ✅ System already cloud-ready (easy to migrate later)
 5. ✅ Validate 97.9% win rate wasn't a fluke
 
-### 0.1: Implement Polymarket Execution (Priority: CRITICAL)
+### 0.1: Implement Polymarket Execution (Priority: HIGH)
 
-**Current Blocker:** `services/execution_service_rust/src/engine.rs:125-153` returns rejection for Polymarket
+**Status:** Paper trading works for all market types. Real order execution is the next step.
+
+**Current State:** `services/execution_service_rust/src/engine.rs` supports paper trading. For real trading, implement actual Polymarket CLOB integration.
 
 **What You'll Do Manually:**
 
@@ -972,12 +988,15 @@ redis-cli -h arbees-redis.xxxxx.cache.amazonaws.com
 
 | Service | CPU | Memory | Notes |
 |---------|-----|--------|-------|
-| orchestrator-rust | 256 | 512 | Low frequency |
-| market-discovery-rust | 256 | 512 | RPC server |
+| orchestrator-rust | 256 | 512 | Game discovery, shard assignment |
+| market-discovery-rust | 256 | 512 | Market ID lookup (RPC server) |
 | game-shard-rust | 512 | 1024 | Multiple instances (1 per 10 games) |
-| signal-processor-rust | 256 | 512 | Signal validation |
-| execution-service-rust | 512 | 1024 | Latency-critical |
-| position-tracker-rust | 256 | 512 | Position monitoring |
+| signal-processor-rust | 256 | 512 | Signal validation & generation |
+| execution-service-rust | 512 | 1024 | Latency-critical trade execution |
+| position-tracker-rust | 256 | 512 | Position monitoring & exits |
+| notification-service-rust | 256 | 512 | Alerts via Signal (adaptive scheduling) |
+| zmq-listener | 256 | 512 | ZMQ→Redis bridge (only if using ZMQ mode) |
+| analytics-service | 256 | 512 | ML analysis & archiving |
 
 ---
 
@@ -1083,16 +1102,27 @@ docker-compose logs -f
 ### Phase 2 Completion Checklist
 
 - [ ] ECS cluster created
-- [ ] All 6 Rust services deployed to ECS Fargate
+- [ ] All Rust services deployed to ECS Fargate:
+  - [ ] orchestrator-rust
+  - [ ] market-discovery-rust
+  - [ ] game-shard-rust
+  - [ ] signal-processor-rust
+  - [ ] execution-service-rust
+  - [ ] position-tracker-rust
+  - [ ] notification-service-rust
+  - [ ] zmq-listener (if using ZMQ mode)
+  - [ ] analytics-service
 - [ ] CloudWatch logs streaming for all services
+- [ ] Kalshi monitor running on Fargate (no VPN needed)
 - [ ] Polymarket monitor running on EC2 in eu-central-1
 - [ ] Services can connect to RDS and Redis
-- [ ] Game discoveries appearing in Redis
-- [ ] Market IDs being matched
+- [ ] Game discoveries appearing in Redis (all market types)
+- [ ] Market IDs being matched (Sports + Politics + Economics + Crypto + Entertainment)
 - [ ] Signals being generated
 - [ ] Trades being executed (paper or live)
+- [ ] Notifications working via Signal
 
-**Cost at this point:** ~$260/month
+**Cost at this point:** ~$280/month (updated for additional services)
 
 **Validation:** Run for 48 hours, monitor for errors, verify trades executing correctly
 
