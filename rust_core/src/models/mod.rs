@@ -2,6 +2,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+// Market type taxonomy for multi-market support
+pub mod market_type;
+pub use market_type::{CryptoPredictionType, MarketType, PoliticsEventType};
+
 // ============================================================================
 // Notification Events (cross-service alerting)
 // ============================================================================
@@ -200,31 +204,159 @@ impl Default for SportSpecificState {
     }
 }
 
+// ============================================================================
+// Non-Sports Market States
+// ============================================================================
 
-/// Game state for win probability calculation
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PoliticsState {
+    /// Current probability from polling aggregators
+    pub current_probability: Option<f64>,
+    /// Last poll update timestamp
+    pub last_poll_update: Option<DateTime<Utc>>,
+    /// Number of polls in average
+    pub poll_count: Option<u32>,
+    /// Event date (election day, vote day, etc.)
+    pub event_date: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EconomicsState {
+    /// Current value of indicator (if released)
+    pub current_value: Option<f64>,
+    /// Consensus forecast value
+    pub forecast_value: Option<f64>,
+    /// Release/announcement date
+    pub release_date: DateTime<Utc>,
+    /// Previous value (for comparison)
+    pub previous_value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CryptoState {
+    /// Current price in USD
+    pub current_price: f64,
+    /// Target price for prediction
+    pub target_price: f64,
+    /// Target date for prediction
+    pub target_date: DateTime<Utc>,
+    /// 24-hour volatility (standard deviation)
+    pub volatility_24h: f64,
+    /// Current trading volume 24h
+    pub volume_24h: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EntertainmentState {
+    /// Event description
+    pub event_description: String,
+    /// Event date
+    pub event_date: DateTime<Utc>,
+    /// Current probability if available
+    pub current_probability: Option<f64>,
+}
+
+/// Universal market-specific state that encompasses all market types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "market_state_type", rename_all = "snake_case")]
+pub enum MarketSpecificState {
+    Sport(SportSpecificState),
+    Politics(PoliticsState),
+    Economics(EconomicsState),
+    Crypto(CryptoState),
+    Entertainment(EntertainmentState),
+}
+
+impl Default for MarketSpecificState {
+    fn default() -> Self {
+        MarketSpecificState::Sport(SportSpecificState::Other)
+    }
+}
+
+
+/// Universal event/game state for all market types
+///
+/// This struct supports both sports markets (backward compatible) and new
+/// market types (politics, economics, crypto, entertainment).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
+    // ========== Universal Fields (New) ==========
+    /// Universal event identifier
+    #[serde(default)]
+    pub event_id: String,
+
+    /// Market type discriminator
+    #[serde(default)]
+    pub market_type: Option<MarketType>,
+
+    /// Generic entity A (home_team, candidate_1, indicator, asset)
+    #[serde(default)]
+    pub entity_a: Option<String>,
+
+    /// Generic entity B (away_team, candidate_2, opponent, null for single-entity)
+    #[serde(default)]
+    pub entity_b: Option<String>,
+
+    /// Event start time
+    #[serde(default)]
+    pub event_start: Option<DateTime<Utc>>,
+
+    /// Event end time (None for continuous markets)
+    #[serde(default)]
+    pub event_end: Option<DateTime<Utc>>,
+
+    /// Market resolution criteria (for non-sports markets)
+    #[serde(default)]
+    pub resolution_criteria: Option<String>,
+
+    // ========== Legacy Sports Fields (Deprecated) ==========
+    /// @deprecated Use event_id instead
     pub game_id: String,
+
+    /// @deprecated Extract from market_type.as_sport()
     pub sport: Sport,
+
+    /// @deprecated Use entity_a instead
     pub home_team: String,
+
+    /// @deprecated Use entity_b instead
     pub away_team: String,
+
+    /// Score for entity A (optional for non-sports)
+    #[serde(default)]
     pub home_score: u16,
+
+    /// Score for entity B (optional for non-sports)
+    #[serde(default)]
     pub away_score: u16,
+
+    /// Period/quarter/inning (optional for non-sports)
+    #[serde(default)]
     pub period: u8,
+
+    /// Time remaining in current period (optional for non-sports)
+    #[serde(default)]
     pub time_remaining_seconds: u32,
+
+    /// Possession indicator (sports-specific)
     pub possession: Option<String>,
 
-    // Timestamp when this game state was fetched
+    // ========== Common Fields ==========
+    /// Timestamp when this state was fetched
     #[serde(default = "default_timestamp")]
     pub fetched_at: DateTime<Utc>,
 
-    // Pre-game expectation
+    /// Pre-event probability (home team for sports, entity_a for others)
     #[serde(default)]
     pub pregame_home_prob: Option<f64>,
 
-    // Sport-specific details
-    #[serde(flatten)]
+    /// Market-specific state data
+    #[serde(flatten, default)]
     pub sport_specific: SportSpecificState,
+
+    /// Market-specific state (new, for all market types)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_specific: Option<MarketSpecificState>,
 }
 
 fn default_timestamp() -> DateTime<Utc> {
@@ -232,9 +364,64 @@ fn default_timestamp() -> DateTime<Utc> {
 }
 
 impl GameState {
+    // ========== Backward Compatibility Helpers ==========
+
+    /// Get event ID (new field or fall back to game_id)
+    pub fn get_event_id(&self) -> &str {
+        if !self.event_id.is_empty() {
+            &self.event_id
+        } else {
+            &self.game_id
+        }
+    }
+
+    /// Get sport (from market_type or legacy field)
+    pub fn get_sport(&self) -> Option<Sport> {
+        self.market_type
+            .as_ref()
+            .and_then(|mt| mt.as_sport())
+            .or(Some(self.sport))
+    }
+
+    /// Get entity A name (new field or fall back to home_team)
+    pub fn get_entity_a(&self) -> &str {
+        self.entity_a
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or(&self.home_team)
+    }
+
+    /// Get entity B name (new field or fall back to away_team)
+    pub fn get_entity_b(&self) -> Option<&str> {
+        self.entity_b
+            .as_ref()
+            .map(|s| s.as_str())
+            .or(Some(self.away_team.as_str()))
+    }
+
+    /// Check if this is a sports market
+    pub fn is_sport_market(&self) -> bool {
+        self.market_type
+            .as_ref()
+            .map(|mt| mt.is_sport())
+            .unwrap_or(true) // Default to true for backward compatibility
+    }
+
+    // ========== Existing Methods ==========
+
     /// Calculate total time remaining in the game (in seconds)
+    /// Only applicable to sports markets
     pub fn total_time_remaining(&self) -> u32 {
-        let period_seconds = match self.sport {
+        if !self.is_sport_market() {
+            return 0;
+        }
+
+        let sport = match self.get_sport() {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        let period_seconds = match sport {
             Sport::NFL | Sport::NCAAF => 900,   // 15 minutes per quarter
             Sport::NBA => 720,                   // 12 minutes per quarter
             Sport::NCAAB => 1200,                // 20 minutes per half
@@ -245,7 +432,7 @@ impl GameState {
             Sport::MMA => 300,                   // 5 minutes per round
         };
 
-        let periods_remaining = match self.sport {
+        let periods_remaining = match sport {
             Sport::NFL | Sport::NCAAF | Sport::NBA => 4u32.saturating_sub(self.period as u32),
             Sport::NCAAB | Sport::MLS | Sport::Soccer => 2u32.saturating_sub(self.period as u32),
             Sport::NHL => 3u32.saturating_sub(self.period as u32),
