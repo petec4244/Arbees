@@ -1073,11 +1073,11 @@ impl SignalProcessorState {
                         contract_team: Some(signal.team.clone()),
                         yes_bid: (signal.market_prob.unwrap_or(0.5) - 0.02).max(0.01),
                         yes_ask: (signal.market_prob.unwrap_or(0.5) + 0.02).min(0.99),
-                        yes_bid_size: Some(0.0),
-                        yes_ask_size: Some(0.0),
+                        // Use liquidity from signal (set by game_shard based on orderbook)
+                        yes_bid_size: Some(signal.liquidity_available),
+                        yes_ask_size: Some(signal.liquidity_available),
                         volume: Some(0.0),
-                        // Conservative fallback - use smaller amount when liquidity unknown
-                        liquidity: Some(100.0),
+                        liquidity: Some(signal.liquidity_available),
                         time: Utc::now(),
                     }
                 } else {
