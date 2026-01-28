@@ -26,6 +26,7 @@ ALTER TABLE games
 UPDATE games
 SET
     market_type = 'sport',
+    market_subtype = sport,
     entity_a = home_team,
     entity_b = away_team,
     event_start = scheduled_time

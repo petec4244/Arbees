@@ -6,6 +6,7 @@ use arbees_rust_core::models::{
     channels, FootballState, GameState, MarketType, Platform, SignalDirection, SignalType, Sport,
     SportSpecificState, TradingSignal, TransportMode,
 };
+use arbees_rust_core::ProbabilityModelRegistry;
 use arbees_rust_core::redis::bus::RedisBus;
 use arbees_rust_core::simd::{check_arbs_simd, calculate_profit_cents, decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
 use arbees_rust_core::utils::matching::match_team_in_text;
@@ -169,6 +170,8 @@ pub struct GameShard {
     process_id: String,
     /// Process start time (unchanging, for restart detection)
     started_at: chrono::DateTime<Utc>,
+    /// Probability model registry for edge calculation (multi-market support)
+    probability_registry: Arc<ProbabilityModelRegistry>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +194,10 @@ struct MarketPriceData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameContext {
     pub game_id: String,
-    pub sport: String,
+    pub sport: String,                   // Keep for backward compatibility
+    pub market_type: Option<MarketType>, // Universal market type
+    pub entity_a: Option<String>,        // Generic entity A (home_team for sports)
+    pub entity_b: Option<String>,        // Generic entity B (away_team for sports)
     pub polymarket_id: Option<String>,
     pub kalshi_id: Option<String>,
 }
@@ -210,9 +216,14 @@ struct ShardCommand {
     #[serde(rename = "type")]
     command_type: String,
     game_id: Option<String>,
+    event_id: Option<String>,           // Universal event ID (for non-sports markets)
     sport: Option<String>,
+    market_type: Option<MarketType>,    // Universal market type (sport, crypto, economics, politics)
+    entity_a: Option<String>,           // Generic entity A (home_team for sports)
+    entity_b: Option<String>,           // Generic entity B (away_team for sports)
     kalshi_market_id: Option<String>,
     polymarket_market_id: Option<String>,
+    metadata: Option<serde_json::Value>, // Additional market-specific metadata
 }
 
 /// Incoming market price message from polymarket_monitor
@@ -312,6 +323,9 @@ impl GameShard {
         let process_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
 
+        // Initialize probability model registry for multi-market support
+        let probability_registry = Arc::new(ProbabilityModelRegistry::new());
+
         Ok(Self {
             shard_id,
             redis,
@@ -332,6 +346,7 @@ impl GameShard {
             zmq_pub_port,
             process_id,
             started_at,
+            probability_registry,
         })
     }
 
@@ -424,6 +439,9 @@ impl GameShard {
         let context = GameContext {
             game_id: game_id.clone(),
             sport: sport.clone(),
+            market_type: None,  // Will be set to Sport by monitor_game based on sport string
+            entity_a: None,     // Will be set to home_team by monitor_game
+            entity_b: None,     // Will be set to away_team by monitor_game
             polymarket_id,
             kalshi_id,
         };
@@ -541,6 +559,45 @@ impl GameShard {
                         }
                     } else {
                         warn!("remove_game command missing game_id");
+                    }
+                }
+                "add_event" => {
+                    // Universal path for non-sports markets (crypto, economics, politics)
+                    // Falls back to event_id if game_id not provided
+                    let event_id = command.event_id.clone().or(command.game_id.clone());
+                    if let (Some(event_id), Some(market_type)) = (event_id, command.market_type.clone()) {
+                        info!(
+                            "Received add_event: {} ({:?}) kalshi={:?} poly={:?}",
+                            event_id, market_type, command.kalshi_market_id, command.polymarket_market_id
+                        );
+
+                        // For now, only sports are supported in monitor_game
+                        // Non-sports events will be handled in a future phase with monitor_event
+                        if market_type.is_sport() {
+                            let sport = market_type.as_sport()
+                                .map(|s| format!("{:?}", s).to_lowercase())
+                                .unwrap_or_else(|| "nba".to_string());
+                            if let Err(e) = self
+                                .add_game(
+                                    event_id,
+                                    sport,
+                                    command.polymarket_market_id,
+                                    command.kalshi_market_id,
+                                )
+                                .await
+                            {
+                                error!("Failed to add_event (sport): {}", e);
+                            }
+                        } else {
+                            // Non-sport events not yet supported - log and skip
+                            warn!(
+                                "Non-sport events not yet supported: {:?} (event_id: {}). \
+                                 Future implementation will add monitor_event for crypto/economics/politics.",
+                                market_type, event_id
+                            );
+                        }
+                    } else {
+                        warn!("add_event command missing event_id or market_type");
                     }
                 }
                 other => {

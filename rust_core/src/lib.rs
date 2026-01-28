@@ -45,6 +45,9 @@ use std::collections::HashMap;
 pub use types::*;
 pub use win_prob::*;
 
+// Re-export ProbabilityModelRegistry for use in services
+pub use probability::ProbabilityModelRegistry;
+
 /// Find cross-platform arbitrage opportunities (Kalshi vs Polymarket).
 ///
 /// CORRECT LOGIC: Looks for situations where YES + NO < $1.00:
