@@ -39,6 +39,63 @@ except ImportError:
     logger.warning("pyzmq not installed - ZMQ publishing disabled")
 
 
+def extract_team_from_ticker(ticker: str) -> Optional[str]:
+    """
+    Extract team abbreviation from Kalshi ticker format.
+
+    Ticker format: KX{SPORT}GAME-{DATE}{AWAY}{HOME}-{CONTRACT_TEAM}
+
+    The middle segment contains both team abbreviations concatenated:
+        - PORWAS = POR (Portland) vs WAS (Washington)
+        - NSHBOS = NSH (Nashville) vs BOS (Boston)
+        - BUFTOR = BUF (Buffalo) vs TOR (Toronto)
+
+    The final segment is the team this contract represents.
+
+    Examples:
+        KXNHLGAME-26JAN27NSHBOS-BOS -> BOS (Boston Bruins)
+        KXNHLGAME-26JAN27VGKMTL-MTL -> MTL (Montreal Canadiens)
+        KXNBAGAME-26JAN27PORWAS-POR -> POR (Portland Trail Blazers)
+        KXNBAGAME-26JAN27PORWAS-WAS -> WAS (Washington Wizards)
+
+    Returns:
+        Team abbreviation (contract team) if found and validated, None otherwise.
+    """
+    if not ticker:
+        return None
+
+    parts = ticker.split("-")
+    if len(parts) >= 3:
+        # Last segment is the contract team abbreviation
+        contract_team = parts[-1].upper()
+
+        # Basic validation: team abbreviations are typically 2-4 letters
+        if not (2 <= len(contract_team) <= 4 and contract_team.isalpha()):
+            return None
+
+        # Extract matchup segment (e.g., "26JAN27PORWAS" -> get last 6-8 chars for teams)
+        # The date portion is like "26JAN27" (7 chars), rest is team matchup
+        date_matchup = parts[1] if len(parts) > 1 else ""
+        if len(date_matchup) > 7:
+            # Matchup is after the date (e.g., "PORWAS" from "26JAN27PORWAS")
+            matchup = date_matchup[7:].upper()
+
+            # Validate: contract team must appear in the matchup segment
+            if contract_team in matchup:
+                return contract_team
+            else:
+                logger.warning(
+                    f"Contract team '{contract_team}' not found in matchup '{matchup}' "
+                    f"for ticker {ticker}"
+                )
+                return None
+
+        # Fallback for unexpected format - return contract team without validation
+        return contract_team
+
+    return None
+
+
 class KalshiMonitor:
     """
     Monitors Kalshi markets and publishes prices to Redis.
@@ -241,10 +298,14 @@ class KalshiMonitor:
     ):
         """
         Subscribe to a Kalshi market via WebSocket.
-        
+
         For moneyline markets, we typically need TWO tickers (one per team).
         The orchestrator should send both tickers in separate assignment messages.
         """
+        # Extract team from ticker if not provided
+        if not team_name:
+            team_name = extract_team_from_ticker(ticker)
+
         # Store metadata
         self._market_metadata[ticker] = {
             "game_id": game_id,
@@ -252,14 +313,14 @@ class KalshiMonitor:
             "team_name": team_name,
             "title": ticker,  # Will be updated if we fetch market details
         }
-        
+
         # Store ticker -> info mapping
         self._ticker_to_info[ticker] = {
             "game_id": game_id,
             "market_type": market_type,
             "team_name": team_name,
         }
-        
+
         # Subscribe via WebSocket
         try:
             await self.kalshi_ws.subscribe([ticker])
