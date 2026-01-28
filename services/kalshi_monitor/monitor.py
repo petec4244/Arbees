@@ -39,9 +39,9 @@ except ImportError:
     logger.warning("pyzmq not installed - ZMQ publishing disabled")
 
 
-def extract_team_from_ticker(ticker: str) -> Optional[str]:
+def parse_kalshi_ticker(ticker: str) -> Optional[dict]:
     """
-    Extract team abbreviation from Kalshi ticker format.
+    Parse Kalshi ticker to extract teams and matchup info.
 
     Ticker format: KX{SPORT}GAME-{DATE}{AWAY}{HOME}-{CONTRACT_TEAM}
 
@@ -53,47 +53,94 @@ def extract_team_from_ticker(ticker: str) -> Optional[str]:
     The final segment is the team this contract represents.
 
     Examples:
-        KXNHLGAME-26JAN27NSHBOS-BOS -> BOS (Boston Bruins)
-        KXNHLGAME-26JAN27VGKMTL-MTL -> MTL (Montreal Canadiens)
-        KXNBAGAME-26JAN27PORWAS-POR -> POR (Portland Trail Blazers)
-        KXNBAGAME-26JAN27PORWAS-WAS -> WAS (Washington Wizards)
+        KXNHLGAME-26JAN27NSHBOS-BOS -> {contract_team: BOS, matchup: NSHBOS, other_team: NSH}
+        KXNBAGAME-26JAN27PORWAS-POR -> {contract_team: POR, matchup: PORWAS, other_team: WAS}
 
     Returns:
-        Team abbreviation (contract team) if found and validated, None otherwise.
+        Dict with contract_team, matchup, other_team, base_ticker if valid, None otherwise.
     """
     if not ticker:
         return None
 
     parts = ticker.split("-")
-    if len(parts) >= 3:
-        # Last segment is the contract team abbreviation
-        contract_team = parts[-1].upper()
+    if len(parts) < 3:
+        return None
 
-        # Basic validation: team abbreviations are typically 2-4 letters
-        if not (2 <= len(contract_team) <= 4 and contract_team.isalpha()):
-            return None
+    # Last segment is the contract team abbreviation
+    contract_team = parts[-1].upper()
 
-        # Extract matchup segment (e.g., "26JAN27PORWAS" -> get last 6-8 chars for teams)
-        # The date portion is like "26JAN27" (7 chars), rest is team matchup
-        date_matchup = parts[1] if len(parts) > 1 else ""
-        if len(date_matchup) > 7:
-            # Matchup is after the date (e.g., "PORWAS" from "26JAN27PORWAS")
-            matchup = date_matchup[7:].upper()
+    # Basic validation: team abbreviations are typically 2-4 letters
+    if not (2 <= len(contract_team) <= 4 and contract_team.isalpha()):
+        return None
 
-            # Validate: contract team must appear in the matchup segment
-            if contract_team in matchup:
-                return contract_team
-            else:
-                logger.warning(
-                    f"Contract team '{contract_team}' not found in matchup '{matchup}' "
-                    f"for ticker {ticker}"
-                )
-                return None
+    # Extract matchup segment (e.g., "26JAN27PORWAS" -> get last 6-8 chars for teams)
+    # The date portion is like "26JAN27" (7 chars), rest is team matchup
+    date_matchup = parts[1] if len(parts) > 1 else ""
+    if len(date_matchup) <= 7:
+        return None
 
-        # Fallback for unexpected format - return contract team without validation
-        return contract_team
+    # Matchup is after the date (e.g., "PORWAS" from "26JAN27PORWAS")
+    matchup = date_matchup[7:].upper()
 
-    return None
+    # Validate: contract team must appear in the matchup segment
+    if contract_team not in matchup:
+        logger.warning(
+            f"Contract team '{contract_team}' not found in matchup '{matchup}' "
+            f"for ticker {ticker}"
+        )
+        return None
+
+    # Extract the other team by removing contract_team from matchup
+    # Team abbrevs are 2-4 chars, and matchup is {AWAY}{HOME}
+    other_team = matchup.replace(contract_team, "", 1)
+
+    # Validate other team
+    if not (2 <= len(other_team) <= 4 and other_team.isalpha()):
+        logger.warning(
+            f"Could not extract valid other team from matchup '{matchup}' "
+            f"(contract_team={contract_team}) for ticker {ticker}"
+        )
+        return None
+
+    # Base ticker is everything except the final team segment
+    base_ticker = "-".join(parts[:-1])
+
+    return {
+        "contract_team": contract_team,
+        "other_team": other_team,
+        "matchup": matchup,
+        "base_ticker": base_ticker,
+    }
+
+
+def extract_team_from_ticker(ticker: str) -> Optional[str]:
+    """
+    Extract team abbreviation from Kalshi ticker format.
+    Convenience wrapper around parse_kalshi_ticker.
+    """
+    parsed = parse_kalshi_ticker(ticker)
+    return parsed["contract_team"] if parsed else None
+
+
+def get_complementary_ticker(ticker: str) -> Optional[str]:
+    """
+    Get the complementary ticker for a Kalshi moneyline market.
+
+    For moneyline markets, Kalshi has TWO contracts per game (one per team).
+    Given one ticker, this returns the ticker for the other team.
+
+    Examples:
+        KXNHLGAME-26JAN27NSHBOS-BOS -> KXNHLGAME-26JAN27NSHBOS-NSH
+        KXNBAGAME-26JAN27PORWAS-POR -> KXNBAGAME-26JAN27PORWAS-WAS
+
+    Returns:
+        Complementary ticker if valid, None otherwise.
+    """
+    parsed = parse_kalshi_ticker(ticker)
+    if not parsed:
+        return None
+
+    return f"{parsed['base_ticker']}-{parsed['other_team']}"
 
 
 class KalshiMonitor:
@@ -119,9 +166,10 @@ class KalshiMonitor:
         # Market metadata (ticker -> {game_id, market_type, title, team})
         self._market_metadata: dict[str, dict] = {}
 
-        # Active assignment per (game_id, market_type) -> ticker
+        # Active assignments per (game_id, market_type) -> set of tickers
+        # For moneyline markets, this includes BOTH team contracts
         # Used to prevent publishing stale markets after discovery corrections.
-        self._active_by_game_type: dict[tuple[str, str], str] = {}
+        self._active_by_game_type: dict[tuple[str, str], set[str]] = {}
 
         # State
         self._running = False
@@ -278,16 +326,32 @@ class KalshiMonitor:
             if not ticker:
                 continue
 
-            # Update active mapping even if we're already subscribed; orchestrator may be correcting IDs.
-            self._active_by_game_type[(str(game_id), str(market_type))] = str(ticker)
+            # Update active mapping - use set to track both team contracts for moneyline
+            key = (str(game_id), str(market_type))
+            if key not in self._active_by_game_type:
+                self._active_by_game_type[key] = set()
+            self._active_by_game_type[key].add(str(ticker))
 
-            if ticker in self.subscribed_tickers:
-                continue
+            # Subscribe to this ticker
+            if ticker not in self.subscribed_tickers:
+                try:
+                    await self._subscribe_to_market(ticker, game_id, market_type, team_name)
+                except Exception as e:
+                    logger.error(f"Failed to subscribe to {ticker}: {e}")
 
-            try:
-                await self._subscribe_to_market(ticker, game_id, market_type, team_name)
-            except Exception as e:
-                logger.error(f"Failed to subscribe to {ticker}: {e}")
+            # For moneyline markets, also subscribe to the complementary ticker (other team)
+            # Kalshi has TWO contracts per game - one for each team
+            if market_type == "moneyline":
+                comp_ticker = get_complementary_ticker(ticker)
+                if comp_ticker:
+                    # Add complementary ticker to active set too
+                    self._active_by_game_type[key].add(comp_ticker)
+
+                    if comp_ticker not in self.subscribed_tickers:
+                        try:
+                            await self._subscribe_to_market(comp_ticker, game_id, market_type, None)
+                        except Exception as e:
+                            logger.error(f"Failed to subscribe to complementary ticker {comp_ticker}: {e}")
 
     async def _subscribe_to_market(
         self,
@@ -396,9 +460,9 @@ class KalshiMonitor:
         market_type = ticker_info["market_type"]
         team_name = ticker_info.get("team_name")
 
-        # Drop stale markets: only publish the currently active (game_id, market_type) assignment.
-        active = self._active_by_game_type.get((str(game_id), str(market_type)))
-        if active and active != ticker:
+        # Drop stale markets: only publish if ticker is in the active set for this (game_id, market_type)
+        active_set = self._active_by_game_type.get((str(game_id), str(market_type)))
+        if active_set and ticker not in active_set:
             return
 
         # Get metadata
