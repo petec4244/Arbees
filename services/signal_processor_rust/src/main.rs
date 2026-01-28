@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use arbees_rust_core::models::{
     channels, ExecutionRequest, ExecutionSide, NotificationEvent, NotificationPriority,
-    NotificationType, Platform, RuleDecision, RuleDecisionType, SignalDirection, Sport,
+    NotificationType, Platform, RuleDecision, RuleDecisionType, SignalDirection, SignalType, Sport,
     TradingSignal, TransportMode,
 };
 use arbees_rust_core::redis::RedisBus;
@@ -972,18 +972,25 @@ impl SignalProcessorState {
             return Some("edge".to_string());
         }
 
-        // Probability bounds
-        if signal.direction == SignalDirection::Buy && signal.model_prob > self.config.max_buy_prob
-        {
-            *self.rejected_counts.entry("prob".to_string()).or_insert(0) += 1;
-            return Some("prob_high".to_string());
-        }
+        // Probability bounds (skip for ARB signals - they profit regardless of outcome)
+        let is_arb_signal = matches!(
+            signal.signal_type,
+            SignalType::CrossMarketArb | SignalType::CrossMarketArbNo
+        );
 
-        if signal.direction == SignalDirection::Sell
-            && signal.model_prob < self.config.min_sell_prob
-        {
-            *self.rejected_counts.entry("prob".to_string()).or_insert(0) += 1;
-            return Some("prob_low".to_string());
+        if !is_arb_signal {
+            if signal.direction == SignalDirection::Buy && signal.model_prob > self.config.max_buy_prob
+            {
+                *self.rejected_counts.entry("prob".to_string()).or_insert(0) += 1;
+                return Some("prob_high".to_string());
+            }
+
+            if signal.direction == SignalDirection::Sell
+                && signal.model_prob < self.config.min_sell_prob
+            {
+                *self.rejected_counts.entry("prob".to_string()).or_insert(0) += 1;
+                return Some("prob_low".to_string());
+            }
         }
 
         // Duplicate position check (same-side only)

@@ -130,11 +130,12 @@ pub async fn get_game_counts(
     imminent_hours: u64,
 ) -> Result<GameCounts> {
     // Query active games with freshness check
+    // ESPN API returns status with 'status_' prefix
     let active_count: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
         FROM games
-        WHERE status IN ('in_progress', 'halftime', 'end_period')
+        WHERE status IN ('status_in_progress', 'status_halftime', 'status_end_period')
           AND updated_at > NOW() - make_interval(mins => $1::integer)
         "#,
     )
@@ -185,7 +186,7 @@ pub async fn get_active_game_ids(pool: &PgPool, freshness_mins: u64) -> Result<V
         r#"
         SELECT game_id
         FROM games
-        WHERE status IN ('in_progress', 'halftime', 'end_period')
+        WHERE status IN ('status_in_progress', 'status_halftime', 'status_end_period')
           AND updated_at > NOW() - make_interval(mins => $1::integer)
         "#,
     )
@@ -202,7 +203,7 @@ pub async fn get_stale_game_count(pool: &PgPool, stale_threshold_mins: u64) -> R
         r#"
         SELECT COUNT(*)
         FROM games
-        WHERE status IN ('in_progress', 'halftime', 'end_period')
+        WHERE status IN ('status_in_progress', 'status_halftime', 'status_end_period')
           AND updated_at < NOW() - make_interval(mins => $1::integer)
         "#,
     )
