@@ -9,6 +9,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 // Concrete model implementations
+pub mod crypto;
+pub mod economics;
+pub mod politics;
 pub mod sport;
 
 /// Universal probability model trait
@@ -65,6 +68,15 @@ impl ProbabilityModelRegistry {
 
         // Add sport model (existing functionality)
         models.push(Box::new(sport::SportWinProbabilityModel::new()));
+
+        // Add crypto model
+        models.push(Box::new(crypto::CryptoProbabilityModel::new()));
+
+        // Add economics model
+        models.push(Box::new(economics::EconomicsProbabilityModel::new()));
+
+        // Add politics model
+        models.push(Box::new(politics::PoliticsProbabilityModel::new()));
 
         Self { models }
     }
@@ -136,6 +148,6 @@ mod tests {
     #[tokio::test]
     async fn test_registry_creation() {
         let registry = ProbabilityModelRegistry::new();
-        assert_eq!(registry.models.len(), 1); // Sport model
+        assert_eq!(registry.models.len(), 4); // Sport + Crypto + Economics + Politics models
     }
 }

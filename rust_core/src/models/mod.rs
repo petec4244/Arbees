@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 // Market type taxonomy for multi-market support
 pub mod market_type;
-pub use market_type::{CryptoPredictionType, MarketType, PoliticsEventType};
+pub use market_type::{CryptoPredictionType, EconomicIndicator, MarketType, PoliticsEventType};
 
 // ============================================================================
 // Notification Events (cross-service alerting)

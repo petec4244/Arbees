@@ -9,7 +9,6 @@ use crate::providers::{EventState, StateData};
 use crate::win_prob::calculate_win_probability;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use chrono::Utc;
 
 /// Sport win probability model
 ///
@@ -183,6 +182,7 @@ mod tests {
     use super::*;
     use crate::models::{BasketballState, SportSpecificState};
     use crate::providers::{EventStatus, SportStateData};
+    use chrono::Utc;
 
     #[tokio::test]
     async fn test_sport_model_supports() {

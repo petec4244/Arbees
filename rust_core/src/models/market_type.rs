@@ -11,7 +11,7 @@ use super::Sport;
 ///
 /// Wraps the existing Sport enum for backward compatibility while adding
 /// support for non-sports markets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MarketType {
     /// Sports markets (existing functionality)
@@ -30,8 +30,8 @@ pub enum MarketType {
     /// Economic indicator markets
     #[serde(rename = "economics")]
     Economics {
-        indicator: String,
-        region: String,
+        indicator: EconomicIndicator,
+        threshold: Option<f64>,
     },
 
     /// Cryptocurrency prediction markets
@@ -111,6 +111,38 @@ pub enum CryptoPredictionType {
     Other,
 }
 
+/// Economic indicator types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EconomicIndicator {
+    /// Consumer Price Index (headline inflation)
+    CPI,
+    /// Core CPI (excluding food and energy)
+    CoreCPI,
+    /// Personal Consumption Expenditures (Fed's preferred measure)
+    PCE,
+    /// Core PCE (excluding food and energy)
+    CorePCE,
+    /// Unemployment Rate
+    Unemployment,
+    /// Nonfarm Payrolls (jobs report)
+    NonfarmPayrolls,
+    /// Federal Funds Rate
+    FedFundsRate,
+    /// Real GDP
+    GDP,
+    /// GDP Growth Rate (annualized)
+    GDPGrowth,
+    /// Initial Jobless Claims (weekly)
+    JoblessClaims,
+    /// Consumer Sentiment Index
+    ConsumerSentiment,
+    /// 10-Year Treasury Yield
+    Treasury10Y,
+    /// 2-Year Treasury Yield
+    Treasury2Y,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,8 +193,8 @@ mod tests {
     #[test]
     fn test_market_type_economics() {
         let market_type = MarketType::Economics {
-            indicator: "cpi".to_string(),
-            region: "us".to_string(),
+            indicator: EconomicIndicator::CPI,
+            threshold: Some(3.0),
         };
         assert_eq!(market_type.type_name(), "economics");
         assert!(!market_type.is_sport());

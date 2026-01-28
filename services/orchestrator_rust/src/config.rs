@@ -15,6 +15,11 @@ pub struct Config {
     pub assignment_circuit_failure_threshold: u32,
     pub assignment_circuit_half_open_timeout_secs: u64,
     pub assignment_circuit_success_threshold: u32,
+    // Multi-market configuration
+    pub enable_crypto_markets: bool,
+    pub enable_economics_markets: bool,
+    pub enable_politics_markets: bool,
+    pub multi_market_discovery_interval_secs: u64,
 }
 
 impl Config {
@@ -64,6 +69,28 @@ impl Config {
                 .unwrap_or_else(|_| "2".to_string())
                 .parse()
                 .unwrap(),
+            // Multi-market configuration (disabled by default for safety)
+            enable_crypto_markets: env::var("ENABLE_CRYPTO_MARKETS")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            enable_economics_markets: env::var("ENABLE_ECONOMICS_MARKETS")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            enable_politics_markets: env::var("ENABLE_POLITICS_MARKETS")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            multi_market_discovery_interval_secs: env::var("MULTI_MARKET_DISCOVERY_INTERVAL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap(),
         }
+    }
+
+    /// Check if any multi-market types are enabled
+    pub fn has_multi_market_enabled(&self) -> bool {
+        self.enable_crypto_markets || self.enable_economics_markets || self.enable_politics_markets
     }
 }

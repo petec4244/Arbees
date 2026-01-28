@@ -10,7 +10,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // Concrete provider implementations
+pub mod crypto;
+pub mod economics;
 pub mod espn;
+pub mod politics;
 
 /// Universal event provider trait
 ///

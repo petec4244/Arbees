@@ -92,6 +92,7 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "redis",
+ "regex",
  "reqwest",
  "rsa",
  "rustc-hash",

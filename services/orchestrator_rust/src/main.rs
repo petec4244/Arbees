@@ -8,6 +8,7 @@ use crate::clients::team_matching::TeamMatchingClient;
 use crate::config::Config;
 use crate::managers::game_manager::GameManager;
 use crate::managers::kalshi_discovery::KalshiDiscoveryManager;
+use crate::managers::multi_market::MultiMarketManager;
 use crate::managers::service_registry::ServiceRegistry;
 use crate::managers::shard_manager::ShardManager;
 use anyhow::{Context, Result};
@@ -63,6 +64,24 @@ async fn main() -> Result<()> {
         db.clone(),
         config.clone(),
     ));
+
+    // Multi-market manager (for crypto, economics, politics)
+    let multi_market_manager = if config.has_multi_market_enabled() {
+        info!(
+            "Multi-market enabled: crypto={}, economics={}, politics={}",
+            config.enable_crypto_markets,
+            config.enable_economics_markets,
+            config.enable_politics_markets
+        );
+        Some(Arc::new(MultiMarketManager::new(
+            redis_client.clone(),
+            shard_manager.clone(),
+            config.clone(),
+        )))
+    } else {
+        info!("Multi-market discovery disabled");
+        None
+    };
 
     // Tasks
     let mut tasks = Vec::new();
@@ -173,6 +192,52 @@ async fn main() -> Result<()> {
             sr_clone.process_pending_resyncs(gm_clone4.get_assignments()).await;
         }
     }));
+
+    // 7. Multi-Market Discovery Loop (for crypto, economics, politics)
+    if let Some(mm_manager) = multi_market_manager.clone() {
+        let mm_interval = config.multi_market_discovery_interval_secs;
+        tasks.push(tokio::spawn(async move {
+            info!(
+                "Multi-market discovery loop started (interval: {}s)",
+                mm_interval
+            );
+            loop {
+                mm_manager.run_discovery_cycle().await;
+                tokio::time::sleep(Duration::from_secs(mm_interval)).await;
+            }
+        }));
+    }
+
+    // 8. Multi-Market Heartbeat Handler
+    if let Some(mm_manager) = multi_market_manager {
+        let redis_url3 = config.redis_url.clone();
+        tasks.push(tokio::spawn(async move {
+            match redis::Client::open(redis_url3) {
+                Ok(client) => match client.get_async_connection().await {
+                    Ok(conn) => {
+                        let mut pubsub = conn.into_pubsub();
+                        if let Err(e) = pubsub.psubscribe("shard:*:heartbeat").await {
+                            error!("Failed to subscribe to heartbeats for multi-market: {}", e);
+                            return;
+                        }
+                        info!("Multi-market manager listening for shard heartbeats...");
+                        let mut stream = pubsub.on_message();
+                        while let Some(msg) = stream.next().await {
+                            if let Ok(payload_str) = msg.get_payload::<String>() {
+                                if let Ok(payload) =
+                                    serde_json::from_str::<serde_json::Value>(&payload_str)
+                                {
+                                    mm_manager.handle_shard_heartbeat(payload).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => error!("Redis connection error in multi-market heartbeat: {}", e),
+                },
+                Err(e) => error!("Redis client error: {}", e),
+            }
+        }));
+    }
 
     // Wait for signal
     match tokio::signal::ctrl_c().await {
