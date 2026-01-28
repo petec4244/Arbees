@@ -1063,6 +1063,23 @@ async fn monitor_game(
                 // Arbs are higher priority than model-edge signals (guaranteed profit)
                 const MIN_ARB_PROFIT_CENTS: i16 = 1;
 
+                // Debug: Log when we have both platforms for a team
+                if home_kalshi.is_some() && home_poly.is_some() {
+                    let hk = home_kalshi.unwrap();
+                    let hp = home_poly.unwrap();
+                    // Calculate the NO prices (what we'd need to buy for the other side)
+                    let k_no = 1.0 - hk.yes_bid;
+                    let p_no = 1.0 - hp.yes_bid;
+                    debug!(
+                        "ARB check {} {}: Kalshi YES={:.0}¢ NO={:.0}¢ (bid={:.2}) | Poly YES={:.0}¢ NO={:.0}¢ (bid={:.2}) | K+P_NO={:.0}¢ P+K_NO={:.0}¢",
+                        game_id, game.home_team,
+                        hk.yes_ask * 100.0, k_no * 100.0, hk.yes_bid,
+                        hp.yes_ask * 100.0, p_no * 100.0, hp.yes_bid,
+                        (hk.yes_ask + p_no) * 100.0,
+                        (hp.yes_ask + k_no) * 100.0
+                    );
+                }
+
                 if let Some((arb_mask, profit)) = check_cross_platform_arb(home_kalshi, home_poly, MIN_ARB_PROFIT_CENTS) {
                     let arb_key = (game.home_team.clone(), "arb".to_string());
                     let should_emit_arb = match last_signal_times.get(&arb_key) {

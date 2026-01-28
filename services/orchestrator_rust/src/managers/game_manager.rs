@@ -55,6 +55,11 @@ impl GameManager {
         }
     }
 
+    /// Get reference to assignments for fault tolerance resync
+    pub fn get_assignments(&self) -> Arc<RwLock<HashMap<String, GameAssignment>>> {
+        self.assignments.clone()
+    }
+
     pub async fn run_scheduled_sync(&self) {
         info!("Starting scheduled games sync");
         let days = 7;

@@ -164,18 +164,15 @@ async fn main() -> Result<()> {
     }));
 
     // 6. Service Resync Loop (for fault tolerance)
-    // Note: Resync is handled internally by ServiceRegistry
-    // The assignments are passed during the process_pending_resyncs call
-    // For now, we'll skip the resync loop and handle it in a future update
-    // let sr_clone = service_registry.clone();
-    // tasks.push(tokio::spawn(async move {
-    //     info!("Service resync loop started");
-    //     loop {
-    //         tokio::time::sleep(Duration::from_secs(1)).await;
-    //         // Process pending resyncs
-    //         // sr_clone.process_pending_resyncs().await;
-    //     }
-    // }));
+    let sr_clone = service_registry.clone();
+    let gm_clone4 = game_manager.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Service resync loop started");
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sr_clone.process_pending_resyncs(gm_clone4.get_assignments()).await;
+        }
+    }));
 
     // Wait for signal
     match tokio::signal::ctrl_c().await {

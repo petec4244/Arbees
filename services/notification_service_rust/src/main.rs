@@ -28,6 +28,135 @@ use thresholds::ThresholdTracker;
 use tokio::sync::RwLock;
 
 // ============================================================================
+// Orchestrator Notification Handler
+// ============================================================================
+
+/// Handle fault tolerance notifications from the orchestrator
+async fn handle_orchestrator_notification(
+    channel: &str,
+    payload_bytes: &[u8],
+    signal: &SignalClient,
+    metrics: &Arc<RwLock<Metrics>>,
+) {
+    // Parse as generic JSON
+    let notification: serde_json::Value = match serde_json::from_slice(payload_bytes) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("Failed to parse orchestrator notification: {}", e);
+            let mut m = metrics.write().await;
+            m.parse_errors += 1;
+            return;
+        }
+    };
+
+    // Extract common fields
+    let notif_type = notification
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let instance_id = notification
+        .get("instance_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let service_type = notification
+        .get("service_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    // Format message based on notification type
+    let message = match notif_type {
+        "service_restarted" => {
+            let process_id = notification
+                .get("process_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "🔄 Service Restart Detected\nService: {}\nInstance: {}\nProcess: {}",
+                service_type, instance_id, &process_id[..8]
+            )
+        }
+        "service_resync_complete" => {
+            let game_count = notification
+                .get("games_resynced")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!(
+                "✅ Service Resync Complete\nService: {}\nInstance: {}\nGames Resynced: {}",
+                service_type, instance_id, game_count
+            )
+        }
+        "service_degraded" => {
+            let failing_checks = notification
+                .get("failing_checks")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            format!(
+                "⚠️ Service Degraded\nService: {}\nInstance: {}\nFailing Checks: {}",
+                service_type, instance_id, failing_checks
+            )
+        }
+        "service_recovered" => {
+            format!(
+                "✅ Service Recovered\nService: {}\nInstance: {}",
+                service_type, instance_id
+            )
+        }
+        "circuit_breaker_opened" => {
+            let failure_count = notification
+                .get("failure_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!(
+                "🚨 Circuit Breaker Opened\nService: {}\nInstance: {}\nFailures: {}",
+                service_type, instance_id, failure_count
+            )
+        }
+        "circuit_breaker_closed" => {
+            format!(
+                "✅ Circuit Breaker Closed\nService: {}\nInstance: {}",
+                service_type, instance_id
+            )
+        }
+        "service_dead" => {
+            let last_heartbeat = notification
+                .get("last_heartbeat")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "💀 Service Dead\nService: {}\nInstance: {}\nLast Heartbeat: {}",
+                service_type, instance_id, last_heartbeat
+            )
+        }
+        _ => {
+            format!(
+                "📊 Orchestrator Notification\nType: {}\nService: {}\nInstance: {}",
+                notif_type, service_type, instance_id
+            )
+        }
+    };
+
+    // Send notification (always send fault tolerance events immediately)
+    if let Err(e) = signal.send(&message).await {
+        error!("Failed to send orchestrator notification: {}", e);
+        let mut m = metrics.write().await;
+        m.send_errors += 1;
+    } else {
+        info!(
+            "Sent orchestrator notification: type={} service={}",
+            notif_type, service_type
+        );
+        let mut m = metrics.write().await;
+        m.sent += 1;
+    }
+}
+
+// ============================================================================
 // Heartbeat
 // ============================================================================
 
@@ -181,9 +310,33 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Subscribe to notification events
+    // Subscribe to notification events and fault tolerance channels
     let mut pubsub = redis.subscribe(channels::NOTIFICATION_EVENTS).await?;
     info!("Subscribed to {}", channels::NOTIFICATION_EVENTS);
+
+    // Subscribe to fault tolerance notification channels
+    pubsub
+        .subscribe(channels::NOTIFICATIONS_SERVICE_HEALTH)
+        .await?;
+    info!("Subscribed to {}", channels::NOTIFICATIONS_SERVICE_HEALTH);
+
+    pubsub
+        .subscribe(channels::NOTIFICATIONS_SERVICE_RESYNC)
+        .await?;
+    info!("Subscribed to {}", channels::NOTIFICATIONS_SERVICE_RESYNC);
+
+    pubsub
+        .subscribe(channels::NOTIFICATIONS_CIRCUIT_BREAKER)
+        .await?;
+    info!(
+        "Subscribed to {}",
+        channels::NOTIFICATIONS_CIRCUIT_BREAKER
+    );
+
+    pubsub
+        .subscribe(channels::NOTIFICATIONS_DEGRADATION)
+        .await?;
+    info!("Subscribed to {}", channels::NOTIFICATIONS_DEGRADATION);
 
     let mut stream = pubsub.on_message();
     while let Some(msg) = stream.next().await {
@@ -192,6 +345,29 @@ async fn main() -> Result<()> {
             let mut m = metrics.write().await;
             m.received += 1;
         }
+
+        // Get channel name to determine message type
+        let channel: String = match msg.get_channel_name() {
+            s if s.starts_with(channels::NOTIFICATION_EVENTS) => {
+                channels::NOTIFICATION_EVENTS.to_string()
+            }
+            s if s.starts_with(channels::NOTIFICATIONS_SERVICE_HEALTH) => {
+                channels::NOTIFICATIONS_SERVICE_HEALTH.to_string()
+            }
+            s if s.starts_with(channels::NOTIFICATIONS_SERVICE_RESYNC) => {
+                channels::NOTIFICATIONS_SERVICE_RESYNC.to_string()
+            }
+            s if s.starts_with(channels::NOTIFICATIONS_CIRCUIT_BREAKER) => {
+                channels::NOTIFICATIONS_CIRCUIT_BREAKER.to_string()
+            }
+            s if s.starts_with(channels::NOTIFICATIONS_DEGRADATION) => {
+                channels::NOTIFICATIONS_DEGRADATION.to_string()
+            }
+            _ => {
+                warn!("Unknown channel: {}", msg.get_channel_name());
+                continue;
+            }
+        };
 
         // Get payload as bytes (consistent with other services)
         let payload_bytes: Vec<u8> = match msg.get_payload::<Vec<u8>>() {
@@ -209,6 +385,12 @@ async fn main() -> Result<()> {
                 }
             }
         };
+
+        // Handle fault tolerance notifications separately
+        if channel != channels::NOTIFICATION_EVENTS {
+            handle_orchestrator_notification(&channel, &payload_bytes, &signal, &metrics).await;
+            continue;
+        }
 
         // Parse JSON from bytes (handles UTF-8 correctly)
         let mut event: NotificationEvent = match serde_json::from_slice(&payload_bytes) {

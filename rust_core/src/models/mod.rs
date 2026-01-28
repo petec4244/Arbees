@@ -846,6 +846,12 @@ pub mod channels {
     pub const FEEDBACK_RULES: &str = "feedback:rules";
     pub const HEALTH_HEARTBEATS: &str = "health:heartbeats";
     pub const NOTIFICATION_EVENTS: &str = "notification:events";
+
+    // Fault Tolerance Notification Channels
+    pub const NOTIFICATIONS_SERVICE_HEALTH: &str = "notifications:service_health";
+    pub const NOTIFICATIONS_SERVICE_RESYNC: &str = "notifications:service_resync";
+    pub const NOTIFICATIONS_CIRCUIT_BREAKER: &str = "notifications:circuit_breaker";
+    pub const NOTIFICATIONS_DEGRADATION: &str = "notifications:degradation";
 }
 
 // ============================================================================
