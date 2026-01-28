@@ -9,6 +9,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+// Concrete provider implementations
+pub mod espn;
+
 /// Universal event provider trait
 ///
 /// Implementations provide event data for different market types:
