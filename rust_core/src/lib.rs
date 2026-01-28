@@ -18,6 +18,7 @@ pub mod win_prob;
 // Service modules (from arbees_rust_core merge)
 pub mod clients;
 pub mod db;
+pub mod matching;
 pub mod models;
 pub mod probability;
 pub mod providers;
