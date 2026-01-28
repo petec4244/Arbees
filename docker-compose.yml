@@ -242,9 +242,9 @@ services:
     env_file:
       - .env
     environment:
-      # ZMQ configuration for low-latency signal reception
-      ZMQ_ENABLED: "${ZMQ_ENABLED:-false}"
-      ZMQ_SUB_ENDPOINT: "tcp://game_shard:5558"
+      # Execution service uses Redis-only mode to receive ExecutionRequests from signal_processor
+      # It does NOT subscribe to game_shard ZMQ (which sends TradingSignal, not ExecutionRequest)
+      ZMQ_ENABLED: "false"
     volumes:
       - ./:/app
     profiles:
