@@ -3,7 +3,7 @@ use arbees_rust_core::atomic_orderbook::kalshi_fee_cents;
 use arbees_rust_core::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
-    channels, FootballState, GameState, Platform, SignalDirection, SignalType, Sport,
+    channels, FootballState, GameState, MarketType, Platform, SignalDirection, SignalType, Sport,
     SportSpecificState, TradingSignal, TransportMode,
 };
 use arbees_rust_core::redis::bus::RedisBus;
@@ -1635,6 +1635,15 @@ async fn fetch_game_state(
     };
 
     let state = GameState {
+        // Universal fields (new - Phase 1-5)
+        event_id: game.id.clone(),
+        market_type: Some(MarketType::sport(sport_enum)),
+        entity_a: Some(game.home_team.clone()),
+        entity_b: Some(game.away_team.clone()),
+        event_start: None,
+        event_end: None,
+        resolution_criteria: None,
+        // Legacy fields
         game_id: game.id.clone(),
         sport: sport_enum,
         home_team: game.home_team.clone(),
@@ -1647,6 +1656,7 @@ async fn fetch_game_state(
         fetched_at: Utc::now(), // Track when this state was fetched
         pregame_home_prob: None,
         sport_specific,
+        market_specific: None,
     };
 
     Some((game, state))

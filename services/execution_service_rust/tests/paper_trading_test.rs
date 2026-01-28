@@ -17,6 +17,7 @@ fn create_test_request(platform: Platform, price: f64, size: f64) -> ExecutionRe
         platform,
         market_id: "TEST-MARKET-123".to_string(),
         contract_team: Some("Test Team".to_string()),
+        token_id: None, // For Polymarket CLOB
         game_id: "test-game-456".to_string(),
         sport: Sport::NBA,
         side: ExecutionSide::Yes,
@@ -35,7 +36,7 @@ fn create_test_request(platform: Platform, price: f64, size: f64) -> ExecutionRe
 
 #[tokio::test]
 async fn test_paper_trading_execution_fills_order() {
-    let engine = ExecutionEngine::new(true); // Paper trading mode
+    let engine = ExecutionEngine::new(true).await; // Paper trading mode
 
     let request = create_test_request(Platform::Paper, 0.55, 10.0);
     let result = engine.execute(request.clone()).await.expect("Execution should succeed");
@@ -51,7 +52,7 @@ async fn test_paper_trading_execution_fills_order() {
 
 #[tokio::test]
 async fn test_paper_trading_calculates_kalshi_fees() {
-    let engine = ExecutionEngine::new(true);
+    let engine = ExecutionEngine::new(true).await;
 
     // At 50% price, Kalshi fee is max: ceil(7 * 50 * 50 / 10000) = 2 cents per contract
     let request = create_test_request(Platform::Kalshi, 0.50, 100.0);
@@ -64,7 +65,7 @@ async fn test_paper_trading_calculates_kalshi_fees() {
 
 #[tokio::test]
 async fn test_paper_trading_calculates_fees_at_extreme_prices() {
-    let engine = ExecutionEngine::new(true);
+    let engine = ExecutionEngine::new(true).await;
 
     // At 95% price, fee should be lower
     // ceil(7 * 95 * 5 / 10000) = ceil(0.3325) = 1 cent per contract
@@ -78,7 +79,7 @@ async fn test_paper_trading_calculates_fees_at_extreme_prices() {
 
 #[tokio::test]
 async fn test_paper_trading_tracks_latency() {
-    let engine = ExecutionEngine::new(true);
+    let engine = ExecutionEngine::new(true).await;
 
     let request = create_test_request(Platform::Paper, 0.60, 5.0);
     let result = engine.execute(request).await.expect("Execution should succeed");
@@ -90,7 +91,7 @@ async fn test_paper_trading_tracks_latency() {
 
 #[tokio::test]
 async fn test_paper_trading_preserves_request_fields() {
-    let engine = ExecutionEngine::new(true);
+    let engine = ExecutionEngine::new(true).await;
 
     let request = create_test_request(Platform::Paper, 0.65, 20.0);
     let request_id = request.request_id.clone();
@@ -112,7 +113,7 @@ async fn test_paper_trading_preserves_request_fields() {
 
 #[tokio::test]
 async fn test_kalshi_live_disabled_in_paper_mode() {
-    let engine = ExecutionEngine::new(true); // Paper trading mode
+    let engine = ExecutionEngine::new(true).await; // Paper trading mode
 
     // In paper trading mode, live trading should be disabled
     assert!(!engine.kalshi_live_enabled());
@@ -120,7 +121,7 @@ async fn test_kalshi_live_disabled_in_paper_mode() {
 
 #[tokio::test]
 async fn test_polymarket_execution_rejected_without_clob() {
-    let engine = ExecutionEngine::new(false); // Live trading mode
+    let engine = ExecutionEngine::new(false).await; // Live trading mode
 
     let request = create_test_request(Platform::Polymarket, 0.55, 10.0);
     let result = engine.execute(request).await.expect("Execution should return result");
