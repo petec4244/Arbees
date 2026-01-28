@@ -392,7 +392,8 @@ impl GameShard {
     /// Initialize ZMQ PUB socket for publishing signals
     async fn init_zmq_pub(port: u16) -> Result<PubSocket> {
         let mut socket = PubSocket::new();
-        let addr = format!("tcp://*:{}", port);
+        // Use 0.0.0.0 instead of * for zeromq-rs compatibility
+        let addr = format!("tcp://0.0.0.0:{}", port);
         socket.bind(&addr).await?;
         Ok(socket)
     }
