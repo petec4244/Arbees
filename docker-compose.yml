@@ -225,9 +225,10 @@ services:
       - .env
     environment:
       RUST_LOG: info
+      SHARD_TYPE: "crypto"
       CRYPTO_SHARD_ID: "crypto_1"
-      # ZMQ price subscriptions: Kalshi (5555), Polymarket (5556), Spot prices (5560)
-      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556,tcp://crypto-spot-monitor:5560"
+      # ZMQ price subscriptions: Spot prices primary, Kalshi secondary (optional if not running)
+      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://crypto-spot-monitor:5560"
       CRYPTO_EXECUTION_PUB_ENDPOINT: "tcp://*:5559"
       # Risk management
       CRYPTO_MIN_EDGE_PCT: "3.0"

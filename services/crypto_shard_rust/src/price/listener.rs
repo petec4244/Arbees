@@ -97,10 +97,18 @@ impl CryptoPriceListener {
         }
 
         // Subscribe to price topics from all sources
-        socket.subscribe("prices.kalshi").await?;  // Kalshi prediction market prices
-        socket.subscribe("prices.poly").await?;    // Polymarket prediction market prices
-        socket.subscribe("crypto.prices").await?;  // Crypto spot prices
-        info!("Subscribed to prices.kalshi.*, prices.poly.*, crypto.prices.*");
+        // Note: These subscriptions will work even if no publishers are connected yet
+        // ZMQ will buffer/match messages once publishers connect
+        if let Err(e) = socket.subscribe("prices.kalshi").await {
+            warn!("Failed to subscribe to prices.kalshi: {}", e);
+        }
+        if let Err(e) = socket.subscribe("prices.poly").await {
+            warn!("Failed to subscribe to prices.poly: {}", e);
+        }
+        if let Err(e) = socket.subscribe("crypto.prices").await {
+            warn!("Failed to subscribe to crypto.prices: {}", e);
+        }
+        info!("Subscription setup complete (will receive prices.kalshi.*, prices.poly.*, crypto.prices.*)");
 
         let mut last_stats_log = Instant::now();
         let stats_log_interval = Duration::from_secs(60);
