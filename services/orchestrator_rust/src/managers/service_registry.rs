@@ -581,6 +581,26 @@ impl ServiceRegistry {
             .collect()
     }
 
+    /// Track a game/event assignment to a shard
+    /// This prevents zombie detection from removing legitimately assigned games
+    pub async fn track_assignment(&self, shard_id: &str, game_id: &str) {
+        let mut services = self.services.write().await;
+        if let Some(state) = services.get_mut(shard_id) {
+            state.assigned_games.insert(game_id.to_string());
+            debug!(
+                "Tracked assignment of {} to shard {} (total: {})",
+                game_id,
+                shard_id,
+                state.assigned_games.len()
+            );
+        } else {
+            warn!(
+                "Cannot track assignment: shard {} not found in registry",
+                shard_id
+            );
+        }
+    }
+
     /// Get service status by instance ID
     pub async fn get_service_status(&self, instance_id: &str) -> Option<ServiceStatus> {
         let services = self.services.read().await;

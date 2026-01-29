@@ -150,7 +150,20 @@ impl CryptoEventProvider {
             return Err(anyhow!("Polymarket API error: {}", response.status()));
         }
 
-        let markets: Vec<PolymarketMarket> = response.json().await?;
+        // Get raw text first for debugging
+        let text = response.text().await?;
+
+        let markets: Vec<PolymarketMarket> = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                // Log a snippet of the response for debugging
+                let snippet: String = text.chars().take(500).collect();
+                warn!("Polymarket JSON parse error: {}. Response snippet: {}", e, snippet);
+                return Err(anyhow!("JSON parse error: {}", e));
+            }
+        };
+
+        info!("Polymarket returned {} total markets", markets.len());
 
         // Filter for crypto markets
         let crypto_markets: Vec<CryptoMarket> = markets
@@ -158,28 +171,30 @@ impl CryptoEventProvider {
             .filter_map(|m| self.parse_polymarket_crypto(&m))
             .collect();
 
+        if !crypto_markets.is_empty() {
+            info!(
+                "Found {} crypto markets on Polymarket: {:?}",
+                crypto_markets.len(),
+                crypto_markets.iter().map(|m| &m.title).collect::<Vec<_>>()
+            );
+        }
+
         Ok(crypto_markets)
     }
 
     /// Parse a Polymarket market into a CryptoMarket if it's crypto-related
     fn parse_polymarket_crypto(&self, market: &PolymarketMarket) -> Option<CryptoMarket> {
-        let question = market.question.to_uppercase();
-
-        // Check if it's a crypto market
+        // Check if it's a crypto market using word-boundary matching
         let asset = TRACKED_ASSETS
             .iter()
-            .find(|&asset| {
-                question.contains(asset)
-                    || question.contains(&format!("{} ", asset))
-                    || question.contains(&asset_full_name(asset))
-            })?;
+            .find(|&asset| contains_crypto_asset(&market.question, asset))?;
 
         // Try to parse price target from question
         let (target_price, prediction_type) = self.parse_price_target(&market.question)?;
 
         // Parse end date
         let target_date = market
-            .end_date_iso
+            .end_date
             .as_ref()
             .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
             .map(|d| d.with_timezone(&Utc))
@@ -225,6 +240,11 @@ impl CryptoEventProvider {
         }
 
         let resp: KalshiMarketsResponse = response.json().await?;
+        info!("Kalshi returned {} total markets", resp.markets.len());
+
+        // Log some sample titles to help debug crypto detection
+        let sample_titles: Vec<&str> = resp.markets.iter().take(5).map(|m| m.title.as_str()).collect();
+        info!("Kalshi sample titles: {:?}", sample_titles);
 
         // Filter for crypto markets
         let crypto_markets: Vec<CryptoMarket> = resp
@@ -233,19 +253,23 @@ impl CryptoEventProvider {
             .filter_map(|m| self.parse_kalshi_crypto(&m))
             .collect();
 
+        if !crypto_markets.is_empty() {
+            info!(
+                "Found {} crypto markets on Kalshi: {:?}",
+                crypto_markets.len(),
+                crypto_markets.iter().map(|m| &m.title).collect::<Vec<_>>()
+            );
+        }
+
         Ok(crypto_markets)
     }
 
     /// Parse a Kalshi market into a CryptoMarket if it's crypto-related
     fn parse_kalshi_crypto(&self, market: &KalshiMarket) -> Option<CryptoMarket> {
-        let title = market.title.to_uppercase();
-
-        // Check if it's a crypto market
+        // Check if it's a crypto market using word-boundary matching
         let asset = TRACKED_ASSETS
             .iter()
-            .find(|&asset| {
-                title.contains(asset) || title.contains(&asset_full_name(asset).to_uppercase())
-            })?;
+            .find(|&asset| contains_crypto_asset(&market.title, asset))?;
 
         // Try to parse price target
         let (target_price, prediction_type) = self.parse_price_target(&market.title)?;
@@ -433,6 +457,18 @@ impl EventProvider for CryptoEventProvider {
     }
 
     async fn get_event_state(&self, event_id: &str) -> Result<EventState> {
+        // Check if cache is empty and needs refresh
+        {
+            let cache = self.market_cache.read().await;
+            if cache.is_empty() {
+                drop(cache);
+                info!("Market cache empty, refreshing...");
+                if let Err(e) = self.refresh_markets().await {
+                    warn!("Failed to refresh market cache: {}", e);
+                }
+            }
+        }
+
         let cache = self.market_cache.read().await;
 
         let market = cache
@@ -503,6 +539,26 @@ fn extract_price_from_text(text: &str) -> Option<f64> {
     None
 }
 
+/// Check if text contains asset as a whole word (not part of another word)
+/// This prevents "Kenneth" from matching "ETH"
+fn contains_crypto_asset(text: &str, asset: &str) -> bool {
+    let text_upper = text.to_uppercase();
+    let asset_upper = asset.to_uppercase();
+    let full_name = asset_full_name(asset).to_uppercase();
+
+    // Check for the asset symbol with word boundaries
+    // Allow matches like "BTC", "$BTC", "BTC:", "BTC,", "(BTC)", etc.
+    for word in text_upper.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ':' || c == ';') {
+        let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if trimmed == asset_upper || trimmed == format!("${}", asset_upper) {
+            return true;
+        }
+    }
+
+    // Check for full name (e.g., "BITCOIN", "ETHEREUM")
+    text_upper.contains(&full_name)
+}
+
 /// Get full name for asset symbol
 fn asset_full_name(symbol: &str) -> String {
     match symbol {
@@ -524,14 +580,80 @@ fn asset_full_name(symbol: &str) -> String {
 // API Response Structs
 // ============================================================================
 
+/// Helper module to deserialize numbers that may come as strings
+mod string_or_number {
+    use serde::{self, Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrNumber {
+            String(String),
+            Number(f64),
+            Null,
+        }
+
+        match StringOrNumber::deserialize(deserializer)? {
+            StringOrNumber::String(s) => Ok(s.parse().ok()),
+            StringOrNumber::Number(n) => Ok(Some(n)),
+            StringOrNumber::Null => Ok(None),
+        }
+    }
+
+    /// Deserialize outcome_prices which can be:
+    /// - A JSON array: [0.5, 0.5]
+    /// - A JSON string containing an array: "[\"0.5\", \"0.5\"]"
+    /// - null/missing
+    pub fn deserialize_outcome_prices<'de, D>(deserializer: D) -> Result<Option<Vec<f64>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OutcomePrices {
+            // String containing JSON array like "[\"0.0355\", \"0.9645\"]"
+            JsonString(String),
+            // Direct array of numbers
+            NumberArray(Vec<f64>),
+            // Direct array of strings
+            StringArray(Vec<String>),
+        }
+
+        let opt: Option<OutcomePrices> = Option::deserialize(deserializer)?;
+        Ok(opt.and_then(|prices| match prices {
+            OutcomePrices::JsonString(s) => {
+                // Try to parse as JSON array of strings
+                if let Ok(arr) = serde_json::from_str::<Vec<String>>(&s) {
+                    Some(arr.iter().filter_map(|v| v.parse().ok()).collect())
+                } else if let Ok(arr) = serde_json::from_str::<Vec<f64>>(&s) {
+                    Some(arr)
+                } else {
+                    None
+                }
+            }
+            OutcomePrices::NumberArray(arr) => Some(arr),
+            OutcomePrices::StringArray(arr) => {
+                Some(arr.iter().filter_map(|v| v.parse().ok()).collect())
+            }
+        }))
+    }
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PolymarketMarket {
     condition_id: String,
     question: String,
     description: Option<String>,
-    end_date_iso: Option<String>,
+    end_date: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize_outcome_prices")]
     outcome_prices: Option<Vec<f64>>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
     volume: Option<f64>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
     liquidity: Option<f64>,
     closed: Option<bool>,
 }

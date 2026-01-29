@@ -6,6 +6,7 @@
 //! - Politics (elections, confirmations, policy votes)
 
 use crate::config::Config;
+use crate::managers::service_registry::ServiceRegistry;
 use crate::managers::shard_manager::ShardManager;
 use arbees_rust_core::clients::coingecko::CoinGeckoClient;
 use arbees_rust_core::models::MarketType;
@@ -39,6 +40,7 @@ pub struct MultiMarketManager {
     redis: redis::Client,
     config: Config,
     shard_manager: Arc<ShardManager>,
+    service_registry: Arc<ServiceRegistry>,
     /// Active event assignments
     assignments: Arc<RwLock<HashMap<String, EventAssignment>>>,
     /// Crypto event provider
@@ -54,6 +56,7 @@ impl MultiMarketManager {
     pub fn new(
         redis_client: redis::Client,
         shard_manager: Arc<ShardManager>,
+        service_registry: Arc<ServiceRegistry>,
         config: Config,
     ) -> Self {
         // Initialize providers based on configuration
@@ -80,6 +83,7 @@ impl MultiMarketManager {
             redis: redis_client,
             config,
             shard_manager,
+            service_registry,
             assignments: Arc::new(RwLock::new(HashMap::new())),
             crypto_provider,
             economics_provider,
@@ -265,6 +269,11 @@ impl MultiMarketManager {
                 event.event_id,
                 shard.shard_id
             );
+
+            // Track assignment in service registry to prevent zombie detection
+            self.service_registry
+                .track_assignment(&shard.shard_id, &event.event_id)
+                .await;
 
             let mut assign_lock = self.assignments.write().await;
             assign_lock.insert(event.event_id.clone(), assignment);

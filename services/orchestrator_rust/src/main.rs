@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
         Some(Arc::new(MultiMarketManager::new(
             redis_client.clone(),
             shard_manager.clone(),
+            service_registry.clone(),
             config.clone(),
         )))
     } else {

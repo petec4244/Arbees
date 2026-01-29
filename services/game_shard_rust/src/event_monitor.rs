@@ -10,7 +10,7 @@ use arbees_rust_core::models::{
     TransportMode,
 };
 use arbees_rust_core::probability::ProbabilityModelRegistry;
-use arbees_rust_core::providers::{EventProviderRegistry, EventState, EventStatus};
+use arbees_rust_core::providers::{EventProviderRegistry, EventState, EventStatus, StateData};
 use arbees_rust_core::redis::bus::RedisBus;
 use chrono::Utc;
 use log::{debug, error, info, warn};
@@ -151,57 +151,76 @@ pub async fn monitor_event(
                 publish_event_state(&redis, &event_id, &state, probability).await;
 
                 // Check for trading signals
+                // First, prepare fallback price from metadata for crypto markets
+                let fallback_price: Option<MarketPriceData> =
+                    if matches!(market_type, MarketType::Crypto { .. }) {
+                        extract_crypto_prices_from_metadata(&state.state, &event_id, &entity_a)
+                    } else {
+                        None
+                    };
+
+                // Check Redis prices first
                 let prices = market_prices.read().await;
-                if let Some(event_prices) = prices.get(&event_id) {
-                    // Find prices for entity_a (primary entity)
-                    if let Some(price) = find_entity_price(event_prices, &entity_a, config.price_staleness_secs) {
-                        // Calculate edge
-                        let market_mid = price.mid_price;
-                        let edge_pct = (probability - market_mid).abs() * 100.0;
+                let redis_price = prices
+                    .get(&event_id)
+                    .and_then(|event_prices| {
+                        find_entity_price(event_prices, &entity_a, config.price_staleness_secs)
+                    })
+                    .cloned();
+                drop(prices); // Release lock early
 
-                        if edge_pct >= config.min_edge_pct {
-                            let direction = if probability > market_mid {
-                                SignalDirection::Buy
-                            } else {
-                                SignalDirection::Sell
-                            };
+                // Use Redis price if available, otherwise fallback to metadata
+                let price = redis_price.or(fallback_price);
 
-                            let signal_key = (entity_a.clone(), format!("{:?}", direction).to_lowercase());
+                if let Some(ref price) = price {
+                    // Calculate edge
+                    let market_mid = price.mid_price;
+                    let edge_pct = (probability - market_mid).abs() * 100.0;
 
-                            // Check debounce
-                            let should_emit = match last_signal_times.get(&signal_key) {
-                                Some(last_time) => {
-                                    last_time.elapsed().as_secs() >= config.signal_debounce_secs
-                                }
-                                None => true,
-                            };
+                    if edge_pct >= config.min_edge_pct {
+                        let direction = if probability > market_mid {
+                            SignalDirection::Buy
+                        } else {
+                            SignalDirection::Sell
+                        };
 
-                            if should_emit {
-                                info!(
-                                    "EDGE: {} {} model={:.1}% market={:.1}% edge={:.1}%",
-                                    event_id, entity_a, probability * 100.0, market_mid * 100.0, edge_pct
-                                );
+                        let signal_key = (entity_a.clone(), format!("{:?}", direction).to_lowercase());
 
-                                if emit_event_signal(
-                                    &redis,
-                                    &event_id,
-                                    &market_type,
-                                    &entity_a,
-                                    direction,
-                                    &price,
-                                    probability,
-                                    edge_pct,
-                                    &zmq_pub,
-                                    &zmq_seq,
-                                    transport_mode,
-                                )
-                                .await
-                                {
-                                    last_signal_times.insert(signal_key, Instant::now());
-                                }
+                        // Check debounce
+                        let should_emit = match last_signal_times.get(&signal_key) {
+                            Some(last_time) => {
+                                last_time.elapsed().as_secs() >= config.signal_debounce_secs
+                            }
+                            None => true,
+                        };
+
+                        if should_emit {
+                            info!(
+                                "EDGE: {} {} model={:.1}% market={:.1}% edge={:.1}%",
+                                event_id, entity_a, probability * 100.0, market_mid * 100.0, edge_pct
+                            );
+
+                            if emit_event_signal(
+                                &redis,
+                                &event_id,
+                                &market_type,
+                                &entity_a,
+                                direction,
+                                price,
+                                probability,
+                                edge_pct,
+                                &zmq_pub,
+                                &zmq_seq,
+                                transport_mode,
+                            )
+                            .await
+                            {
+                                last_signal_times.insert(signal_key, Instant::now());
                             }
                         }
                     }
+                } else {
+                    debug!("No price available for event {} entity {}", event_id, entity_a);
                 }
 
                 // Update last probability
@@ -268,6 +287,51 @@ fn find_entity_price<'a>(
     }
 
     None
+}
+
+/// Extract market prices from crypto metadata as fallback when Redis prices aren't available.
+///
+/// Crypto markets store `yes_price` and `no_price` in the EventState metadata from the provider.
+/// This allows price-based signal generation without requiring a separate price publisher.
+fn extract_crypto_prices_from_metadata(
+    state: &StateData,
+    event_id: &str,
+    entity: &str,
+) -> Option<MarketPriceData> {
+    if let StateData::Crypto(crypto_state) = state {
+        let yes_price = crypto_state.metadata.get("yes_price")?.as_f64()?;
+        let no_price = crypto_state.metadata.get("no_price")?.as_f64()?;
+
+        // Mid-price calculation (yes_price is probability of YES outcome)
+        let mid_price = yes_price;
+
+        let platform = crypto_state
+            .metadata
+            .get("platform")
+            .and_then(|v| v.as_str())
+            .unwrap_or("polymarket")
+            .to_string();
+
+        debug!(
+            "Extracted crypto prices from metadata for {}: yes={:.3} no={:.3} platform={}",
+            event_id, yes_price, no_price, platform
+        );
+
+        Some(MarketPriceData {
+            market_id: event_id.to_string(),
+            platform,
+            contract_team: entity.to_string(),
+            yes_bid: yes_price.max(0.01).min(0.99),
+            yes_ask: yes_price.max(0.01).min(0.99),
+            mid_price,
+            timestamp: Utc::now(),
+            yes_bid_size: None,
+            yes_ask_size: None,
+            total_liquidity: Some(1000.0), // Default for paper trading
+        })
+    } else {
+        None
+    }
 }
 
 /// Emit a trading signal for a non-sports event
@@ -413,5 +477,72 @@ mod tests {
         // No match
         let found = find_entity_price(&prices, "ethereum", 30);
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_extract_crypto_prices_from_metadata() {
+        use arbees_rust_core::providers::CryptoStateData;
+
+        // Test with valid crypto state containing prices
+        let crypto_state = StateData::Crypto(CryptoStateData {
+            current_price: 100000.0,
+            target_price: 150000.0,
+            target_date: Utc::now() + chrono::Duration::days(30),
+            volatility_24h: 0.03,
+            volume_24h: Some(50_000_000_000.0),
+            metadata: serde_json::json!({
+                "yes_price": 0.45,
+                "no_price": 0.55,
+                "platform": "polymarket"
+            }),
+        });
+
+        let result = extract_crypto_prices_from_metadata(&crypto_state, "test-market", "BTC");
+        assert!(result.is_some());
+        let price = result.unwrap();
+        assert_eq!(price.market_id, "test-market");
+        assert_eq!(price.platform, "polymarket");
+        assert_eq!(price.contract_team, "BTC");
+        assert!((price.mid_price - 0.45).abs() < 0.001);
+        assert!((price.yes_bid - 0.45).abs() < 0.001);
+        assert!((price.yes_ask - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_extract_crypto_prices_from_metadata_missing_prices() {
+        use arbees_rust_core::providers::CryptoStateData;
+
+        // Test with metadata missing yes_price
+        let crypto_state = StateData::Crypto(CryptoStateData {
+            current_price: 100000.0,
+            target_price: 150000.0,
+            target_date: Utc::now() + chrono::Duration::days(30),
+            volatility_24h: 0.03,
+            volume_24h: Some(50_000_000_000.0),
+            metadata: serde_json::json!({
+                "platform": "kalshi"
+            }),
+        });
+
+        let result = extract_crypto_prices_from_metadata(&crypto_state, "test-market", "BTC");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_crypto_prices_non_crypto_state() {
+        use arbees_rust_core::providers::SportStateData;
+
+        // Test with non-crypto state
+        let sport_state = StateData::Sport(SportStateData {
+            score_a: 72,
+            score_b: 68,
+            period: 3,
+            time_remaining: 420,
+            possession: Some("home".to_string()),
+            sport_details: serde_json::json!({}),
+        });
+
+        let result = extract_crypto_prices_from_metadata(&sport_state, "test-game", "Lakers");
+        assert!(result.is_none());
     }
 }
