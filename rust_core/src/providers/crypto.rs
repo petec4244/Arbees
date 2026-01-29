@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, info, warn};
 
 /// Crypto event provider
 ///
@@ -34,6 +34,8 @@ pub struct CryptoEventProvider {
     last_update: Arc<RwLock<Option<DateTime<Utc>>>>,
     /// Cache TTL in seconds
     cache_ttl_secs: i64,
+    /// Mutex to prevent concurrent cache refreshes (prevents stack overflow)
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 /// Represents a crypto prediction market
@@ -81,6 +83,7 @@ impl CryptoEventProvider {
             market_cache: Arc::new(RwLock::new(HashMap::new())),
             last_update: Arc::new(RwLock::new(None)),
             cache_ttl_secs: 300, // 5 minute cache
+            refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -461,13 +464,33 @@ impl EventProvider for CryptoEventProvider {
 
     async fn get_event_state(&self, event_id: &str) -> Result<EventState> {
         // Check if cache is empty and needs refresh
+        // Use refresh_lock to prevent concurrent refreshes (which cause stack overflow)
         {
             let cache = self.market_cache.read().await;
-            if cache.is_empty() {
-                drop(cache);
-                info!("Market cache empty, refreshing...");
-                if let Err(e) = self.refresh_markets().await {
-                    warn!("Failed to refresh market cache: {}", e);
+            let needs_refresh = cache.is_empty();
+            drop(cache);
+
+            if needs_refresh {
+                // Try to acquire the refresh lock - only one task does the refresh
+                match self.refresh_lock.try_lock() {
+                    Ok(_guard) => {
+                        // Double-check cache is still empty (another task may have filled it)
+                        let cache = self.market_cache.read().await;
+                        if cache.is_empty() {
+                            drop(cache);
+                            debug!("Market cache empty, refreshing (holding lock)...");
+                            if let Err(e) = self.refresh_markets().await {
+                                warn!("Failed to refresh market cache: {}", e);
+                            }
+                        }
+                        // _guard drops here, releasing the lock
+                    }
+                    Err(_) => {
+                        // Another task is refreshing, wait for it
+                        debug!("Waiting for another task to refresh cache...");
+                        let _guard = self.refresh_lock.lock().await;
+                        // Cache should be populated now
+                    }
                 }
             }
         }

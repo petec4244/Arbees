@@ -172,6 +172,8 @@ services:
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5558"
       SHARD_TYPE: "sports"
+      # Increase stack size to prevent overflow with deep async call stacks
+      RUST_MIN_STACK: "8388608"
     expose:
       - "5558"
     ports:
@@ -210,6 +212,9 @@ services:
       ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5559"
+      # Increase stack size to prevent overflow with deep async call stacks
+      # 32MB stack for handling many concurrent event monitors
+      RUST_MIN_STACK: "33554432"
     expose:
       - "5559"
     ports:
