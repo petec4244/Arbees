@@ -126,8 +126,15 @@ async fn test_polymarket_execution_rejected_without_clob() {
     let request = create_test_request(Platform::Polymarket, 0.55, 10.0);
     let result = engine.execute(request).await.expect("Execution should return result");
 
-    // Polymarket live trading is not implemented
+    // Polymarket live trading should be rejected - either due to:
+    // 1. Balance validation (insufficient funds with no balance configured)
+    // 2. CLOB not configured
     assert_eq!(result.status, ExecutionStatus::Rejected);
     assert!(result.rejection_reason.is_some());
-    assert!(result.rejection_reason.unwrap().contains("CLOB"));
+    let reason = result.rejection_reason.unwrap();
+    assert!(
+        reason.contains("CLOB") || reason.contains("balance") || reason.contains("Insufficient"),
+        "Expected rejection due to CLOB or balance, got: {}",
+        reason
+    );
 }

@@ -629,6 +629,24 @@ impl KalshiClient {
         Ok(())
     }
 
+    /// Get order by ID
+    ///
+    /// Fetches the current status of an order by its ID.
+    /// Useful for verifying order execution and checking fill status.
+    pub async fn get_order(&self, order_id: &str) -> Result<KalshiOrder> {
+        if !self.has_credentials() {
+            return Err(anyhow!("Cannot get order: no credentials configured"));
+        }
+
+        let endpoint = format!("/portfolio/orders/{}", order_id);
+        let resp = self.authenticated_request("GET", &endpoint, None).await?;
+
+        let order: KalshiOrder = serde_json::from_value(resp.get("order").cloned().unwrap_or(resp))
+            .context("Failed to parse order response")?;
+
+        Ok(order)
+    }
+
     /// Get account balance
     pub async fn get_balance(&self) -> Result<f64> {
         if !self.has_credentials() {
