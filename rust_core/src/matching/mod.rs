@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // Concrete matcher implementations
+pub mod crypto;
 pub mod team;
 
 /// Match confidence level
@@ -146,8 +147,11 @@ impl EntityMatcherRegistry {
     pub fn new() -> Self {
         let mut matchers: Vec<Box<dyn EntityMatcher>> = Vec::new();
 
-        // Add team matcher (existing functionality)
+        // Add team matcher (sports)
         matchers.push(Box::new(team::TeamMatcher::new()));
+
+        // Add crypto asset matcher
+        matchers.push(Box::new(crypto::CryptoAssetMatcher::new()));
 
         Self { matchers }
     }
@@ -208,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_creation() {
         let registry = EntityMatcherRegistry::new();
-        assert_eq!(registry.matchers.len(), 1); // Team matcher
+        assert_eq!(registry.matchers.len(), 2); // Team matcher + Crypto matcher
     }
 
     #[tokio::test]

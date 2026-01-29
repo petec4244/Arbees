@@ -1,0 +1,140 @@
+# Docker Compose for Development
+#
+# This file provides an alternative development setup that:
+# 1. Mounts source code as volumes (no rebuild needed for code changes)
+# 2. Uses cargo watch for auto-recompilation
+# 3. Enables debug symbols and faster compile times
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Note: This is slower on first start but much faster for iteration
+
+version: '3.8'
+
+# Development build configuration
+x-rust-dev-build: &rust-dev-build
+  context: .
+  dockerfile: Dockerfile.rust-dev
+  cache_from:
+    - type=registry,ref=arbees/cache-dev:${SERVICE_NAME:-latest}
+  target: development
+
+services:
+  orchestrator:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: orchestrator_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug  # More verbose logging in dev
+      - RUST_BACKTRACE=full
+
+  market-discovery-rust:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: market_discovery_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+
+  game_shard:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: game_shard_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+
+  signal_processor:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: signal_processor_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+
+  execution_service:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: execution_service_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+
+  position_tracker:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: position_tracker_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+
+  notification_service_rust:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: notification_service_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+
+  zmq_listener:
+    build:
+      <<: *rust-dev-build
+      args:
+        SERVICE_NAME: zmq_listener_rust
+    volumes:
+      - ./rust_core:/app/rust_core:cached
+      - ./services:/app/services:cached
+      - rust-cargo-cache:/usr/local/cargo/registry
+      - rust-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+
+volumes:
+  rust-cargo-cache:
+    driver: local
+  rust-target-cache:
+    driver: local

@@ -133,6 +133,7 @@ pub async fn insert_from_event_state(pool: &PgPool, event_state: &EventState) ->
 mod tests {
     use super::*;
     use crate::models::{MarketType, Sport, SportSpecificState};
+    use chrono::Utc;
 
     fn make_test_game_state() -> GameState {
         GameState {

@@ -1219,23 +1219,9 @@ async fn monitor_game(
                         }
                     }
                 }
-
-                if let Some((arb_mask, profit)) = check_cross_platform_arb(away_kalshi, away_poly, MIN_ARB_PROFIT_CENTS) {
-                    let arb_key = (game.away_team.clone(), "arb".to_string());
-                    let should_emit_arb = match last_signal_times.get(&arb_key) {
-                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
-                        None => true,
-                    };
-                    if should_emit_arb {
-                        if emit_arb_signal(
-                            &redis, &game_id, sport_enum, &game.away_team,
-                            arb_mask, profit, away_kalshi.unwrap(), away_poly.unwrap(),
-                            &zmq_pub, &zmq_seq
-                        ).await {
-                            last_signal_times.insert(arb_key, Instant::now());
-                        }
-                    }
-                }
+                // NOTE: We only check home team for arbitrage. In a two-outcome market,
+                // away team arb is mathematically equivalent (TeamA YES = TeamB NO),
+                // so checking both would emit duplicate signals for the same trade.
                 // ===== END ARBITRAGE CHECK =====
 
                 // ===== SCORE-CHANGE LATENCY SIGNALS (DISABLED) =====

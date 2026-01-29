@@ -1,0 +1,87 @@
+# Optimized multi-stage Dockerfile for Rust services
+# Uses cargo-chef for dependency caching to dramatically speed up builds
+#
+# Build time comparison:
+# - Without caching: 5-10 minutes per service
+# - With caching (code changes only): 30-60 seconds per service
+# - With caching (no changes): 5-10 seconds per service
+
+# ============================================================================
+# Stage 1: Chef Base
+# Install cargo-chef for dependency caching
+# ============================================================================
+FROM rust:1.85-bookworm AS chef
+WORKDIR /app
+RUN cargo install cargo-chef
+
+# ============================================================================
+# Stage 2: Planner
+# Analyzes full source to create a "recipe" of dependencies
+# ============================================================================
+FROM chef AS planner
+# Copy everything needed to analyze dependencies
+COPY Cargo.toml Cargo.lock ./
+COPY rust_core ./rust_core
+COPY services ./services
+# Generate dependency recipe (extracts only dependency info, not code)
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ============================================================================
+# Stage 3: Dependency Builder
+# Builds ONLY dependencies (this layer is cached!)
+# ============================================================================
+FROM chef AS dependencies
+# Copy the recipe (just dependency info)
+COPY --from=planner /app/recipe.json recipe.json
+# Build dependencies - this layer is cached until Cargo.toml/Cargo.lock change
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# ============================================================================
+# Stage 4: Application Builder
+# Builds the actual application code (fast because deps are cached!)
+# ============================================================================
+FROM chef AS builder
+# Copy cached dependencies from previous stage
+COPY --from=dependencies /app/target ./target
+COPY --from=dependencies /usr/local/cargo /usr/local/cargo
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+# Copy source code
+COPY rust_core ./rust_core
+COPY services ./services
+# Build specific service (passed as build arg)
+# SERVICE_NAME = package name (for cargo build)
+# BINARY_NAME = output binary name (defaults to SERVICE_NAME)
+ARG SERVICE_NAME
+ARG BINARY_NAME=${SERVICE_NAME}
+RUN cargo build --release --package ${SERVICE_NAME}
+
+# ============================================================================
+# Stage 5: Runtime
+# Minimal runtime image with only the compiled binary
+# ============================================================================
+FROM debian:bookworm-slim AS runtime
+# Install only runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 arbees
+USER arbees
+WORKDIR /home/arbees
+
+# Copy binary from builder
+# BINARY_NAME = output binary name (may differ from package name)
+ARG SERVICE_NAME
+ARG BINARY_NAME=${SERVICE_NAME}
+COPY --from=builder /app/target/release/${BINARY_NAME} /usr/local/bin/app
+
+# Create log directory
+RUN mkdir -p /home/arbees/logs
+
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
+
+CMD ["/usr/local/bin/app"]

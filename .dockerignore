@@ -1,205 +1,60 @@
-# Git
-.git
-.gitignore
-
-# Python (be very aggressive)
-**/__pycache__/
-**/__pycache__
-__pycache__/
-__pycache__
-**/*.py[cod]
-*.py[cod]
-**/*$py.class
-*$py.class
-**/*.egg-info/
-**/*.egg-info
-*.egg-info/
-*.egg-info
-**/.eggs/
-.eggs/
-**/dist/
-dist/
-**/build/
-build/
-**/*.egg
-*.egg
-**/venv/
-**/venv
-venv/
-venv
-**/env/
-env/
-**/.venv/
-.venv/
-.venv
-**/.Python
-.Python
-**/lib/
-**/lib64/
-**/parts/
-**/sdist/
-**/var/
-**/wheels/
-**/.installed.cfg
-
-# Rust build artifacts (be very aggressive)
+# Rust build artifacts
 **/target/
-**/target
-target/
-target
-rust_core/target/
-rust_core/target
-services/*/target/
-services/*/target
-**/*.rlib
-**/*.rmeta
+**/*.rs.bk
+**/*.pdb
 
-# Node (be very aggressive)
-**/node_modules/
-**/node_modules
-node_modules/
-node_modules
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.Python
+**/*.so
+**/*.egg
+**/*.egg-info/
 **/dist/
-**/dist
-dist/
-dist
-**/.vite/
-**/.vite
-.vite/
-.vite
-**/package-lock.json
-**/yarn.lock
-**/.npm/
-**/.yarn/
+**/build/
+**/.pytest_cache/
+**/.mypy_cache/
 
 # IDE
-.vscode
-.idea
+.vscode/
+.idea/
 *.swp
 *.swo
-
-# Docker volumes
-volumes
-
-# Data files
-data/training
-data/production
-data/models
-*.parquet
-*.pkl
-
-# Logs
-*.log
-
-# Windows oddities / reserved names
-nul
-
-# Environment
-.env
-.env.local
-
-# Terraform
-.terraform
-*.tfstate
-*.tfstate.*
-
-# Claude
-.claude
-
-# Docs
-docs
-
-# Reports (can be large)
-reports/*.html
-reports/*.md
-
-# Scripts (not needed in containers)
-scripts
-
-# Test files
-tests
-test_*.py
-*_test.py
-
-# Cursor workspace files
-.cursor
-*.session-state.md
-
-# Docker files (avoid recursion)
-docker-compose*.yml
-docker-compose*.yaml
-Dockerfile*
-.dockerignore
-
-# Build scripts
-rebuild-*.bat
-rebuild-*.ps1
-rebuild-*.sh
-emergency-*.bat
-emergency-*.sh
-stop_*.bat
-
-# Large data directories (be very aggressive)
-**/data/
-**/data
-data/
-data
-**/*.parquet
-*.parquet
-**/*.pkl
-*.pkl
-**/*.csv
-*.csv
-**/*.json.gz
-*.json.gz
-
-# Frontend build artifacts (if not needed)
-frontend/node_modules
-frontend/dist
-frontend/.vite
-frontend/build
-
-# Python cache at root
-*.pyc
-.pytest_cache
-.coverage
-htmlcov
-
-# Temporary files
-*.tmp
-*.temp
-*.bak
-*.swp
 *~
+.DS_Store
 
-# Windows specific
-Thumbs.db
-Desktop.ini
-$RECYCLE.BIN
-
-# Git (already excluded but ensure)
-.git
+# Git
+.git/
 .gitignore
 .gitattributes
 
-# CI/CD
-.github
-.gitlab-ci.yml
-.travis.yml
+# Documentation (don't need in container)
+# Note: Some services (polymarket_monitor) need README.md for pyproject.toml
+# *.md
+docs/
+*.txt
+!requirements.txt
 
-# Documentation markdown files (can be large)
-*.md
-!README.md
+# Logs and databases (don't copy to container)
+*.log
+*.sqlite
+*.db
 
-# Infrastructure as code
-infrastructure
-*.tf
-*.tfvars
-.terraform
+# Environment files
+.env
+.env.*
+!.env.example
 
-# Signal CLI (if present)
-signal-cli-*
+# Node modules if any
+**/node_modules/
 
-# Other project directories
-GOODArbees
-Polymarket-Kalshi-Arbitrage-bot
+# Test files
+**/tests/
+**/*_test.rs
+**/test_*.py
+
+# Temporary files
+**/tmp/
+**/.cache/

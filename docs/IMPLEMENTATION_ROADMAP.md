@@ -383,24 +383,75 @@ GROUP BY platform;
 
 ## Crypto Markets Implementation
 
-### Current Status: ⚠️ FRAMEWORK COMPLETE, LOGIC MISSING
+### Current Status: ✅ 95% COMPLETE
 
-**What Exists:**
+**What's Fully Implemented:**
 - ✅ `MarketType::Crypto` enum variant
-- ✅ `CryptoEventProvider` trait implementation (stub)
-- ✅ `CryptoProbabilityModel` trait implementation (stub)
+- ✅ `CryptoEventProvider` - Full implementation (Polymarket + Kalshi discovery)
+- ✅ `CryptoProbabilityModel` - Black-Scholes inspired price target calculation
+- ✅ `CoinGeckoClient` - Price feeds, volatility calculation (30-day historical)
 - ✅ Database schema supports crypto (entity_a, entity_b, market_type)
 - ✅ Orchestrator calls `MultiMarketManager.run_discovery_cycle()`
+- ✅ EventProvider/ProbabilityModel registries include crypto
+- ✅ `game_shard add_event()` spawns monitor_event for crypto
+- ✅ Signal generation pipeline works for crypto events
+- ✅ `CryptoAssetMatcher` - Entity matching with 18+ asset aliases
 
-**What's Missing:**
-- ❌ CoinGecko API integration (price feeds, volatility)
-- ❌ Crypto market discovery (Polymarket + Kalshi search)
-- ❌ Black-Scholes price target probability model
-- ❌ Crypto asset entity matching (BTC/Bitcoin, ETH/Ethereum)
-- ❌ Database tables (crypto_prices, price_targets)
-- ❌ Tests for crypto provider + model
+**What's Added (as of 2026-01-28):**
+- ✅ `crypto_prices` hypertable (migration 025) - time-series price storage
+- ✅ `insert_crypto_price()` function for storing CoinGecko data
+- ✅ `crypto_prices_hourly` and `crypto_prices_daily` materialized views
+- ✅ `calculate_crypto_volatility()` SQL function
+- ✅ Integration tests (`services/game_shard_rust/tests/crypto_integration_test.rs`)
+- ✅ Verification scripts (`scripts/verify_crypto.py`, `scripts/verify_crypto.ps1`)
 
-### Implementation Plan: ~2-3 Weeks
+**What Remains (Optional Enhancements):**
+- Consider adding more assets to `CryptoAssetMatcher` aliases
+- Consider connecting price insertion to the monitoring loop (for historical analysis)
+- Production validation with real paper trades
+
+### Key Implementation Files
+
+| File | Purpose |
+|------|---------|
+| `rust_core/src/clients/coingecko.rs` | CoinGecko API (prices, volatility) |
+| `rust_core/src/providers/crypto.rs` | Market discovery (Polymarket + Kalshi) |
+| `rust_core/src/probability/crypto.rs` | Black-Scholes price target model |
+| `rust_core/src/matching/crypto.rs` | Asset entity matching |
+| `rust_core/src/db/crypto.rs` | Price insertion functions |
+| `shared/arbees_shared/db/migrations/025_crypto_prices.sql` | Price history hypertable |
+
+### How to Enable Crypto Markets
+
+```bash
+# 1. Apply the migration
+psql $DATABASE_URL -f shared/arbees_shared/db/migrations/025_crypto_prices.sql
+
+# 2. Enable in .env
+ENABLE_CRYPTO_MARKETS=true
+
+# 3. Verify setup
+python scripts/verify_crypto.py
+
+# 4. Start services
+docker-compose --profile full up -d
+
+# 5. Monitor discovery
+docker compose logs orchestrator_rust | grep "crypto"
+```
+
+### Quick Validation
+
+```bash
+# Run unit tests
+cd services
+cargo test --package arbees_rust_core crypto
+
+# Run integration tests (requires network)
+cargo test --package game_shard_rust crypto_integration -- --ignored
+```
+
+### Original Implementation Plan (Reference Only)
 
 #### Week 1: CoinGecko Integration & Market Discovery
 
@@ -1850,9 +1901,9 @@ CIRCUIT_BREAKER_ENABLED=true   # Halt on consecutive losses
 - **Action:** Merge, deploy, monitor
 
 ### Short-Term (Weeks 1-3): Crypto Implementation
-- **Effort:** 10-12 days focused development
-- **Status:** ⚠️ Framework ready, logic missing
-- **Action:** Implement CoinGecko, Black-Scholes, asset matching
+- **Effort:** ~~10-12 days~~ **COMPLETE** (2 days remaining for production validation)
+- **Status:** ✅ 95% Complete
+- **Action:** Apply migration, enable in .env, run paper trading validation
 
 ### Medium-Term (Weeks 4-6): Economics Implementation
 - **Effort:** 10-12 days focused development

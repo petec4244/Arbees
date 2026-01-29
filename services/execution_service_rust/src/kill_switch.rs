@@ -132,55 +132,46 @@ impl KillSwitch {
             .await;
 
         let handle = tokio::spawn(async move {
-            loop {
-                match redis.subscribe(KILL_SWITCH_CHANNEL).await {
-                    Ok(mut pubsub) => {
-                        info!("Kill switch listening on {}", KILL_SWITCH_CHANNEL);
+            info!("Kill switch listening on {} (auto-reconnect enabled)", KILL_SWITCH_CHANNEL);
 
-                        let mut stream = pubsub.on_message();
-                        while let Some(msg) = stream.next().await {
-                            let payload: String = match msg.get_payload() {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    warn!("Failed to read kill switch message: {}", e);
-                                    continue;
-                                }
-                            };
+            let mut stream = redis
+                .subscribe_with_reconnect(vec![KILL_SWITCH_CHANNEL.to_string()])
+                .into_message_stream();
 
-                            match payload.to_uppercase().as_str() {
-                                "ENABLE" | "ON" | "HALT" | "STOP" => {
-                                    let was_enabled = enabled.swap(true, Ordering::SeqCst);
-                                    if !was_enabled {
-                                        error!("KILL SWITCH ENABLED via Redis command");
-                                        // Publish status change
-                                        let _ = redis_for_status
-                                            .publish(KILL_SWITCH_STATUS_KEY, &"enabled".to_string())
-                                            .await;
-                                    }
-                                }
-                                "DISABLE" | "OFF" | "RESUME" | "START" => {
-                                    let was_enabled = enabled.swap(false, Ordering::SeqCst);
-                                    if was_enabled {
-                                        warn!("Kill switch DISABLED via Redis command - trading resumed");
-                                        // Publish status change
-                                        let _ = redis_for_status
-                                            .publish(KILL_SWITCH_STATUS_KEY, &"disabled".to_string())
-                                            .await;
-                                    }
-                                }
-                                _ => {
-                                    warn!("Unknown kill switch command: {}", payload);
-                                }
-                            }
+            while let Some(msg) = stream.next().await {
+                let payload: String = match msg.get_payload() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Failed to read kill switch message: {}", e);
+                        continue;
+                    }
+                };
+
+                match payload.to_uppercase().as_str() {
+                    "ENABLE" | "ON" | "HALT" | "STOP" => {
+                        let was_enabled = enabled.swap(true, Ordering::SeqCst);
+                        if !was_enabled {
+                            error!("KILL SWITCH ENABLED via Redis command");
+                            // Publish status change
+                            let _ = redis_for_status
+                                .publish(KILL_SWITCH_STATUS_KEY, &"enabled".to_string())
+                                .await;
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to subscribe to kill switch channel: {}", e);
+                    "DISABLE" | "OFF" | "RESUME" | "START" => {
+                        let was_enabled = enabled.swap(false, Ordering::SeqCst);
+                        if was_enabled {
+                            warn!("Kill switch DISABLED via Redis command - trading resumed");
+                            // Publish status change
+                            let _ = redis_for_status
+                                .publish(KILL_SWITCH_STATUS_KEY, &"disabled".to_string())
+                                .await;
+                        }
+                    }
+                    _ => {
+                        warn!("Unknown kill switch command: {}", payload);
                     }
                 }
-
-                // Reconnect delay
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
 

@@ -1,0 +1,31 @@
+# Development Dockerfile for Rust services
+# Uses volume mounts for source code (no rebuild needed for code changes)
+# Includes cargo-watch for auto-recompilation
+
+FROM rust:1.85-bookworm AS development
+
+# Install cargo-watch for auto-recompilation
+RUN cargo install cargo-watch
+
+WORKDIR /app
+
+# Create directories that will be mounted
+RUN mkdir -p /app/rust_core /app/services
+
+# Development environment variables
+ENV RUST_LOG=debug
+ENV RUST_BACKTRACE=full
+
+# Copy workspace files (these rarely change)
+COPY Cargo.toml Cargo.lock ./
+COPY rust_core/Cargo.toml ./rust_core/
+
+# Build dependencies first (cached layer)
+# Note: This will fail without source, but caches dependencies
+RUN cargo fetch || true
+
+# Source code is mounted as volumes, not copied
+
+# Default command uses cargo watch for auto-reload
+# Override with specific service binary in docker-compose
+CMD ["cargo", "watch", "-x", "run"]

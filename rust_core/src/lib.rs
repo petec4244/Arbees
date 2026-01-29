@@ -16,6 +16,7 @@ mod types;
 pub mod win_prob;
 
 // Service modules (from arbees_rust_core merge)
+pub mod alerts;
 pub mod clients;
 pub mod db;
 pub mod matching;

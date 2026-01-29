@@ -237,6 +237,7 @@ pub struct ServiceState {
 
     // Health tracking
     pub status: ServiceStatus,
+    pub previous_status: Option<ServiceStatus>,
     pub last_heartbeat: DateTime<Utc>,
     pub consecutive_heartbeat_failures: u32,
 
@@ -261,6 +262,7 @@ impl ServiceState {
             last_process_id: None,
             last_started_at: None,
             status: ServiceStatus::Starting,
+            previous_status: None,
             last_heartbeat: Utc::now(),
             consecutive_heartbeat_failures: 0,
             component_status: HashMap::new(),

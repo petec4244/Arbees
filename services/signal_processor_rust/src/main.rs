@@ -874,11 +874,21 @@ impl SignalProcessorState {
         market_price: &MarketPriceRow,
     ) -> Result<f64, String> {
         // Get available liquidity based on trade direction
-        let available = match signal.direction {
+        let mut available = match signal.direction {
             SignalDirection::Buy => market_price.yes_ask_size.unwrap_or(0.0),
             SignalDirection::Sell => market_price.yes_bid_size.unwrap_or(0.0),
             SignalDirection::Hold => return Ok(proposed_size),
         };
+
+        // Fallback: If market price has no liquidity data, use signal's liquidity_available
+        // This handles cases where DB market_prices table is missing liquidity columns
+        if available == 0.0 && signal.liquidity_available > 0.0 {
+            available = signal.liquidity_available;
+            debug!(
+                "Using signal's liquidity_available (${:.2}) as fallback for market price with no liquidity data",
+                available
+            );
+        }
 
         // Check minimum liquidity threshold
         if available < self.config.liquidity_min_threshold {
@@ -1066,6 +1076,14 @@ impl SignalProcessorState {
             None => {
                 // Try to create from signal data
                 if signal.market_prob.is_some() {
+                    // Use signal's liquidity_available for both bid and ask sizes
+                    // This ensures the fallback market price doesn't get rejected by liquidity checks
+                    let liquidity = if signal.liquidity_available > 0.0 {
+                        signal.liquidity_available
+                    } else {
+                        100.0  // Conservative fallback if signal also has 0
+                    };
+
                     MarketPriceRow {
                         market_id: format!("signal_{}", signal.game_id),
                         platform: "paper".to_string(),
@@ -1073,11 +1091,10 @@ impl SignalProcessorState {
                         contract_team: Some(signal.team.clone()),
                         yes_bid: (signal.market_prob.unwrap_or(0.5) - 0.02).max(0.01),
                         yes_ask: (signal.market_prob.unwrap_or(0.5) + 0.02).min(0.99),
-                        yes_bid_size: Some(0.0),
-                        yes_ask_size: Some(0.0),
+                        yes_bid_size: Some(liquidity),
+                        yes_ask_size: Some(liquidity),
                         volume: Some(0.0),
-                        // Conservative fallback - use smaller amount when liquidity unknown
-                        liquidity: Some(100.0),
+                        liquidity: Some(liquidity),
                         time: Utc::now(),
                     }
                 } else {
@@ -1500,28 +1517,34 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut pubsub = redis.subscribe(channels::SIGNALS_NEW).await?;
-    info!("Subscribed to {}", channels::SIGNALS_NEW);
+    // Subscribe with auto-reconnect to main signal channel
+    let mut stream = redis
+        .subscribe_with_reconnect(vec![channels::SIGNALS_NEW.to_string()])
+        .into_message_stream();
+    info!("Subscribed to {} (auto-reconnect enabled)", channels::SIGNALS_NEW);
 
-    // Subscribe to rule updates
+    // Subscribe to rule updates with auto-reconnect
     let redis_rules = redis.clone();
     let state_rules = state.clone();
     tokio::spawn(async move {
-        if let Ok(mut pubsub) = redis_rules.subscribe(channels::FEEDBACK_RULES).await {
-            let mut stream = pubsub.on_message();
-            while let Some(msg) = stream.next().await {
-                if let Ok(payload) = msg.get_payload::<String>() {
-                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&payload) {
-                        if data.get("type").and_then(|v| v.as_str()) == Some("rules_update") {
-                            let mut s = state_rules.write().await;
-                            if let Err(e) = s.load_rules_from_db().await {
-                                warn!("Failed to reload rules: {}", e);
-                            }
+        let mut stream = redis_rules
+            .subscribe_with_reconnect(vec![channels::FEEDBACK_RULES.to_string()])
+            .into_message_stream();
+        info!("Subscribed to {} (auto-reconnect enabled)", channels::FEEDBACK_RULES);
+
+        while let Some(msg) = stream.next().await {
+            if let Ok(payload) = msg.get_payload::<String>() {
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    if data.get("type").and_then(|v| v.as_str()) == Some("rules_update") {
+                        let mut s = state_rules.write().await;
+                        if let Err(e) = s.load_rules_from_db().await {
+                            warn!("Failed to reload rules: {}", e);
                         }
                     }
                 }
             }
         }
+        error!("Rules update listener exited unexpectedly");
     });
 
     // Start heartbeat
@@ -1547,8 +1570,7 @@ async fn main() -> Result<()> {
 
     info!("Signal Processor started");
 
-    // Main message loop
-    let mut stream = pubsub.on_message();
+    // Main message loop (stream already created above with auto-reconnect)
     while let Some(msg) = stream.next().await {
         let payload: String = match msg.get_payload() {
             Ok(p) => p,

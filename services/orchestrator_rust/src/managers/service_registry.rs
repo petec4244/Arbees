@@ -177,6 +177,39 @@ impl ServiceRegistry {
                         // Remove from assigned set
                         state.assigned_games.remove(&game_id);
                     }
+
+                    // Check for zombie games (shard is monitoring but shouldn't be)
+                    let zombie_games: Vec<String> = reported_games
+                        .difference(&state.assigned_games)
+                        .cloned()
+                        .collect();
+
+                    if !zombie_games.is_empty() {
+                        warn!(
+                            "Zombie games detected on shard {}: {:?}",
+                            instance_id, zombie_games
+                        );
+
+                        // Store zombie games to send remove commands after lock is dropped
+                        drop(services);
+
+                        // Send remove commands for zombie games
+                        for game_id in zombie_games {
+                            info!("Removing zombie game {} from shard {}", game_id, instance_id);
+                            let remove_channel = format!("shard:{}:command", instance_id);
+                            let remove_cmd = json!({
+                                "command": "remove_game",
+                                "game_id": game_id
+                            });
+
+                            if let Err(e) = self.redis.publish(&remove_channel, &remove_cmd).await {
+                                error!("Failed to send remove command for zombie game {}: {}", game_id, e);
+                            }
+                        }
+
+                        // Re-acquire lock for rest of processing
+                        services = self.services.write().await;
+                    }
                 }
             }
         }
@@ -243,6 +276,7 @@ impl ServiceRegistry {
 
         // Collect notifications to send
         let mut notifications = Vec::new();
+        let mut games_to_reassign: Vec<(String, Vec<String>)> = Vec::new(); // (shard_id, games)
 
         {
             let mut services = self.services.write().await;
@@ -252,6 +286,11 @@ impl ServiceRegistry {
                     .signed_duration_since(state.last_heartbeat)
                     .num_seconds();
 
+                let was_healthy = matches!(
+                    state.previous_status,
+                    Some(ServiceStatus::Healthy)
+                );
+
                 // Check if service is dead
                 if age_secs >= timeout_secs && state.status != ServiceStatus::Dead {
                     warn!(
@@ -259,7 +298,19 @@ impl ServiceRegistry {
                         state.instance_id, age_secs
                     );
 
+                    state.previous_status = Some(state.status);
                     state.status = ServiceStatus::Dead;
+
+                    // Trigger reassignment for game shards
+                    if matches!(state.service_type, ServiceType::GameShard) && !state.assigned_games.is_empty() {
+                        let games: Vec<String> = state.assigned_games.iter().cloned().collect();
+                        info!(
+                            "Marking {} games for reassignment from dead shard {}",
+                            games.len(),
+                            state.instance_id
+                        );
+                        games_to_reassign.push((state.instance_id.clone(), games));
+                    }
 
                     // Collect notification data
                     let assigned_games: Vec<String> = state.assigned_games.iter().cloned().collect();
@@ -273,6 +324,7 @@ impl ServiceRegistry {
                 } else if age_secs < timeout_secs && state.status == ServiceStatus::Dead {
                     // Service recovered!
                     info!("Service {} recovered (heartbeat resumed)", state.instance_id);
+                    state.previous_status = Some(state.status);
                     state.status = ServiceStatus::Healthy;
 
                     // Collect recovery notification
@@ -287,14 +339,42 @@ impl ServiceRegistry {
                 // Check for degradation
                 let operational = self.is_service_operational(state);
                 if !operational && state.status == ServiceStatus::Healthy {
+                    state.previous_status = Some(state.status);
                     state.status = ServiceStatus::Degraded;
                     warn!("Service {} degraded", state.instance_id);
+
+                    // Trigger reassignment for degraded game shards with games
+                    if was_healthy
+                        && matches!(state.service_type, ServiceType::GameShard)
+                        && !state.assigned_games.is_empty()
+                    {
+                        let games: Vec<String> = state.assigned_games.iter().cloned().collect();
+                        info!(
+                            "Marking {} games for reassignment from degraded shard {}",
+                            games.len(),
+                            state.instance_id
+                        );
+                        games_to_reassign.push((state.instance_id.clone(), games));
+                    }
                 } else if operational && state.status == ServiceStatus::Degraded {
+                    state.previous_status = Some(state.status);
                     state.status = ServiceStatus::Healthy;
                     info!("Service {} recovered from degradation", state.instance_id);
                 }
+
+                // Update previous status for next check
+                if state.previous_status.is_none() {
+                    state.previous_status = Some(state.status);
+                }
             }
         } // Lock dropped here
+
+        // Perform game reassignments outside the lock
+        for (shard_id, games) in games_to_reassign {
+            for game_id in games {
+                self.reassign_game(&game_id, &shard_id).await;
+            }
+        }
 
         // Publish notifications after lock is released
         for notification in notifications {
@@ -508,6 +588,93 @@ impl ServiceRegistry {
             .values()
             .find(|s| s.instance_id == instance_id)
             .map(|s| s.status)
+    }
+
+    /// Get all services (for monitoring)
+    pub async fn get_services(&self) -> HashMap<String, ServiceState> {
+        let services = self.services.read().await;
+        services.clone()
+    }
+
+    /// Reassign a game from an unhealthy shard to a healthy one
+    async fn reassign_game(&self, game_id: &str, old_shard_id: &str) {
+        // Find a healthy shard with capacity
+        let healthy_shards = self.get_healthy_shards().await;
+        let new_shard = healthy_shards
+            .iter()
+            .filter(|s| s.available_capacity() > 0 && s.instance_id != old_shard_id)
+            .max_by_key(|s| s.available_capacity());
+
+        match new_shard {
+            Some(shard) => {
+                info!(
+                    "Reassigning game {} from {} to {}",
+                    game_id, old_shard_id, shard.instance_id
+                );
+
+                // Send remove command to old shard (best effort)
+                let remove_channel = format!("shard:{}:command", old_shard_id);
+                let remove_cmd = json!({
+                    "command": "remove_game",
+                    "game_id": game_id
+                });
+                let _ = self.redis.publish(&remove_channel, &remove_cmd).await;
+
+                // Get assignment details from assignments map
+                let assignments = self.assignments.read().await;
+                if let Some(mut assignment) = assignments.get(game_id).cloned() {
+                    drop(assignments); // Release read lock
+
+                    // Update assignment with new shard
+                    assignment.shard_id = shard.instance_id.clone();
+
+                    // Send assignment to new shard
+                    let add_channel = format!("shard:{}:command", shard.instance_id);
+                    let add_cmd = json!({
+                        "command": "add_game",
+                        "game_id": assignment.game_id,
+                        "sport": assignment.sport,
+                        "kalshi_market_id": assignment.kalshi_market_id,
+                        "polymarket_market_id": assignment.polymarket_market_id,
+                        "market_ids_by_type": assignment.market_ids_by_type,
+                    });
+
+                    if let Err(e) = self.redis.publish(&add_channel, &add_cmd).await {
+                        error!("Failed to send reassignment to {}: {}", shard.instance_id, e);
+                    } else {
+                        // Update assigned_games tracking
+                        let mut services = self.services.write().await;
+
+                        // Remove from old shard
+                        if let Some(old_state) = services.get_mut(old_shard_id) {
+                            old_state.assigned_games.remove(game_id);
+                        }
+
+                        // Add to new shard
+                        if let Some(new_state) = services.get_mut(&shard.instance_id) {
+                            new_state.assigned_games.insert(game_id.to_string());
+                        }
+
+                        drop(services);
+
+                        // Update assignments map
+                        let mut assignments_write = self.assignments.write().await;
+                        assignments_write.insert(game_id.to_string(), assignment);
+
+                        info!("Successfully reassigned game {} to {}", game_id, shard.instance_id);
+                    }
+                } else {
+                    warn!("No assignment found for game {} during reassignment", game_id);
+                }
+            }
+            None => {
+                error!(
+                    "No healthy shards available to reassign game {} from {}",
+                    game_id, old_shard_id
+                );
+                // This will trigger a critical alert via system monitor
+            }
+        }
     }
 
     async fn publish_notification(&self, notification: &OrchestratorNotification) {
