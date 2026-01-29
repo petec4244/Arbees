@@ -171,6 +171,7 @@ services:
       ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5558"
+      SHARD_TYPE: "sports"
     expose:
       - "5558"
     ports:
@@ -179,6 +180,45 @@ services:
       - ./:/app
     profiles:
       - full
+
+  # ==========================================================================
+  # Crypto Shard - Handles non-sports markets (crypto, economics, politics)
+  # ==========================================================================
+  # Uses the same game_shard binary but configured for crypto/multi-market types.
+  # Orchestrator routes markets based on shard_type in heartbeat.
+  # ==========================================================================
+  crypto_shard:
+    build:
+      context: .
+      dockerfile: services/game_shard_rust/Dockerfile
+    container_name: arbees-crypto-shard
+    deploy:
+      resources:
+        <<: *common-resources
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      SHARD_ID: "crypto_shard_1"
+      SHARD_TYPE: "crypto"
+      MAX_GAMES: "50"
+      # ZMQ configuration for low-latency messaging
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
+      ZMQ_PUB_PORT: "5559"
+    expose:
+      - "5559"
+    ports:
+      - "8002:80"
+    volumes:
+      - ./:/app
+    profiles:
+      - full
+      - crypto
 
   api:
     build:

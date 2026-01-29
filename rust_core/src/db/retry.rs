@@ -99,6 +99,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_is_retriable_error() {
@@ -121,15 +123,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_succeeds_eventually() {
-        let mut attempt_count = 0;
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
 
-        let result = execute_with_retry(
-            || async {
-                attempt_count += 1;
-                if attempt_count < 3 {
-                    Err(anyhow::anyhow!("connection timeout"))
-                } else {
-                    Ok(42)
+        let result: anyhow::Result<i32> = execute_with_retry(
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    let current = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if current < 3 {
+                        Err(anyhow::anyhow!("connection timeout"))
+                    } else {
+                        Ok(42)
+                    }
                 }
             },
             3,
@@ -137,40 +143,48 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap(), 42);
-        assert_eq!(attempt_count, 3);
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn test_retry_fails_after_max_attempts() {
-        let mut attempt_count = 0;
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
 
-        let result = execute_with_retry(
-            || async {
-                attempt_count += 1;
-                Err(anyhow::anyhow!("connection timeout"))
+        let result: anyhow::Result<i32> = execute_with_retry(
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!("connection timeout"))
+                }
             },
             3,
         )
         .await;
 
         assert!(result.is_err());
-        assert_eq!(attempt_count, 3);
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn test_no_retry_on_non_retriable_error() {
-        let mut attempt_count = 0;
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
 
-        let result = execute_with_retry(
-            || async {
-                attempt_count += 1;
-                Err(anyhow::anyhow!("unique constraint violation"))
+        let result: anyhow::Result<i32> = execute_with_retry(
+            || {
+                let count = attempt_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!("unique constraint violation"))
+                }
             },
             3,
         )
         .await;
 
         assert!(result.is_err());
-        assert_eq!(attempt_count, 1); // Should not retry
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 1); // Should not retry
     }
 }

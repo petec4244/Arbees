@@ -81,6 +81,7 @@ pub struct GameAssignment {
 #[serde(rename_all = "snake_case")]
 pub enum ServiceType {
     GameShard,
+    CryptoShard,
     PolymarketMonitor,
     KalshiMonitor,
     Other(String),

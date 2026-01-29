@@ -60,8 +60,8 @@ impl ServiceRegistry {
 
         let instance_key = format!("{}:{}", service_name, instance_id);
 
-        // Determine service type
-        let service_type = self.determine_service_type(service_name);
+        // Determine service type from payload (checks shard_type field) or name
+        let service_type = self.determine_service_type_from_heartbeat(service_name, &payload);
 
         let mut services = self.services.write().await;
         let state = services
@@ -149,8 +149,8 @@ impl ServiceRegistry {
                 }
             }
 
-            // For game shards, also store max_games and games list
-            if let ServiceType::GameShard = state.service_type {
+            // For game shards and crypto shards, also store max_games and games list
+            if matches!(state.service_type, ServiceType::GameShard | ServiceType::CryptoShard) {
                 if let Some(max_games) = payload.get("max_games") {
                     state.metrics.insert("max_games".to_string(), max_games.clone());
                 }
@@ -258,7 +258,9 @@ impl ServiceRegistry {
     }
 
     fn determine_service_type(&self, service_name: &str) -> ServiceType {
-        if service_name.contains("shard") {
+        if service_name.contains("crypto_shard") || service_name.contains("crypto-shard") {
+            ServiceType::CryptoShard
+        } else if service_name.contains("shard") {
             ServiceType::GameShard
         } else if service_name.contains("polymarket") {
             ServiceType::PolymarketMonitor
@@ -267,6 +269,21 @@ impl ServiceRegistry {
         } else {
             ServiceType::Other(service_name.to_string())
         }
+    }
+
+    /// Determine service type from heartbeat payload, checking shard_type field
+    fn determine_service_type_from_heartbeat(&self, service_name: &str, payload: &Value) -> ServiceType {
+        // Check if shard_type is specified in payload
+        if let Some(shard_type) = payload.get("shard_type").and_then(|v| v.as_str()) {
+            match shard_type.to_lowercase().as_str() {
+                "crypto" => return ServiceType::CryptoShard,
+                "sports" | "game" => return ServiceType::GameShard,
+                _ => {}
+            }
+        }
+
+        // Fall back to name-based detection
+        self.determine_service_type(service_name)
     }
 
     /// Run health check on all services
@@ -301,8 +318,8 @@ impl ServiceRegistry {
                     state.previous_status = Some(state.status);
                     state.status = ServiceStatus::Dead;
 
-                    // Trigger reassignment for game shards
-                    if matches!(state.service_type, ServiceType::GameShard) && !state.assigned_games.is_empty() {
+                    // Trigger reassignment for game/crypto shards
+                    if matches!(state.service_type, ServiceType::GameShard | ServiceType::CryptoShard) && !state.assigned_games.is_empty() {
                         let games: Vec<String> = state.assigned_games.iter().cloned().collect();
                         info!(
                             "Marking {} games for reassignment from dead shard {}",
@@ -343,9 +360,9 @@ impl ServiceRegistry {
                     state.status = ServiceStatus::Degraded;
                     warn!("Service {} degraded", state.instance_id);
 
-                    // Trigger reassignment for degraded game shards with games
+                    // Trigger reassignment for degraded game/crypto shards with games
                     if was_healthy
-                        && matches!(state.service_type, ServiceType::GameShard)
+                        && matches!(state.service_type, ServiceType::GameShard | ServiceType::CryptoShard)
                         && !state.assigned_games.is_empty()
                     {
                         let games: Vec<String> = state.assigned_games.iter().cloned().collect();
@@ -386,6 +403,11 @@ impl ServiceRegistry {
         match state.service_type {
             ServiceType::GameShard => {
                 // Critical: Redis (for pub/sub)
+                state.component_status.get("redis_ok").copied().unwrap_or(false)
+            }
+            ServiceType::CryptoShard => {
+                // Critical: Redis (for pub/sub)
+                // CryptoShards have same requirements as GameShards
                 state.component_status.get("redis_ok").copied().unwrap_or(false)
             }
             ServiceType::PolymarketMonitor => {
@@ -430,7 +452,7 @@ impl ServiceRegistry {
 
     async fn resync_service(&self, state: &ServiceState, assignments: Arc<RwLock<HashMap<String, GameAssignment>>>) {
         match state.service_type {
-            ServiceType::GameShard => {
+            ServiceType::GameShard | ServiceType::CryptoShard => {
                 self.resync_game_shard(state, assignments).await;
             }
             ServiceType::PolymarketMonitor | ServiceType::KalshiMonitor => {
@@ -568,12 +590,25 @@ impl ServiceRegistry {
         Ok(())
     }
 
-    /// Get all healthy game shards
+    /// Get all healthy game shards (backward compatibility - returns both GameShard and CryptoShard)
     pub async fn get_healthy_shards(&self) -> Vec<ServiceState> {
         let services = self.services.read().await;
         services
             .values()
-            .filter(|s| matches!(s.service_type, ServiceType::GameShard))
+            .filter(|s| matches!(s.service_type, ServiceType::GameShard | ServiceType::CryptoShard))
+            .filter(|s| matches!(s.status, ServiceStatus::Healthy))
+            .filter(|s| self.is_service_operational(s))
+            .filter(|s| s.assignment_circuit.state == CircuitState::Closed)
+            .cloned()
+            .collect()
+    }
+
+    /// Get healthy shards of a specific type
+    pub async fn get_healthy_shards_by_type(&self, shard_type: ServiceType) -> Vec<ServiceState> {
+        let services = self.services.read().await;
+        services
+            .values()
+            .filter(|s| s.service_type == shard_type)
             .filter(|s| matches!(s.status, ServiceStatus::Healthy))
             .filter(|s| self.is_service_operational(s))
             .filter(|s| s.assignment_circuit.state == CircuitState::Closed)
@@ -727,6 +762,7 @@ impl ToString for ServiceType {
     fn to_string(&self) -> String {
         match self {
             ServiceType::GameShard => "game_shard".to_string(),
+            ServiceType::CryptoShard => "crypto_shard".to_string(),
             ServiceType::PolymarketMonitor => "polymarket_monitor".to_string(),
             ServiceType::KalshiMonitor => "kalshi_monitor".to_string(),
             ServiceType::Other(s) => s.clone(),
