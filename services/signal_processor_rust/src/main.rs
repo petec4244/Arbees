@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use arbees_rust_core::models::{
     channels, ExecutionRequest, ExecutionResult, ExecutionSide, ExecutionStatus, MarketType,
     NotificationEvent, NotificationPriority, NotificationType, Platform, RuleDecision,
-    RuleDecisionType, SignalDirection, SignalType, Sport, TradingSignal, TransportMode,
+    RuleDecisionType, SignalDirection, SignalType, Sport, TradingSignal,
 };
 use arbees_rust_core::redis::RedisBus;
 use arbees_rust_core::utils::matching::match_team_in_text;
@@ -279,8 +279,7 @@ struct SignalProcessorState {
     execution_engine: Option<Arc<ExecutionEngine>>,
     pnl_tracker: Option<Arc<DailyPnlTracker>>,
 
-    // Transport configuration
-    transport_mode: TransportMode,
+    // ZMQ publishing (ZMQ-only transport)
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: Arc<AtomicU64>,
 
@@ -306,7 +305,6 @@ impl SignalProcessorState {
         config: Config,
         pool: PgPool,
         redis: RedisBus,
-        transport_mode: TransportMode,
         zmq_pub: Option<Arc<Mutex<PubSocket>>>,
         execution_inline: bool,
         execution_engine: Option<Arc<ExecutionEngine>>,
@@ -333,7 +331,6 @@ impl SignalProcessorState {
             execution_inline,
             execution_engine,
             pnl_tracker,
-            transport_mode,
             zmq_pub,
             zmq_seq: Arc::new(AtomicU64::new(0)),
             signal_count: 0,
@@ -1274,6 +1271,10 @@ impl SignalProcessorState {
         self.in_flight
             .insert(exec_request.idempotency_key.clone(), Utc::now());
 
+        // Capture values for logging before potential move
+        let request_id = exec_request.request_id.clone();
+        let limit_price = exec_request.limit_price;
+
         if self.execution_inline {
             if let Some(engine) = &self.execution_engine {
                 let result = self.execute_inline_request(engine, exec_request).await;
@@ -1282,27 +1283,18 @@ impl SignalProcessorState {
                 error!("Execution inline enabled but engine not initialized");
             }
         } else {
-            // Publish to execution channel based on transport mode
-            if self.transport_mode.use_redis() {
-                self.redis
-                    .publish(channels::EXECUTION_REQUESTS, &exec_request)
-                    .await?;
-            }
-
-            if self.transport_mode.use_zmq() {
-                self.publish_zmq(&exec_request).await;
-            }
+            // Publish to execution channel via ZMQ (ZMQ-only transport)
+            self.publish_zmq(&exec_request).await;
         }
 
         self.approved_count += 1;
 
         info!(
-            "Emitted ExecutionRequest: {} ({:?} {} @ {:.3}) via {:?}",
-            exec_request.request_id,
+            "Emitted ExecutionRequest: {} ({:?} {} @ {:.3}) via ZMQ",
+            request_id,
             signal.direction,
             signal.team,
-            exec_request.limit_price,
-            self.transport_mode
+            limit_price
         );
 
         Ok(())
@@ -1665,29 +1657,20 @@ async fn main() -> Result<()> {
     let redis = RedisBus::new().await?;
     info!("Connected to Redis");
 
-    // Transport mode configuration
-    let transport_mode = TransportMode::from_env();
-    info!("Transport mode: {:?}", transport_mode);
+    // ZMQ-only transport mode - always initialize ZMQ publisher
+    let zmq_port = env::var("ZMQ_PUB_PORT").unwrap_or_else(|_| "5559".to_string());
+    let zmq_addr = format!("tcp://0.0.0.0:{}", zmq_port);
 
-    // Setup ZMQ publisher if needed
-    let zmq_pub = if transport_mode.use_zmq() {
-        let zmq_port = env::var("ZMQ_PUB_PORT").unwrap_or_else(|_| "5559".to_string());
-        let zmq_addr = format!("tcp://0.0.0.0:{}", zmq_port);
-
-        let mut socket = PubSocket::new();
-        match socket.bind(&zmq_addr).await {
-            Ok(_) => {
-                info!("ZMQ publisher bound to {}", zmq_addr);
-                Some(Arc::new(Mutex::new(socket)))
-            }
-            Err(e) => {
-                error!("Failed to bind ZMQ publisher to {}: {}", zmq_addr, e);
-                None
-            }
+    let mut socket = PubSocket::new();
+    let zmq_pub = match socket.bind(&zmq_addr).await {
+        Ok(_) => {
+            info!("ZMQ publisher bound to {}", zmq_addr);
+            Some(Arc::new(Mutex::new(socket)))
         }
-    } else {
-        info!("ZMQ publishing disabled (transport_mode={:?})", transport_mode);
-        None
+        Err(e) => {
+            error!("Failed to bind ZMQ publisher to {}: {}", zmq_addr, e);
+            None
+        }
     };
 
     // Configuration
@@ -1709,7 +1692,7 @@ async fn main() -> Result<()> {
 
     let (execution_engine, pnl_tracker) = if execution_inline {
         info!("Execution inline enabled - creating execution engine");
-        let engine = ExecutionEngine::with_safeguards(paper_trading, Some(redis.clone()), None, None).await;
+        let engine = ExecutionEngine::with_safeguards(paper_trading, Some(Arc::new(redis.clone())), None, None).await;
         let idempotency = engine.idempotency_tracker();
         let _cleanup_task = execution_service_rust::idempotency::start_cleanup_task(idempotency);
 
@@ -1732,7 +1715,6 @@ async fn main() -> Result<()> {
             config,
             pool,
             redis.clone(),
-            transport_mode,
             zmq_pub,
             execution_inline,
             execution_engine,
@@ -1749,33 +1731,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Spawn ZMQ listener if enabled
-    if transport_mode.use_zmq() {
-        let zmq_endpoint = env::var("ZMQ_SUB_ENDPOINT")
-            .unwrap_or_else(|_| "tcp://game_shard:5558".to_string());
-        let state_zmq = state.clone();
+    // Spawn ZMQ listener (ZMQ-only transport - always enabled)
+    let zmq_endpoint = env::var("ZMQ_SUB_ENDPOINT")
+        .unwrap_or_else(|_| "tcp://game_shard:5558".to_string());
+    let state_zmq = state.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = zmq_listener_loop(state_zmq, zmq_endpoint).await {
-                error!("ZMQ listener error: {}", e);
-            }
-        });
-        info!("ZMQ signal listener started");
-    }
-
-    // Subscribe to Redis signals if enabled
-    if !transport_mode.use_redis() {
-        info!("Redis signal subscription disabled (transport_mode={:?})", transport_mode);
-        // Keep service running with ZMQ only
-        tokio::signal::ctrl_c().await?;
-        return Ok(());
-    }
-
-    // Subscribe with auto-reconnect to main signal channel
-    let mut stream = redis
-        .subscribe_with_reconnect(vec![channels::SIGNALS_NEW.to_string()])
-        .into_message_stream();
-    info!("Subscribed to {} (auto-reconnect enabled)", channels::SIGNALS_NEW);
+    tokio::spawn(async move {
+        if let Err(e) = zmq_listener_loop(state_zmq, zmq_endpoint).await {
+            error!("ZMQ listener error: {}", e);
+        }
+    });
+    info!("ZMQ signal listener started (ZMQ-only transport)");
 
     // Subscribe to rule updates with auto-reconnect
     let redis_rules = redis.clone();
@@ -1822,31 +1788,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("Signal Processor started");
+    info!("Signal Processor started (ZMQ-only transport)");
 
-    // Main message loop (stream already created above with auto-reconnect)
-    while let Some(msg) = stream.next().await {
-        let payload: String = match msg.get_payload() {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Failed to get payload: {}", e);
-                continue;
-            }
-        };
-
-        let signal: TradingSignal = match serde_json::from_str(&payload) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to parse signal: {}", e);
-                continue;
-            }
-        };
-
-        let mut s = state.write().await;
-        if let Err(e) = s.handle_signal(signal).await {
-            error!("Error handling signal: {}", e);
-        }
-    }
+    // Wait for shutdown signal (ZMQ signals handled in spawned listener task)
+    tokio::signal::ctrl_c().await?;
+    info!("Signal Processor shutting down...");
 
     Ok(())
 }

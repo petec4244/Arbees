@@ -6,7 +6,7 @@
 //! 3. Optional file logging for replay/backtesting
 //! 4. Latency tracking and metrics
 //!
-//! Architecture:
+//! Architecture (ZMQ-only transport):
 //! ```
 //! kalshi_monitor (PUB :5555) ────────┐
 //! polymarket_monitor (PUB :5556) ────┼──> zmq_listener (SUB all)
@@ -17,12 +17,11 @@
 //! ```
 //!
 //! Modes:
-//! - observer: Subscribe and log/persist only (default for zmq_only transport)
-//! - bridge: Subscribe and forward to Redis pub/sub (legacy, for "both" transport)
-//! - disabled: Exit immediately
+//! - observer: Subscribe and log/persist only (default)
+//! - bridge: Subscribe and forward to Redis pub/sub (legacy, for dashboards)
+//! - disabled: Exit immediately (used for testing)
 
 use anyhow::Result;
-use arbees_rust_core::models::TransportMode;
 use chrono::{DateTime, Utc};
 use dotenv::dotenv;
 use log::{debug, error, info, warn};
@@ -52,14 +51,7 @@ impl ListenerMode {
             Some("observer") => ListenerMode::Observer,
             Some("bridge") => ListenerMode::Bridge,
             Some("disabled") => ListenerMode::Disabled,
-            None => {
-                // Infer from transport mode
-                match TransportMode::from_env() {
-                    TransportMode::ZmqOnly => ListenerMode::Observer,
-                    TransportMode::Both => ListenerMode::Bridge,
-                    TransportMode::RedisOnly => ListenerMode::Disabled,
-                }
-            }
+            // Default to Observer for ZMQ-only transport
             _ => ListenerMode::Observer,
         }
     }

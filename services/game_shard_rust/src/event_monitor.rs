@@ -6,8 +6,7 @@
 
 use crate::price::data::MarketPriceData;
 use arbees_rust_core::models::{
-    channels, MarketType, Platform, SignalDirection, SignalType, Sport, TradingSignal,
-    TransportMode,
+    MarketType, Platform, SignalDirection, SignalType, Sport, TradingSignal,
 };
 use arbees_rust_core::probability::ProbabilityModelRegistry;
 use arbees_rust_core::providers::{EventProviderRegistry, EventState, EventStatus, StateData};
@@ -92,7 +91,6 @@ pub async fn monitor_event(
     market_prices: Arc<RwLock<HashMap<String, HashMap<String, MarketPriceData>>>>,
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: Arc<AtomicU64>,
-    transport_mode: TransportMode,
 ) {
     info!(
         "Starting monitor_event: {} ({:?}) entity_a={}, entity_b={:?}",
@@ -220,7 +218,6 @@ pub async fn monitor_event(
                                     edge_pct,
                                     &zmq_pub,
                                     &zmq_seq,
-                                    transport_mode,
                                 )
                                 .await
                                 {
@@ -344,9 +341,9 @@ fn extract_crypto_prices_from_metadata(
     }
 }
 
-/// Emit a trading signal for a non-sports event
+/// Emit a trading signal for a non-sports event (ZMQ-only transport)
 async fn emit_event_signal(
-    redis: &RedisBus,
+    _redis: &RedisBus,  // Kept for future use (notifications, etc.)
     event_id: &str,
     market_type: &MarketType,
     entity: &str,
@@ -356,7 +353,6 @@ async fn emit_event_signal(
     edge_pct: f64,
     zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: &Arc<AtomicU64>,
-    transport_mode: TransportMode,
 ) -> bool {
     let signal_type = match direction {
         SignalDirection::Buy => SignalType::ModelEdgeYes,
@@ -404,36 +400,30 @@ async fn emit_event_signal(
         }
     };
 
-    // Publish via ZMQ if enabled
-    if transport_mode.use_zmq() {
-        if let Some(zmq) = zmq_pub {
-            let seq = zmq_seq.fetch_add(1, Ordering::SeqCst);
-            let envelope = json!({
-                "seq": seq,
-                "timestamp_ms": Utc::now().timestamp_millis(),
-                "source": "game_shard",
-                "payload": signal_json,
-            });
+    // Publish via ZMQ (ZMQ-only transport)
+    if let Some(zmq) = zmq_pub {
+        let seq = zmq_seq.fetch_add(1, Ordering::SeqCst);
+        let envelope = json!({
+            "seq": seq,
+            "timestamp_ms": Utc::now().timestamp_millis(),
+            "source": "game_shard",
+            "payload": signal_json,
+        });
 
-            if let Ok(envelope_bytes) = serde_json::to_vec(&envelope) {
-                let zmq_msg = ZmqMessage::from(envelope_bytes);
-                if let Ok(mut socket) = zmq.try_lock() {
-                    if let Err(e) = socket.send(zmq_msg).await {
-                        warn!("ZMQ signal send error: {}", e);
-                    } else {
-                        debug!("Signal sent via ZMQ: seq={}", seq);
-                    }
+        if let Ok(envelope_bytes) = serde_json::to_vec(&envelope) {
+            let zmq_msg = ZmqMessage::from(envelope_bytes);
+            if let Ok(mut socket) = zmq.try_lock() {
+                if let Err(e) = socket.send(zmq_msg).await {
+                    warn!("ZMQ signal send error: {}", e);
+                    return false;
+                } else {
+                    debug!("Signal sent via ZMQ: seq={}", seq);
                 }
             }
         }
-    }
-
-    // Publish via Redis if enabled
-    if transport_mode.use_redis() {
-        if let Err(e) = redis.publish(channels::SIGNALS_NEW, &signal_json).await {
-            warn!("Redis signal publish error: {}", e);
-            return false;
-        }
+    } else {
+        warn!("ZMQ publisher not available for signal");
+        return false;
     }
 
     info!(

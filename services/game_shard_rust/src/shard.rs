@@ -3,7 +3,7 @@ use arbees_rust_core::circuit_breaker::ApiCircuitBreaker;
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
     FootballState, GameState, MarketType, Platform, SignalDirection, Sport,
-    SportSpecificState, TransportMode,
+    SportSpecificState,
 };
 use arbees_rust_core::ProbabilityModelRegistry;
 use arbees_rust_core::providers::EventProviderRegistry;
@@ -58,8 +58,6 @@ pub struct GameShard {
     price_stats: Arc<PriceListenerStats>,
     /// Circuit breaker for ESPN API calls
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
-    /// Transport mode configuration (kept for event_monitor compatibility)
-    transport_mode: TransportMode,
     /// ZMQ PUB socket for signals (wrapped in Arc<Mutex> for sharing)
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     /// ZMQ sequence number for message ordering
@@ -108,9 +106,6 @@ impl GameShard {
             30 // Can't easily get config back, log default
         );
 
-        // Transport mode configuration
-        let transport_mode = TransportMode::from_env();
-
         let zmq_sub_endpoints = load_zmq_sub_endpoints();
         let zmq_pub_port = load_zmq_pub_port();
 
@@ -142,7 +137,6 @@ impl GameShard {
             min_edge_pct: config.min_edge_pct,
             price_stats: Arc::new(PriceListenerStats::default()),
             espn_circuit_breaker,
-            transport_mode,
             zmq_pub: None, // Initialized in start()
             zmq_seq: Arc::new(AtomicU64::new(0)),
             zmq_sub_endpoints,
@@ -256,7 +250,6 @@ impl GameShard {
         let sp = sport.clone();
         let zmq_pub = self.zmq_pub.clone();
         let zmq_seq = self.zmq_seq.clone();
-        let transport_mode = self.transport_mode;
 
         let task = tokio::spawn(async move {
             monitor_game(
@@ -272,7 +265,6 @@ impl GameShard {
                 espn_cb,
                 zmq_pub,
                 zmq_seq,
-                transport_mode,
             )
             .await;
         });
@@ -341,7 +333,6 @@ impl GameShard {
         let mt = market_type.clone();
         let ea = entity_a.clone();
         let eb = entity_b.clone();
-        let transport_mode = self.transport_mode;
 
         // Spawn the monitoring task
         let last_prob = Arc::new(RwLock::new(None));
@@ -359,7 +350,6 @@ impl GameShard {
                 market_prices,
                 zmq_pub,
                 zmq_seq,
-                transport_mode,
             )
             .await;
         });
@@ -629,7 +619,6 @@ async fn monitor_game(
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: Arc<AtomicU64>,
-    transport_mode: TransportMode,
 ) {
     let sport_enum = match parse_sport(&sport) {
         Some(s) => s,
