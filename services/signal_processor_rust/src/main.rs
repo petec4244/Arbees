@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use arbees_rust_core::models::{
-    channels, ExecutionRequest, ExecutionSide, NotificationEvent, NotificationPriority,
+    channels, ExecutionRequest, ExecutionSide, MarketType, NotificationEvent, NotificationPriority,
     NotificationType, Platform, RuleDecision, RuleDecisionType, SignalDirection, SignalType, Sport,
     TradingSignal, TransportMode,
 };
@@ -75,8 +75,22 @@ struct Config {
     price_staleness_secs: f64,
     /// Minimum liquidity threshold to trade ($10 default)
     liquidity_min_threshold: f64,
+    /// Optional per-platform liquidity thresholds
+    liquidity_min_threshold_kalshi: Option<f64>,
+    liquidity_min_threshold_polymarket: Option<f64>,
+    liquidity_min_threshold_paper: Option<f64>,
+    /// Optional per-market-type liquidity thresholds
+    liquidity_min_threshold_sport: Option<f64>,
+    liquidity_min_threshold_crypto: Option<f64>,
+    liquidity_min_threshold_economics: Option<f64>,
+    liquidity_min_threshold_politics: Option<f64>,
+    liquidity_min_threshold_entertainment: Option<f64>,
     /// Maximum percentage of available liquidity to use (80% default)
     liquidity_max_position_pct: f64,
+}
+
+fn get_env_float(name: &str) -> Option<f64> {
+    env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 impl Default for Config {
@@ -149,10 +163,17 @@ impl Default for Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30.0),
             // Minimum liquidity threshold - don't trade if less than this available ($10 default)
-            liquidity_min_threshold: env::var("LIQUIDITY_MIN_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10.0),
+            liquidity_min_threshold: get_env_float("LIQUIDITY_MIN_THRESHOLD").unwrap_or(10.0),
+            liquidity_min_threshold_kalshi: get_env_float("LIQUIDITY_MIN_THRESHOLD_KALSHI"),
+            liquidity_min_threshold_polymarket: get_env_float("LIQUIDITY_MIN_THRESHOLD_POLYMARKET"),
+            liquidity_min_threshold_paper: get_env_float("LIQUIDITY_MIN_THRESHOLD_PAPER"),
+            liquidity_min_threshold_sport: get_env_float("LIQUIDITY_MIN_THRESHOLD_SPORT"),
+            liquidity_min_threshold_crypto: get_env_float("LIQUIDITY_MIN_THRESHOLD_CRYPTO"),
+            liquidity_min_threshold_economics: get_env_float("LIQUIDITY_MIN_THRESHOLD_ECONOMICS"),
+            liquidity_min_threshold_politics: get_env_float("LIQUIDITY_MIN_THRESHOLD_POLITICS"),
+            liquidity_min_threshold_entertainment: get_env_float(
+                "LIQUIDITY_MIN_THRESHOLD_ENTERTAINMENT",
+            ),
             // Maximum percentage of available liquidity to use (80% default)
             // This prevents taking the entire book and ensures we can exit
             liquidity_max_position_pct: env::var("LIQUIDITY_MAX_POSITION_PCT")
@@ -290,6 +311,7 @@ impl SignalProcessorState {
             "cooldown",
             "risk",
             "rule_blocked",
+            "insufficient_liquidity",
         ] {
             rejected_counts.insert(key.to_string(), 0);
         }
@@ -879,22 +901,45 @@ impl SignalProcessorState {
             SignalDirection::Sell => market_price.yes_bid_size.unwrap_or(0.0),
             SignalDirection::Hold => return Ok(proposed_size),
         };
+        let mut used_signal_liquidity = false;
 
         // Fallback: If market price has no liquidity data, use signal's liquidity_available
         // This handles cases where DB market_prices table is missing liquidity columns
         if available == 0.0 && signal.liquidity_available > 0.0 {
             available = signal.liquidity_available;
+            used_signal_liquidity = true;
             debug!(
                 "Using signal's liquidity_available (${:.2}) as fallback for market price with no liquidity data",
                 available
             );
         }
 
+        let min_threshold = self.min_liquidity_threshold(signal, market_price);
+
         // Check minimum liquidity threshold
-        if available < self.config.liquidity_min_threshold {
+        if available < min_threshold {
+            let rejection = serde_json::json!({
+                "event": "liquidity_rejected",
+                "signal_id": signal.signal_id,
+                "game_id": signal.game_id,
+                "market_id": market_price.market_id,
+                "platform": market_price.platform,
+                "market_type": signal.get_market_type().type_name(),
+                "direction": format!("{:?}", signal.direction),
+                "price": match signal.direction {
+                    SignalDirection::Buy => market_price.yes_ask,
+                    SignalDirection::Sell => market_price.yes_bid,
+                    SignalDirection::Hold => 0.0,
+                },
+                "liquidity_available": available,
+                "liquidity_source_signal": used_signal_liquidity,
+                "threshold": min_threshold,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+            warn!("LIQUIDITY_REJECTED {}", rejection);
             return Err(format!(
                 "insufficient_liquidity: ${:.2} available < ${:.2} minimum",
-                available, self.config.liquidity_min_threshold
+                available, min_threshold
             ));
         }
 
@@ -910,6 +955,31 @@ impl SignalProcessorState {
         }
 
         Ok(validated_size)
+    }
+
+    fn min_liquidity_threshold(&self, signal: &TradingSignal, market_price: &MarketPriceRow) -> f64 {
+        let market_type = signal.get_market_type();
+        let mut threshold = self.config.liquidity_min_threshold;
+
+        threshold = match market_type {
+            MarketType::Sport { .. } => self.config.liquidity_min_threshold_sport.unwrap_or(threshold),
+            MarketType::Crypto { .. } => self.config.liquidity_min_threshold_crypto.unwrap_or(threshold),
+            MarketType::Economics { .. } => self.config.liquidity_min_threshold_economics.unwrap_or(threshold),
+            MarketType::Politics { .. } => self.config.liquidity_min_threshold_politics.unwrap_or(threshold),
+            MarketType::Entertainment { .. } => self.config.liquidity_min_threshold_entertainment.unwrap_or(threshold),
+        };
+
+        let platform = match market_price.platform.as_str() {
+            "kalshi" => Platform::Kalshi,
+            "polymarket" => Platform::Polymarket,
+            _ => Platform::Paper,
+        };
+
+        match platform {
+            Platform::Kalshi => self.config.liquidity_min_threshold_kalshi.unwrap_or(threshold),
+            Platform::Polymarket => self.config.liquidity_min_threshold_polymarket.unwrap_or(threshold),
+            Platform::Paper => self.config.liquidity_min_threshold_paper.unwrap_or(threshold),
+        }
     }
 
     fn create_execution_request(
@@ -1052,6 +1122,15 @@ impl SignalProcessorState {
 
     async fn handle_signal(&mut self, signal: TradingSignal) -> Result<()> {
         self.signal_count += 1;
+        if self.signal_count % 100 == 0 {
+            let rejection_snapshot = serde_json::json!(self.rejected_counts);
+            info!(
+                "Signal stats: total={} approved={} rejected={}",
+                self.signal_count,
+                self.approved_count,
+                rejection_snapshot
+            );
+        }
 
         // Format direction as "to win" / "to lose" for clarity
         let direction_str = match signal.direction {
@@ -1302,6 +1381,11 @@ async fn heartbeat_loop(
         let mut metrics = HashMap::new();
         metrics.insert("signals_received".to_string(), state.signal_count as f64);
         metrics.insert("signals_approved".to_string(), state.approved_count as f64);
+        let rejected_total: u64 = state.rejected_counts.values().sum();
+        metrics.insert("signals_rejected".to_string(), rejected_total as f64);
+        if let Some(count) = state.rejected_counts.get("insufficient_liquidity") {
+            metrics.insert("signals_rejected_insufficient_liquidity".to_string(), *count as f64);
+        }
 
         // Connection pool metrics for monitoring
         let pool_size = state.pool.size() as f64;

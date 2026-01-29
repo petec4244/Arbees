@@ -1,6 +1,10 @@
 mod event_monitor;
 mod shard;
 
+// Shared modules
+mod types;
+mod config;
+
 // Submodules
 mod price;
 mod signals;

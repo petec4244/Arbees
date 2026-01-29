@@ -1,5 +1,5 @@
 use anyhow::Result;
-use arbees_rust_core::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
+use arbees_rust_core::circuit_breaker::ApiCircuitBreaker;
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
     channels, FootballState, GameState, MarketType, Platform, SignalDirection, SignalType, Sport,
@@ -13,7 +13,7 @@ use arbees_rust_core::win_prob::calculate_win_probability;
 use chrono::Utc;
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -26,67 +26,17 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use zeromq::{Socket, SocketRecv, SocketSend, PubSocket, SubSocket, ZmqMessage};
 
-// Import from sibling modules
+// Import from internal modules
+use crate::types::{GameContext, GameEntry, PriceListenerStats, PriceListenerStatsSnapshot, ShardCommand, ZmqEnvelope};
+use crate::config::{GameMonitorConfig, load_espn_circuit_breaker_config, load_database_url, load_zmq_sub_endpoints, load_zmq_pub_port, DEFAULT_MIN_EDGE_PCT};
 use crate::price::data::{MarketPriceData, IncomingMarketPrice};
 use crate::signals::edge::{compute_team_net_edge, fee_for_price};
 use crate::monitoring::espn::{parse_sport, is_overtime, format_time_remaining, check_cross_platform_arb, espn_sport_league};
 use crate::price::matching::{find_team_prices, select_best_platform_for_team};
 
-// Re-export types for external use
-pub use crate::price::data::{MarketPriceData as PublicMarketPriceData};
+// Type definitions moved to types.rs
+// Configuration constants moved to config.rs
 
-/// ZMQ message envelope format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ZmqEnvelope {
-    seq: u64,
-    timestamp_ms: i64,
-    source: Option<String>,
-    payload: serde_json::Value,
-}
-
-/// Default minimum edge percentage to generate a signal (can be overridden via MIN_EDGE_PCT env var)
-/// Data shows: 5-10% edge = 36% win rate, 15%+ edge = 87.5% win rate
-const DEFAULT_MIN_EDGE_PCT: f64 = 15.0;
-/// Maximum probability to buy (avoid buying near-certain outcomes)
-const MAX_BUY_PROB: f64 = 0.95;
-/// Minimum probability to buy (avoid buying very unlikely outcomes)
-const MIN_BUY_PROB: f64 = 0.05;
-
-/// Statistics for monitoring price message processing health
-#[derive(Debug, Default)]
-pub struct PriceListenerStats {
-    /// Total price messages received
-    pub messages_received: std::sync::atomic::AtomicU64,
-    /// Messages successfully parsed and processed
-    pub messages_processed: std::sync::atomic::AtomicU64,
-    /// Messages that failed to parse (msgpack or JSON)
-    pub parse_failures: std::sync::atomic::AtomicU64,
-    /// Messages skipped due to no liquidity
-    pub no_liquidity_skipped: std::sync::atomic::AtomicU64,
-    /// Messages skipped due to missing contract_team
-    pub no_team_skipped: std::sync::atomic::AtomicU64,
-}
-
-impl PriceListenerStats {
-    pub fn snapshot(&self) -> PriceListenerStatsSnapshot {
-        PriceListenerStatsSnapshot {
-            messages_received: self.messages_received.load(std::sync::atomic::Ordering::Relaxed),
-            messages_processed: self.messages_processed.load(std::sync::atomic::Ordering::Relaxed),
-            parse_failures: self.parse_failures.load(std::sync::atomic::Ordering::Relaxed),
-            no_liquidity_skipped: self.no_liquidity_skipped.load(std::sync::atomic::Ordering::Relaxed),
-            no_team_skipped: self.no_team_skipped.load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PriceListenerStatsSnapshot {
-    pub messages_received: u64,
-    pub messages_processed: u64,
-    pub parse_failures: u64,
-    pub no_liquidity_skipped: u64,
-    pub no_team_skipped: u64,
-}
 
 #[derive(Clone)]
 pub struct GameShard {
@@ -127,40 +77,6 @@ pub struct GameShard {
 }
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GameContext {
-    pub game_id: String,
-    pub sport: String,                   // Keep for backward compatibility
-    pub market_type: Option<MarketType>, // Universal market type
-    pub entity_a: Option<String>,        // Generic entity A (home_team for sports)
-    pub entity_b: Option<String>,        // Generic entity B (away_team for sports)
-    pub polymarket_id: Option<String>,
-    pub kalshi_id: Option<String>,
-}
-
-struct GameEntry {
-    context: GameContext,
-    task: tokio::task::JoinHandle<()>,
-    /// Last calculated home win probability
-    last_home_win_prob: Arc<RwLock<Option<f64>>>,
-    /// Opening market line for home team (first price we see, used as team strength prior)
-    opening_home_prob: Arc<RwLock<Option<f64>>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShardCommand {
-    #[serde(rename = "type")]
-    command_type: String,
-    game_id: Option<String>,
-    event_id: Option<String>,           // Universal event ID (for non-sports markets)
-    sport: Option<String>,
-    market_type: Option<MarketType>,    // Universal market type (sport, crypto, economics, politics)
-    entity_a: Option<String>,           // Generic entity A (home_team for sports)
-    entity_b: Option<String>,           // Generic entity B (away_team for sports)
-    kalshi_market_id: Option<String>,
-    polymarket_market_id: Option<String>,
-    metadata: Option<serde_json::Value>, // Additional market-specific metadata
-}
 
 
 impl GameShard {
@@ -169,51 +85,20 @@ impl GameShard {
         let espn = EspnClient::new();
 
         // Create database pool
-        let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://arbees:arbees@localhost:5432/arbees".to_string());
+        let database_url = load_database_url();
         let db_pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&database_url)
             .await?;
         info!("Connected to database");
 
-        let poll_interval_secs = env::var("POLL_INTERVAL")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.5)
-            .clamp(0.1, 5.0);
-        let poll_interval = Duration::from_secs_f64(poll_interval_secs);
-        let heartbeat_interval = Duration::from_secs(
-            env::var("HEARTBEAT_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(10),
-        );
-        let max_games = env::var("MAX_GAMES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(20);
-        let min_edge_pct = env::var("MIN_EDGE_PCT")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(DEFAULT_MIN_EDGE_PCT);
+        // Load configuration
+        let config = GameMonitorConfig::from_env();
 
         // ESPN API circuit breaker configuration
         let espn_circuit_breaker = Arc::new(ApiCircuitBreaker::new(
             "espn_api",
-            ApiCircuitBreakerConfig {
-                failure_threshold: env::var("ESPN_CB_FAILURE_THRESHOLD")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(5),
-                recovery_timeout: std::time::Duration::from_secs(
-                    env::var("ESPN_CB_RECOVERY_TIMEOUT_SECS")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(30),
-                ),
-                success_threshold: 2,
-            },
+            load_espn_circuit_breaker_config(),
         ));
         info!(
             "ESPN circuit breaker configured: failure_threshold={}, recovery_timeout={}s",
@@ -224,17 +109,8 @@ impl GameShard {
         // Transport mode configuration
         let transport_mode = TransportMode::from_env();
 
-        let zmq_sub_endpoints: Vec<String> = env::var("ZMQ_SUB_ENDPOINTS")
-            .unwrap_or_else(|_| "tcp://kalshi_monitor:5555,tcp://polymarket_monitor:5556".to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let zmq_pub_port = env::var("ZMQ_PUB_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5558u16);
+        let zmq_sub_endpoints = load_zmq_sub_endpoints();
+        let zmq_pub_port = load_zmq_pub_port();
 
         // Generate process identity for restart detection
         let process_id = Uuid::new_v4().to_string();
@@ -258,10 +134,10 @@ impl GameShard {
             db_pool,
             games: Arc::new(Mutex::new(HashMap::new())),
             market_prices: Arc::new(RwLock::new(HashMap::new())),
-            poll_interval,
-            heartbeat_interval,
-            max_games,
-            min_edge_pct,
+            poll_interval: config.poll_interval,
+            heartbeat_interval: config.heartbeat_interval,
+            max_games: config.max_games,
+            min_edge_pct: config.min_edge_pct,
             price_stats: Arc::new(PriceListenerStats::default()),
             espn_circuit_breaker,
             transport_mode,
