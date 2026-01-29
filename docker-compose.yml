@@ -38,11 +38,18 @@ services:
       retries: 5
 
   # ==========================================================================
-  # ZMQ Listener (Rust) - Bridges ZMQ messages to Redis for backward compatibility
+  # ZMQ Listener (Rust) - Observes all ZMQ traffic for logging and persistence
   # ==========================================================================
-  # This service subscribes to ZMQ publishers (kalshi_monitor, polymarket_monitor,
-  # game_shard) and mirrors messages to Redis streams/pub-sub for services that
-  # don't use ZMQ directly.
+  # This service subscribes to ALL ZMQ publishers and provides:
+  # - Structured console logging for debugging
+  # - Redis streams for historical queries and slow-path consumers
+  # - Optional file logging for replay/backtesting
+  # - Latency tracking and sequence gap detection
+  #
+  # Modes:
+  # - observer: Log and persist to streams only (default for zmq_only)
+  # - bridge: Also forward to Redis pub/sub (for "both" transport mode)
+  # - disabled: Exit immediately (for redis_only mode)
   # ==========================================================================
   zmq_listener:
     build:
@@ -55,13 +62,26 @@ services:
     env_file:
       - .env
     environment:
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      # Transport mode determines listener behavior
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-zmq_only}"
+      # Explicit listener mode (optional - inferred from transport mode if not set)
+      ZMQ_LISTENER_MODE: "${ZMQ_LISTENER_MODE:-}"
+      # ZMQ endpoints to subscribe to
       ZMQ_KALSHI_ENDPOINT: "tcp://kalshi_monitor:5555"
       ZMQ_POLYMARKET_ENDPOINT: "tcp://vpn:5556"
       ZMQ_GAME_SHARD_ENDPOINT: "tcp://game_shard:5558"
+      ZMQ_SIGNAL_PROCESSOR_ENDPOINT: "tcp://signal_processor:5559"
+      ZMQ_EXECUTION_ENDPOINT: "tcp://execution_service:5560"
+      # Output configuration
+      ZMQ_LISTENER_CONSOLE_LOG: "${ZMQ_LISTENER_CONSOLE_LOG:-true}"
+      ZMQ_LISTENER_REDIS_STREAMS: "${ZMQ_LISTENER_REDIS_STREAMS:-true}"
+      ZMQ_LISTENER_LOG_FORMAT: "${ZMQ_LISTENER_LOG_FORMAT:-pretty}"
+      # Optional file logging (mount a volume if using)
+      # ZMQ_LISTENER_LOG_FILE: "/var/log/arbees/zmq_traffic.jsonl"
     restart: unless-stopped
     profiles:
       - full
+      - zmq
 
   # ==========================================================================
   # Notifications (Rust) - Signal via signal-cli-rest-api sidecar
@@ -168,7 +188,7 @@ services:
       - .env
     environment:
       # ZMQ configuration for low-latency messaging
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-zmq_only}"
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5558"
       SHARD_TYPE: "sports"
@@ -209,7 +229,7 @@ services:
       SHARD_TYPE: "crypto"
       MAX_GAMES: "50"
       # ZMQ configuration for low-latency messaging
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-zmq_only}"
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5559"
       # Increase stack size to prevent overflow with deep async call stacks
@@ -270,7 +290,7 @@ services:
       - .env
     environment:
       # ZMQ configuration for signal processing pipeline
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-zmq_only}"
       ZMQ_SUB_ENDPOINT: "tcp://game_shard:5558"
       ZMQ_PUB_PORT: "5559"
     expose:
@@ -295,8 +315,12 @@ services:
       - .env
     environment:
       # ZMQ configuration for execution request processing
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-zmq_only}"
       ZMQ_SUB_ENDPOINT: "tcp://signal_processor:5559"
+      # ZMQ PUB for trade results (observed by zmq_listener)
+      ZMQ_PUB_PORT: "5560"
+    expose:
+      - "5560"
     volumes:
       - ./:/app
     profiles:
@@ -514,7 +538,7 @@ services:
     environment:
       # ZMQ configuration for low-latency price publishing
       # Note: Since using network_mode: service:vpn, port 5556 is exposed via vpn container
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-zmq_only}"
       ZMQ_PUB_PORT: "5556"
     volumes:
       # DEBUG MODE: write NDJSON instrumentation to the host workspace file
@@ -538,7 +562,7 @@ services:
       - .env
     environment:
       # ZMQ configuration for low-latency price publishing
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-zmq_only}"
       ZMQ_PUB_PORT: "5555"
     expose:
       - "5555"
