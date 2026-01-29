@@ -579,6 +579,8 @@ class PolymarketMonitor:
                                 last_trade_price=polled.last_trade_price,
                             )
                             await self.redis.publish_market_price(game_id, normalized)
+                            if self._zmq_enabled and self._zmq_pub:
+                                await self._publish_zmq_price(condition_id, game_id, normalized)
                             self._prices_published += 1
                             self._last_price_time = datetime.utcnow()
                         continue
@@ -644,6 +646,8 @@ class PolymarketMonitor:
                             last_trade_price=float(market_data.get("lastTradePrice", 0) or 0) if market_data.get("lastTradePrice") else None,
                         )
                         await self.redis.publish_market_price(game_id, normalized)
+                        if self._zmq_enabled and self._zmq_pub:
+                            await self._publish_zmq_price(condition_id, game_id, normalized)
                         self._prices_published += 1
                         self._last_price_time = datetime.utcnow()
                         

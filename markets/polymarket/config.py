@@ -27,6 +27,16 @@ DEFAULT_ENDPOINTS = PolymarketEndpoints(
 )
 
 
+def _get_env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def get_polymarket_gamma_url(override_url: Optional[str] = None) -> str:
     """
     Get Polymarket Gamma API URL.
@@ -70,6 +80,21 @@ def get_polymarket_ws_url(override_url: Optional[str] = None) -> str:
         return override_url
     
     return os.environ.get("POLYMARKET_WS_URL", DEFAULT_ENDPOINTS.ws_url)
+
+
+def get_polymarket_ws_reconnect_base() -> float:
+    """Base delay (seconds) for WS exponential backoff."""
+    return _get_env_float("POLYMARKET_WS_RECONNECT_BASE", 0.25)
+
+
+def get_polymarket_ws_reconnect_max() -> float:
+    """Max delay (seconds) for WS exponential backoff."""
+    return _get_env_float("POLYMARKET_WS_RECONNECT_MAX", 30.0)
+
+
+def get_polymarket_ws_reconnect_jitter() -> float:
+    """Jitter percentage (0-1) for WS exponential backoff."""
+    return _get_env_float("POLYMARKET_WS_RECONNECT_JITTER", 0.2)
 
 
 def get_polymarket_api_key() -> Optional[str]:

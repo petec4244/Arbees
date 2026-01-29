@@ -7,6 +7,7 @@ Provides 10-50ms latency for CLOB orderbook updates.
 import asyncio
 import json
 import logging
+import random
 import time
 from datetime import datetime
 from typing import AsyncIterator, Optional, Set, Dict
@@ -35,8 +36,8 @@ class PolymarketWebSocketClient:
     # The Rust reference bot pings every 30s using WS ping frames. Polymarket docs
     # sometimes require more frequent pings; we use 5s to be safe.
     PING_INTERVAL = 5  # seconds
-    RECONNECT_DELAY_BASE = 1.0  # seconds
-    RECONNECT_DELAY_MAX = 60.0  # seconds
+    RECONNECT_DELAY_BASE = 1.0  # seconds (legacy default)
+    RECONNECT_DELAY_MAX = 60.0  # seconds (legacy default)
     
     def __init__(self, ws_url: Optional[str] = None):
         """
@@ -45,7 +46,12 @@ class PolymarketWebSocketClient:
         Args:
             ws_url: Override WebSocket URL (or use POLYMARKET_WS_URL env var)
         """
-        from markets.polymarket.config import get_polymarket_ws_url
+        from markets.polymarket.config import (
+            get_polymarket_ws_reconnect_base,
+            get_polymarket_ws_reconnect_jitter,
+            get_polymarket_ws_reconnect_max,
+            get_polymarket_ws_url,
+        )
         
         self._ws_url = get_polymarket_ws_url(override_url=ws_url)
         self._ws: Optional[WebSocketClientProtocol] = None
@@ -53,6 +59,13 @@ class PolymarketWebSocketClient:
         self._token_metadata: Dict[str, dict] = {}  # token_id -> {condition_id, title, etc}
         self._running = False
         self._reconnect_count = 0
+        self._reconnect_in_progress = False
+        self._last_disconnect_at: Optional[float] = None
+        self._last_reconnect_at: Optional[float] = None
+
+        self._reconnect_base = get_polymarket_ws_reconnect_base()
+        self._reconnect_max = get_polymarket_ws_reconnect_max()
+        self._reconnect_jitter = max(0.0, min(get_polymarket_ws_reconnect_jitter(), 1.0))
         
         # Message queue for async iteration
         self._message_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
@@ -292,10 +305,12 @@ class PolymarketWebSocketClient:
             close_reason = getattr(self._ws, "close_reason", None)
             logger.warning(f"Polymarket WebSocket connection closed (code={close_code}, reason={close_reason})")
             if self._running:
+                self._last_disconnect_at = time.monotonic()
                 asyncio.create_task(self._handle_reconnect())
         except Exception as e:
             logger.error(f"Error in Polymarket WebSocket receive loop: {e}")
             if self._running:
+                self._last_disconnect_at = time.monotonic()
                 asyncio.create_task(self._handle_reconnect())
     
     async def _ping_loop(self) -> None:
@@ -313,33 +328,51 @@ class PolymarketWebSocketClient:
                 logger.error(f"Error in Polymarket ping loop: {e}")
     
     async def _handle_reconnect(self) -> None:
-        """Handle WebSocket reconnection with exponential backoff."""
-        if not self._running:
+        """Handle WebSocket reconnection with exponential backoff + jitter."""
+        if not self._running or self._reconnect_in_progress:
             return
-        
-        self._reconnect_count += 1
-        delay = min(
-            self.RECONNECT_DELAY_BASE * (2 ** self._reconnect_count),
-            self.RECONNECT_DELAY_MAX
-        )
-        
-        logger.info(f"Reconnecting to Polymarket WebSocket in {delay:.1f}s (attempt {self._reconnect_count})")
-        await asyncio.sleep(delay)
-        
+
+        self._reconnect_in_progress = True
         try:
-            # Close old connection
-            if self._ws:
+            while self._running:
+                self._reconnect_count += 1
+                base_delay = min(
+                    self._reconnect_base * (2 ** max(self._reconnect_count - 1, 0)),
+                    self._reconnect_max,
+                )
+                jitter = 1.0
+                if self._reconnect_jitter > 0:
+                    jitter = 1.0 + random.uniform(-self._reconnect_jitter, self._reconnect_jitter)
+                delay = min(base_delay * jitter, self._reconnect_max)
+
+                logger.info(
+                    f"Reconnecting to Polymarket WebSocket in {delay:.2f}s "
+                    f"(attempt {self._reconnect_count})"
+                )
+                await asyncio.sleep(delay)
+
                 try:
-                    await self._ws.close()
-                except:
-                    pass
-            
-            # Reconnect
-            await self.connect()
-            
-        except Exception as e:
-            logger.error(f"Polymarket reconnect failed: {e}")
-            # Will try again on next disconnect
+                    # Close old connection
+                    if self._ws:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+
+                    # Reconnect
+                    await self.connect()
+                    self._last_reconnect_at = time.monotonic()
+                    if self._last_disconnect_at is not None:
+                        reconnect_time = self._last_reconnect_at - self._last_disconnect_at
+                        logger.info(
+                            f"Polymarket WS reconnected in {reconnect_time:.2f}s "
+                            f"(attempts={self._reconnect_count})"
+                        )
+                    return
+                except Exception as e:
+                    logger.error(f"Polymarket reconnect failed: {e}")
+        finally:
+            self._reconnect_in_progress = False
     
     async def _resubscribe_all(self) -> None:
         """Re-subscribe to all markets after reconnect."""

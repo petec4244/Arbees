@@ -264,12 +264,12 @@ impl GameShard {
             .await?;
         info!("Connected to database");
 
-        let poll_interval = Duration::from_secs_f64(
-            env::var("POLL_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(1.0),
-        );
+        let poll_interval_secs = env::var("POLL_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.1, 5.0);
+        let poll_interval = Duration::from_secs_f64(poll_interval_secs);
         let heartbeat_interval = Duration::from_secs(
             env::var("HEARTBEAT_INTERVAL_SECS")
                 .ok()
@@ -1229,7 +1229,7 @@ async fn monitor_game(
                         if emit_arb_signal(
                             &redis, &game_id, sport_enum, &game.home_team,
                             arb_mask, profit, home_kalshi.unwrap(), home_poly.unwrap(),
-                            &zmq_pub, &zmq_seq
+                            &zmq_pub, &zmq_seq, transport_mode
                         ).await {
                             last_signal_times.insert(arb_key, Instant::now());
                         }
@@ -1269,7 +1269,7 @@ async fn monitor_game(
                                 if emit_latency_signal(
                                     &redis, &game_id, sport_enum, &game.home_team,
                                     SignalDirection::Buy, price, platform, home_win_prob,
-                                    &zmq_pub, &zmq_seq
+                                    &zmq_pub, &zmq_seq, transport_mode
                                 ).await {
                                     last_signal_times.insert(signal_key, Instant::now());
                                 }
@@ -1295,7 +1295,7 @@ async fn monitor_game(
                                 if emit_latency_signal(
                                     &redis, &game_id, sport_enum, &game.away_team,
                                     SignalDirection::Buy, price, platform, 1.0 - home_win_prob,
-                                    &zmq_pub, &zmq_seq
+                                    &zmq_pub, &zmq_seq, transport_mode
                                 ).await {
                                     last_signal_times.insert(signal_key, Instant::now());
                                 }
@@ -1889,6 +1889,7 @@ async fn emit_arb_signal(
     poly_price: &MarketPriceData,
     zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: &Arc<AtomicU64>,
+    transport_mode: TransportMode,
 ) -> bool {
     let arb_types = decode_arb_mask(arb_mask);
     let arb_type_str = arb_types.first().unwrap_or(&"Unknown");
@@ -1951,17 +1952,21 @@ async fn emit_arb_signal(
         team, arb_type_str, profit_cents, buy_platform, sell_platform
     );
 
-    // Publish via ZMQ for low-latency consumers
-    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+    let mut success = true;
 
-    // Publish via Redis (backward compatibility)
-    match redis.publish(channels::SIGNALS_NEW, &signal).await {
-        Ok(_) => true,
-        Err(e) => {
+    if transport_mode.use_zmq() {
+        publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+    }
+
+    if transport_mode.use_redis() {
+        let redis_result = redis.publish(channels::SIGNALS_NEW, &signal).await;
+        if let Err(e) = &redis_result {
             error!("Failed to publish arb signal via Redis: {}", e);
-            false
+            success = false;
         }
     }
+
+    success
 }
 
 /// Emit a latency-based signal when a team scores.
@@ -1977,6 +1982,7 @@ async fn emit_latency_signal(
     model_prob: f64,
     zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: &Arc<AtomicU64>,
+    transport_mode: TransportMode,
 ) -> bool {
     // For a BUY signal, we expect the price to go UP after the score
     // Edge is the expected price movement (model prob - current market price)
@@ -2018,17 +2024,21 @@ async fn emit_latency_signal(
         entity: None,
     };
 
-    // Publish via ZMQ for low-latency consumers
-    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+    let mut success = true;
 
-    // Publish via Redis (backward compatibility)
-    match redis.publish(channels::SIGNALS_NEW, &signal).await {
-        Ok(_) => true,
-        Err(e) => {
+    if transport_mode.use_zmq() {
+        publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+    }
+
+    if transport_mode.use_redis() {
+        let redis_result = redis.publish(channels::SIGNALS_NEW, &signal).await;
+        if let Err(e) = &redis_result {
             error!("Failed to publish latency signal via Redis: {}", e);
-            false
+            success = false;
         }
     }
+
+    success
 }
 
 // ============================================================================
