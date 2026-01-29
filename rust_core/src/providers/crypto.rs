@@ -438,21 +438,29 @@ impl EventProvider for CryptoEventProvider {
         let events: Vec<EventInfo> = cache
             .values()
             .filter(|m| m.status == EventStatus::Live)
-            .map(|m| EventInfo {
-                event_id: m.market_id.clone(),
-                market_type: MarketType::Crypto {
-                    asset: m.asset.clone(),
-                    prediction_type: m.prediction_type,
-                },
-                entity_a: m.asset.clone(),
-                entity_b: None,
-                scheduled_time: m.target_date,
-                status: m.status,
-                venue: Some(m.platform.clone()),
-                metadata: serde_json::json!({
-                    "title": m.title,
-                    "target_price": m.target_price,
-                }),
+            .map(|m| {
+                // Extract raw condition_id/ticker from market_id (format: "platform:id")
+                let raw_id = m.market_id.split(':').nth(1).unwrap_or(&m.market_id);
+
+                EventInfo {
+                    event_id: m.market_id.clone(),
+                    market_type: MarketType::Crypto {
+                        asset: m.asset.clone(),
+                        prediction_type: m.prediction_type,
+                    },
+                    entity_a: m.asset.clone(),
+                    entity_b: None,
+                    scheduled_time: m.target_date,
+                    status: m.status,
+                    venue: Some(m.platform.clone()),
+                    metadata: serde_json::json!({
+                        "title": m.title,
+                        "target_price": m.target_price,
+                        // Include platform-specific IDs for monitor assignment
+                        "polymarket_condition_id": if m.platform == "polymarket" { Some(raw_id) } else { None },
+                        "kalshi_ticker": if m.platform == "kalshi" { Some(raw_id) } else { None },
+                    }),
+                }
             })
             .collect();
 
@@ -471,21 +479,29 @@ impl EventProvider for CryptoEventProvider {
         let events: Vec<EventInfo> = cache
             .values()
             .filter(|m| m.target_date <= cutoff)
-            .map(|m| EventInfo {
-                event_id: m.market_id.clone(),
-                market_type: MarketType::Crypto {
-                    asset: m.asset.clone(),
-                    prediction_type: m.prediction_type,
-                },
-                entity_a: m.asset.clone(),
-                entity_b: None,
-                scheduled_time: m.target_date,
-                status: m.status,
-                venue: Some(m.platform.clone()),
-                metadata: serde_json::json!({
-                    "title": m.title,
-                    "target_price": m.target_price,
-                }),
+            .map(|m| {
+                // Extract raw condition_id/ticker from market_id (format: "platform:id")
+                let raw_id = m.market_id.split(':').nth(1).unwrap_or(&m.market_id);
+
+                EventInfo {
+                    event_id: m.market_id.clone(),
+                    market_type: MarketType::Crypto {
+                        asset: m.asset.clone(),
+                        prediction_type: m.prediction_type,
+                    },
+                    entity_a: m.asset.clone(),
+                    entity_b: None,
+                    scheduled_time: m.target_date,
+                    status: m.status,
+                    venue: Some(m.platform.clone()),
+                    metadata: serde_json::json!({
+                        "title": m.title,
+                        "target_price": m.target_price,
+                        // Include platform-specific IDs for monitor assignment
+                        "polymarket_condition_id": if m.platform == "polymarket" { Some(raw_id) } else { None },
+                        "kalshi_ticker": if m.platform == "kalshi" { Some(raw_id) } else { None },
+                    }),
+                }
             })
             .collect();
 
@@ -606,6 +622,12 @@ fn contains_crypto_asset(text: &str, asset: &str) -> bool {
     let asset_upper = asset.to_uppercase();
     let full_name = asset_full_name(asset).to_uppercase();
 
+    // Special handling for DOGE - filter out Department of Government Efficiency markets
+    // These are political markets about Elon Musk's cost-cutting initiative, not Dogecoin
+    if asset_upper == "DOGE" && is_government_doge_market(&text_upper) {
+        return false;
+    }
+
     // Check for the asset symbol with word boundaries
     // Allow matches like "BTC", "$BTC", "BTC:", "BTC,", "(BTC)", etc.
     for word in text_upper.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ':' || c == ';') {
@@ -617,6 +639,41 @@ fn contains_crypto_asset(text: &str, asset: &str) -> bool {
 
     // Check for full name (e.g., "BITCOIN", "ETHEREUM")
     text_upper.contains(&full_name)
+}
+
+/// Check if text is about Department of Government Efficiency (DOGE), not Dogecoin
+/// Returns true if the text contains political/government keywords indicating it's not crypto
+fn is_government_doge_market(text_upper: &str) -> bool {
+    // Keywords that indicate Department of Government Efficiency, not Dogecoin
+    const GOVT_DOGE_KEYWORDS: &[&str] = &[
+        "FEDERAL SPENDING",
+        "GOVERNMENT SPENDING",
+        "FEDERAL BUDGET",
+        "GOVERNMENT EFFICIENCY",
+        "DEPT OF GOVERNMENT",
+        "DEPARTMENT OF GOVERNMENT",
+        "ELON AND DOGE",
+        "MUSK AND DOGE",
+        "DOGE CUT",
+        "DOGE SAVE",
+        "DOGE REDUCE",
+        "DOGE SLASH",
+        "BILLION IN SPENDING",
+        "TRILLION IN SPENDING",
+        "EXECUTIVE ORDER",
+        "WHITE HOUSE",
+        "TRUMP ADMIN",
+        "VIVEK",
+        "RAMASWAMY",
+    ];
+
+    for keyword in GOVT_DOGE_KEYWORDS {
+        if text_upper.contains(keyword) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Get full name for asset symbol
@@ -771,5 +828,36 @@ mod tests {
         let provider = CryptoEventProvider::new();
         assert_eq!(provider.provider_name(), "CryptoEventProvider");
         assert!(!provider.supported_market_types().is_empty());
+    }
+
+    #[test]
+    fn test_doge_government_filtering() {
+        // Should NOT match - these are Department of Government Efficiency markets
+        assert!(
+            !contains_crypto_asset("Will Elon and DOGE cut less than $50b in federal spending in 2025?", "DOGE"),
+            "Should filter out government DOGE markets"
+        );
+        assert!(
+            !contains_crypto_asset("Will DOGE save $1 trillion in government spending?", "DOGE"),
+            "Should filter out government spending DOGE markets"
+        );
+        assert!(
+            !contains_crypto_asset("DOGE slash federal budget by 20%", "DOGE"),
+            "Should filter out federal budget DOGE markets"
+        );
+
+        // SHOULD match - these are actual Dogecoin markets
+        assert!(
+            contains_crypto_asset("Will DOGE reach $1?", "DOGE"),
+            "Should match Dogecoin price target"
+        );
+        assert!(
+            contains_crypto_asset("Dogecoin above $0.50 by December", "DOGE"),
+            "Should match Dogecoin by full name"
+        );
+        assert!(
+            contains_crypto_asset("Will $DOGE hit $2?", "DOGE"),
+            "Should match $DOGE ticker format"
+        );
     }
 }

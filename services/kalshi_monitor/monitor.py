@@ -293,7 +293,7 @@ class KalshiMonitor:
 
     async def _assignment_listener(self):
         """Subscribe to market assignment messages from Orchestrator."""
-        logger.info("Starting assignment listener...")
+        logger.info(f"Starting assignment listener on channel: {Channel.MARKET_ASSIGNMENTS.value}")
 
         # Subscribe to market assignments channel
         await self.redis.subscribe(
@@ -301,9 +301,11 @@ class KalshiMonitor:
             self._handle_assignment,
         )
 
+        logger.info("Assignment listener subscribed, waiting for market assignments from orchestrator...")
+
         # Start the listener (runs in background)
         await self.redis.start_listening()
-        
+
         # Keep this task alive while running
         while self._running:
             await asyncio.sleep(1)
@@ -315,14 +317,17 @@ class KalshiMonitor:
         if msg_type != "kalshi_assign":
             return
 
-        game_id = data.get("game_id")
+        # Support both "game_id" (sports) and "event_id" (crypto/multi-market)
+        game_id = data.get("game_id") or data.get("event_id")
         sport = data.get("sport")
+        market_type_label = data.get("market_type", "moneyline")  # crypto, economics, politics, or moneyline
         markets = data.get("markets", [])
 
         if not game_id or not markets:
+            logger.warning(f"Invalid Kalshi assignment - missing game_id/event_id or markets: {data}")
             return
 
-        logger.info(f"Received Kalshi assignment: game={game_id}, sport={sport}, markets={len(markets)}")
+        logger.info(f"Received Kalshi assignment: game={game_id}, sport={sport}, market_type={market_type_label}, markets={len(markets)}")
 
         for market_info in markets:
             ticker = market_info.get("ticker") or market_info.get("market_id")
@@ -403,13 +408,20 @@ class KalshiMonitor:
     async def _price_streaming_loop(self):
         """Stream prices from Kalshi WebSocket and publish to Redis."""
         logger.info("Starting price streaming loop...")
+        idle_log_counter = 0
 
         while self._running:
             try:
                 # Wait for subscriptions
                 if not self.subscribed_tickers:
+                    idle_log_counter += 1
+                    # Log every 30 iterations (60 seconds) when idle
+                    if idle_log_counter % 30 == 1:
+                        logger.info(f"Price streaming loop idle - no subscribed tickers (waiting for market assignments)")
                     await asyncio.sleep(2)
                     continue
+
+                idle_log_counter = 0  # Reset when we have tickers
 
                 # Check connection before streaming
                 if not self.kalshi_ws.is_connected:

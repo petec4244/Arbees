@@ -229,13 +229,15 @@ class PolymarketMonitor:
 
     async def _assignment_listener(self):
         """Subscribe to market assignment messages from Orchestrator."""
-        logger.info("Starting assignment listener...")
+        logger.info(f"Starting assignment listener on channel: {Channel.MARKET_ASSIGNMENTS.value}")
 
         # Subscribe to market assignments channel
         await self.redis.subscribe(
             Channel.MARKET_ASSIGNMENTS.value,
             self._handle_assignment,
         )
+
+        logger.info("Assignment listener subscribed, waiting for market assignments from orchestrator...")
 
         # Start the listener
         await self.redis.start_listening()
@@ -247,14 +249,17 @@ class PolymarketMonitor:
         if msg_type != "polymarket_assign":
             return
 
-        game_id = data.get("game_id")
+        # Support both "game_id" (sports) and "event_id" (crypto/multi-market)
+        game_id = data.get("game_id") or data.get("event_id")
         sport = data.get("sport")
+        market_type = data.get("market_type", "moneyline")  # crypto, economics, politics, or moneyline
         markets = data.get("markets", [])
 
         if not game_id or not markets:
+            logger.warning(f"Invalid assignment - missing game_id/event_id or markets: {data}")
             return
 
-        logger.info(f"Received assignment: game={game_id}, sport={sport}, markets={len(markets)}")
+        logger.info(f"Received assignment: game={game_id}, sport={sport}, market_type={market_type}, markets={len(markets)}")
 
         for market_info in markets:
             condition_id = market_info.get("condition_id")
@@ -379,13 +384,20 @@ class PolymarketMonitor:
     async def _price_streaming_loop(self):
         """Stream prices from Polymarket WebSocket and publish to Redis."""
         logger.info("Starting price streaming loop...")
+        idle_log_counter = 0
 
         while self._running:
             try:
                 # Wait for subscriptions
                 if not self.subscribed_tokens:
+                    idle_log_counter += 1
+                    # Log every 30 iterations (60 seconds) when idle
+                    if idle_log_counter % 30 == 1:
+                        logger.info(f"Price streaming loop idle - no subscribed tokens (waiting for market assignments)")
                     await asyncio.sleep(2)
                     continue
+
+                idle_log_counter = 0  # Reset when we have tokens
 
                 token_ids = list(self.subscribed_tokens)
                 logger.info(f"Streaming prices for {len(token_ids)} Polymarket markets")
@@ -533,17 +545,24 @@ class PolymarketMonitor:
     async def _rest_poll_loop(self) -> None:
         """
         Fallback poller to ensure we publish prices even if WS is quiet/flaky.
-        
+
         For moneyline markets, polls BOTH team tokens and publishes separate
         prices for each team.
         """
         logger.info(f"Starting REST poll loop (interval={self._poll_interval_s}s)...")
+        idle_log_counter = 0
 
         while self._running:
             try:
                 if not self._active_by_game_type:
+                    idle_log_counter += 1
+                    # Log every 30 iterations (~60 seconds at 2s interval) when idle
+                    if idle_log_counter % 30 == 1:
+                        logger.info(f"REST poll loop idle - no active market assignments (subscribed_conditions={len(self.subscribed_conditions)})")
                     await asyncio.sleep(self._poll_interval_s)
                     continue
+
+                idle_log_counter = 0  # Reset when we have active assignments
 
                 active_items = list(self._active_by_game_type.items())
                 for (g_id, m_type), condition_id in active_items:

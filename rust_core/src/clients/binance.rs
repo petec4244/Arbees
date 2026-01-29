@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-const BASE_URL: &str = "https://api.binance.com/api/v3";
+const BASE_URL: &str = "https://api.binance.us/api/v3";
 const CACHE_TTL_SECS: i64 = 30;
 const RATE_LIMIT_PER_MINUTE: u64 = 1200;
 

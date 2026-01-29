@@ -201,15 +201,15 @@ services:
       - full
 
   # ==========================================================================
-  # Crypto Shard - Handles non-sports markets (crypto, economics, politics)
+  # Crypto Shard - Self-contained crypto arbitrage service
   # ==========================================================================
-  # Uses the same game_shard binary but configured for crypto/multi-market types.
-  # Orchestrator routes markets based on shard_type in heartbeat.
+  # Monitors crypto events and emits execution requests via ZMQ
+  # Bypasses signal_processor for <50ms latency
   # ==========================================================================
   crypto_shard:
     build:
       context: .
-      dockerfile: services/game_shard_rust/Dockerfile
+      dockerfile: services/crypto_shard_rust/Dockerfile
     container_name: arbees-crypto-shard
     deploy:
       resources:
@@ -219,18 +219,31 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      crypto-spot-monitor:
+        condition: service_started
     env_file:
       - .env
     environment:
-      SHARD_ID: "crypto_shard_1"
-      SHARD_TYPE: "crypto"
-      MAX_GAMES: "50"
-      # ZMQ configuration for low-latency messaging
-      ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
-      ZMQ_PUB_PORT: "5559"
-      # Increase stack size to prevent overflow with deep async call stacks
-      # 32MB stack for handling many concurrent event monitors
-      RUST_MIN_STACK: "33554432"
+      RUST_LOG: info
+      CRYPTO_SHARD_ID: "crypto_1"
+      # ZMQ price subscriptions: Kalshi (5555), Polymarket (5556), Spot prices (5560)
+      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556,tcp://crypto-spot-monitor:5560"
+      CRYPTO_EXECUTION_PUB_ENDPOINT: "tcp://*:5559"
+      # Risk management
+      CRYPTO_MIN_EDGE_PCT: "3.0"
+      CRYPTO_MAX_POSITION_SIZE: "500.0"
+      CRYPTO_MAX_ASSET_EXPOSURE: "2000.0"
+      CRYPTO_MAX_TOTAL_EXPOSURE: "5000.0"
+      CRYPTO_VOLATILITY_SCALING: "true"
+      CRYPTO_MIN_LIQUIDITY: "50.0"
+      # Probability model
+      CRYPTO_MODEL_VOLATILITY_WINDOW_DAYS: "30"
+      CRYPTO_MODEL_TIME_DECAY: "true"
+      CRYPTO_MODEL_MIN_CONFIDENCE: "0.60"
+      # Monitoring
+      CRYPTO_POLL_INTERVAL_SECS: "30"
+      CRYPTO_PRICE_STALENESS_SECS: "60"
+      CRYPTO_HEARTBEAT_INTERVAL_SECS: "5"
     expose:
       - "5559"
     ports:
@@ -516,6 +529,31 @@ services:
     profiles:
       - full
       - vpn
+
+  # Crypto Spot Price Monitor - Real-time BTC/ETH/SOL spot prices via WebSocket
+  crypto-spot-monitor:
+    build:
+      context: .
+      dockerfile: services/crypto_spot_monitor/Dockerfile
+    container_name: arbees-crypto-spot-monitor
+    environment:
+      ZMQ_PUB_ENDPOINT: "tcp://*:5560"
+      MONITORED_ASSETS: "BTC,ETH,SOL"
+      LOG_LEVEL: "INFO"
+    expose:
+      - "5560"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    restart: unless-stopped
+    profiles:
+      - full
+      - crypto
 
   # Polymarket Price Shard - publishes prices to Redis for all consumers
   polymarket_monitor:

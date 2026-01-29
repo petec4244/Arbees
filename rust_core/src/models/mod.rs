@@ -819,6 +819,50 @@ pub struct ExecutionResult {
 }
 
 // ============================================================================
+// Crypto Execution Types
+// ============================================================================
+
+/// Crypto-native execution request (from crypto_shard_rust)
+/// Bypasses signal_processor for low-latency crypto arbitrage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoExecutionRequest {
+    pub request_id: String,
+    pub event_id: String,
+    pub asset: String,                    // "BTC", "ETH", "SOL"
+    pub signal_type: CryptoSignalType,
+    pub platform: Platform,               // Kalshi or Polymarket
+    pub market_id: String,
+    pub direction: CryptoDirection,       // Long (buy YES) or Short (buy NO)
+    pub edge_pct: f64,
+    pub probability: f64,
+    pub suggested_size: f64,
+    pub max_price: f64,
+    pub current_price: f64,
+    pub timestamp: DateTime<Utc>,
+    pub volatility_factor: f64,
+    pub exposure_check: bool,
+    pub balance_check: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CryptoSignalType {
+    #[serde(rename = "Arbitrage")]
+    Arbitrage,
+    #[serde(rename = "ModelEdge")]
+    ModelEdge,
+    #[serde(rename = "VolatilityMispricing")]
+    VolatilityMispricing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CryptoDirection {
+    #[serde(rename = "Long")]
+    Long,
+    #[serde(rename = "Short")]
+    Short,
+}
+
+// ============================================================================
 // Trade & Position Types
 // ============================================================================
 

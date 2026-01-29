@@ -283,90 +283,6 @@ impl GameShard {
     }
 
     /// Add a universal event (crypto, economics, politics) to be monitored
-    pub async fn add_event(
-        &self,
-        event_id: String,
-        market_type: MarketType,
-        entity_a: String,
-        entity_b: Option<String>,
-        polymarket_id: Option<String>,
-        kalshi_id: Option<String>,
-    ) -> Result<()> {
-        info!(
-            "Adding event: {} ({:?}) entity_a={}, entity_b={:?}",
-            event_id,
-            market_type.type_name(),
-            entity_a,
-            entity_b
-        );
-
-        let mut games = self.games.lock().await;
-        if games.contains_key(&event_id) {
-            warn!("Event already tracked: {}", event_id);
-            return Ok(());
-        }
-
-        let context = GameContext {
-            game_id: event_id.clone(),
-            sport: market_type.type_name().to_string(),
-            market_type: Some(market_type.clone()),
-            entity_a: Some(entity_a.clone()),
-            entity_b: entity_b.clone(),
-            polymarket_id,
-            kalshi_id,
-        };
-
-        // Use shared provider registry (created once at shard startup)
-        let provider_registry = self.event_provider_registry.clone();
-
-        // Create config from environment
-        let config = crate::event_monitor::EventMonitorConfig::from_env();
-
-        // Clone shared state for the monitoring task
-        let redis = self.redis.clone();
-        let db_pool = self.db_pool.clone();
-        let market_prices = self.market_prices.clone();
-        let zmq_pub = self.zmq_pub.clone();
-        let zmq_seq = self.zmq_seq.clone();
-        let probability_registry = self.probability_registry.clone();
-        let eid = event_id.clone();
-        let mt = market_type.clone();
-        let ea = entity_a.clone();
-        let eb = entity_b.clone();
-
-        // Spawn the monitoring task
-        let last_prob = Arc::new(RwLock::new(None));
-        let task = tokio::spawn(async move {
-            crate::event_monitor::monitor_event(
-                redis,
-                db_pool,
-                eid,
-                mt,
-                ea,
-                eb,
-                config,
-                provider_registry,
-                probability_registry,
-                market_prices,
-                zmq_pub,
-                zmq_seq,
-            )
-            .await;
-        });
-
-        games.insert(
-            context.game_id.clone(),
-            GameEntry {
-                context,
-                task,
-                last_home_win_prob: last_prob,
-                opening_home_prob: Arc::new(RwLock::new(None)),
-            },
-        );
-
-        Ok(())
-    }
-
     pub async fn remove_game(&self, game_id: String) -> Result<()> {
         info!("Removing game: {}", game_id);
         let mut games = self.games.lock().await;
@@ -445,8 +361,8 @@ impl GameShard {
                             event_id, market_type, command.kalshi_market_id, command.polymarket_market_id
                         );
 
+                        // Sports-only handling (crypto/economics/politics handled by crypto_shard_rust)
                         if market_type.is_sport() {
-                            // Sports: use legacy monitor_game for backward compatibility
                             let sport = market_type.as_sport()
                                 .map(|s| format!("{:?}", s).to_lowercase())
                                 .unwrap_or_else(|| "nba".to_string());
@@ -459,25 +375,10 @@ impl GameShard {
                                 )
                                 .await
                             {
-                                error!("Failed to add_event (sport): {}", e);
+                                error!("Failed to add_game: {}", e);
                             }
                         } else {
-                            // Non-sports: use new monitor_event
-                            let entity_a = command.entity_a.clone().unwrap_or_else(|| event_id.clone());
-                            let entity_b = command.entity_b.clone();
-                            if let Err(e) = self
-                                .add_event(
-                                    event_id,
-                                    market_type,
-                                    entity_a,
-                                    entity_b,
-                                    command.polymarket_market_id,
-                                    command.kalshi_market_id,
-                                )
-                                .await
-                            {
-                                error!("Failed to add_event (non-sport): {}", e);
-                            }
+                            warn!("Non-sports events (crypto/economics/politics) should use crypto_shard_rust, not game_shard");
                         }
                     } else {
                         warn!("add_event command missing event_id or market_type");

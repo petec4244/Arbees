@@ -9,8 +9,8 @@ mod rate_limiter;
 
 use anyhow::Result;
 use arbees_rust_core::models::{
-    channels, ExecutionRequest, ExecutionResult, ExecutionStatus, NotificationEvent,
-    NotificationPriority, NotificationType,
+    channels, CryptoDirection, CryptoExecutionRequest, ExecutionRequest, ExecutionResult,
+    ExecutionStatus, NotificationEvent, NotificationPriority, NotificationType, Sport,
 };
 use arbees_rust_core::redis::bus::RedisBus;
 use balance::{start_balance_refresh_loop, DailyPnlTracker};
@@ -36,6 +36,66 @@ struct ZmqEnvelope {
     timestamp_ms: i64,
     source: Option<String>,
     payload: serde_json::Value,
+}
+
+/// Unified execution request type that accepts both sports and crypto requests
+#[derive(Debug, Clone)]
+enum UnifiedExecutionRequest {
+    Sports(ExecutionRequest),
+    Crypto(CryptoExecutionRequest),
+}
+
+impl UnifiedExecutionRequest {
+    /// Try to deserialize from a JSON value, attempting both formats
+    fn from_json(value: serde_json::Value) -> anyhow::Result<Self> {
+        // Try to deserialize as CryptoExecutionRequest first (has unique fields like "asset")
+        if let Ok(crypto_req) = serde_json::from_value::<CryptoExecutionRequest>(value.clone()) {
+            return Ok(UnifiedExecutionRequest::Crypto(crypto_req));
+        }
+
+        // Fall back to ExecutionRequest (has unique fields like "game_id", "sport")
+        match serde_json::from_value::<ExecutionRequest>(value) {
+            Ok(sports_req) => Ok(UnifiedExecutionRequest::Sports(sports_req)),
+            Err(_) => Err(anyhow::anyhow!(
+                "Request did not match ExecutionRequest or CryptoExecutionRequest format"
+            )),
+        }
+    }
+
+    /// Convert to ExecutionRequest for unified processing
+    /// Crypto requests get placeholder values for sports-specific fields
+    fn to_execution_request(&self) -> ExecutionRequest {
+        match self {
+            UnifiedExecutionRequest::Sports(req) => req.clone(),
+            UnifiedExecutionRequest::Crypto(crypto_req) => {
+                // Convert crypto request to sports request with crypto placeholders
+                ExecutionRequest {
+                    request_id: crypto_req.request_id.clone(),
+                    idempotency_key: format!("crypto_{}", crypto_req.request_id),
+                    game_id: format!("crypto_{}_{}", crypto_req.asset, crypto_req.event_id),
+                    sport: Sport::NBA, // Placeholder - crypto requests don't use sport field
+                    platform: crypto_req.platform,
+                    market_id: crypto_req.market_id.clone(),
+                    contract_team: Some(crypto_req.asset.clone()), // Asset name in contract_team
+                    token_id: None,
+                    side: match crypto_req.direction {
+                        CryptoDirection::Long => arbees_rust_core::models::ExecutionSide::Yes,
+                        CryptoDirection::Short => arbees_rust_core::models::ExecutionSide::No,
+                    },
+                    limit_price: crypto_req.max_price,
+                    size: crypto_req.suggested_size,
+                    signal_id: format!("crypto_{}", crypto_req.request_id),
+                    signal_type: format!("{:?}", crypto_req.signal_type),
+                    edge_pct: crypto_req.edge_pct,
+                    model_prob: crypto_req.probability,
+                    market_prob: Some(1.0 - crypto_req.current_price), // Estimate from current price
+                    reason: format!("Crypto {} arbitrage", crypto_req.asset),
+                    created_at: crypto_req.timestamp,
+                    expires_at: None,
+                }
+            }
+        }
+    }
 }
 
 /// Statistics for monitoring ZMQ message processing
@@ -404,16 +464,18 @@ async fn zmq_listener_loop(
                         topic, latency_ms
                     );
 
-                    // Parse execution request from signal payload
-                    let request: ExecutionRequest =
-                        match serde_json::from_value(envelope.payload) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                                debug!("Failed to parse execution request from ZMQ: {}", e);
-                                continue;
-                            }
-                        };
+                    // Parse execution request from signal payload (handles both sports and crypto)
+                    let unified_request = match UnifiedExecutionRequest::from_json(envelope.payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                            debug!("Failed to parse execution request from ZMQ: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Convert to standard ExecutionRequest for processing
+                    let request = unified_request.to_execution_request();
 
                     // Log ZMQ-specific latency info
                     let signal_age_ms = (Utc::now() - request.created_at).num_milliseconds();

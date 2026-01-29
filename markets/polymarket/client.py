@@ -416,13 +416,57 @@ class PolymarketClient(BaseMarketClient):
             return []
 
     async def get_market(self, market_id: str) -> Optional[dict]:
-        """Get detailed information about a specific market."""
+        """Get detailed information about a specific market.
+
+        Handles both:
+        - slug/numeric ID: Uses /markets/{id} endpoint
+        - condition_id (0x...): Searches /markets and filters by conditionId
+        """
+        # If it's a condition_id (hex), we need to search for it
+        if self._is_condition_id(market_id):
+            return await self._get_market_by_condition_id(market_id)
+
+        # Standard slug/numeric ID lookup
         try:
             return await self._gamma_request("GET", f"/markets/{market_id}")
         except aiohttp.ClientResponseError as e:
-            if e.status == 404:
+            if e.status in (404, 422):
                 return None
             raise
+
+    async def _get_market_by_condition_id(self, condition_id: str) -> Optional[dict]:
+        """Find a market by its condition_id by searching the markets list."""
+        # Normalize condition_id (ensure 0x prefix for comparison)
+        normalized = condition_id if condition_id.startswith("0x") else f"0x{condition_id}"
+
+        try:
+            # Search active markets first (most likely case)
+            markets = await self._gamma_request("GET", "/markets", params={
+                "limit": 500,
+                "active": "true",
+            })
+
+            if isinstance(markets, list):
+                for market in markets:
+                    if market.get("conditionId") == normalized:
+                        return market
+
+            # If not found in active, try all markets (including closed)
+            markets = await self._gamma_request("GET", "/markets", params={
+                "limit": 500,
+            })
+
+            if isinstance(markets, list):
+                for market in markets:
+                    if market.get("conditionId") == normalized:
+                        return market
+
+            logger.debug(f"Market not found for condition_id: {condition_id}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error searching for market by condition_id {condition_id}: {e}")
+            return None
 
     async def get_orderbook(self, market_id: str) -> Optional[OrderBook]:
         """Get order book for a market (by condition_id or token_id)."""
