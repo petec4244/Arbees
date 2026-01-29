@@ -983,8 +983,13 @@ impl GameShard {
             // Get build version from environment or use "dev"
             let version = env::var("BUILD_VERSION").unwrap_or_else(|_| "dev".to_string());
 
+            // Shard type: "sports" (default) or "crypto"
+            // Used by orchestrator to route markets to appropriate shards
+            let shard_type = env::var("SHARD_TYPE").unwrap_or_else(|_| "sports".to_string());
+
             let payload = json!({
                 "shard_id": self.shard_id,
+                "shard_type": shard_type,
                 "game_count": count,
                 "max_games": self.max_games,
                 "games": game_ids,

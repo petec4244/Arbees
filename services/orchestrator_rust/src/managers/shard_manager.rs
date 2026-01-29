@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::managers::service_registry::ServiceRegistry;
-use crate::state::ShardInfo;
+use crate::state::{ServiceType, ShardInfo};
+use arbees_rust_core::models::MarketType;
 use chrono::Utc;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 
 /// ShardManager acts as a facade/adapter over ServiceRegistry for backward compatibility.
 /// It provides shard-specific methods while delegating to the comprehensive ServiceRegistry.
@@ -27,17 +28,73 @@ impl ShardManager {
         }
     }
 
-    /// Get the best shard for assignment
-    /// Filters by: GameShard type, Healthy status, Circuit Closed, Has Capacity
+    /// Get the best shard for assignment (any type)
+    /// Filters by: GameShard/CryptoShard type, Healthy status, Circuit Closed, Has Capacity
     pub async fn get_best_shard(&self) -> Option<ShardInfo> {
         let healthy_shards = self.service_registry.get_healthy_shards().await;
+        self.select_best_from_shards(healthy_shards)
+    }
 
-        if healthy_shards.is_empty() {
+    /// Get the best shard for a specific market type
+    ///
+    /// Routes markets to appropriate shard types:
+    /// - Sports -> GameShard
+    /// - Crypto/Economics/Politics -> CryptoShard (with GameShard fallback)
+    pub async fn get_best_shard_for_type(&self, market_type: &MarketType) -> Option<ShardInfo> {
+        let preferred_shard_type = match market_type {
+            MarketType::Sport { .. } => ServiceType::GameShard,
+            MarketType::Crypto { .. } => ServiceType::CryptoShard,
+            MarketType::Economics { .. } => ServiceType::CryptoShard,
+            MarketType::Politics { .. } => ServiceType::CryptoShard,
+            MarketType::Entertainment { .. } => ServiceType::CryptoShard,
+        };
+
+        debug!(
+            "Looking for {:?} shard for market type {:?}",
+            preferred_shard_type, market_type
+        );
+
+        // Try to get shards of the preferred type
+        let preferred_shards = self
+            .service_registry
+            .get_healthy_shards_by_type(preferred_shard_type.clone())
+            .await;
+
+        if let Some(shard) = self.select_best_from_shards(preferred_shards) {
+            debug!(
+                "Found preferred shard {} for {:?}",
+                shard.shard_id, market_type
+            );
+            return Some(shard);
+        }
+
+        // Fallback: for non-sports, try GameShard
+        if !matches!(market_type, MarketType::Sport { .. }) {
+            debug!("No CryptoShards available, falling back to GameShard");
+            let fallback_shards = self
+                .service_registry
+                .get_healthy_shards_by_type(ServiceType::GameShard)
+                .await;
+
+            if let Some(shard) = self.select_best_from_shards(fallback_shards) {
+                debug!("Using GameShard fallback: {}", shard.shard_id);
+                return Some(shard);
+            }
+        }
+
+        // Last resort: any healthy shard
+        debug!("No typed shards available, trying any healthy shard");
+        self.get_best_shard().await
+    }
+
+    /// Select the best shard from a list based on available capacity
+    fn select_best_from_shards(&self, shards: Vec<crate::state::ServiceState>) -> Option<ShardInfo> {
+        if shards.is_empty() {
             return None;
         }
 
-        // Convert ServiceState to ShardInfo and find shard with most capacity
-        let best_state = healthy_shards
+        // Find shard with most capacity
+        let best_state = shards
             .iter()
             .filter(|s| s.available_capacity() > 0)
             .max_by_key(|s| s.available_capacity())?;

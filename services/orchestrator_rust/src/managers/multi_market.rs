@@ -8,7 +8,6 @@
 use crate::config::Config;
 use crate::managers::service_registry::ServiceRegistry;
 use crate::managers::shard_manager::ShardManager;
-use arbees_rust_core::clients::coingecko::CoinGeckoClient;
 use arbees_rust_core::models::MarketType;
 use arbees_rust_core::providers::crypto::CryptoEventProvider;
 use arbees_rust_core::providers::economics::EconomicsEventProvider;
@@ -60,9 +59,9 @@ impl MultiMarketManager {
         config: Config,
     ) -> Self {
         // Initialize providers based on configuration
+        // CryptoEventProvider now uses ChainedPriceProvider (Coinbase → Binance → CoinGecko)
         let crypto_provider = if config.enable_crypto_markets {
-            let coingecko = Arc::new(CoinGeckoClient::new());
-            Some(CryptoEventProvider::with_coingecko(coingecko))
+            Some(CryptoEventProvider::new())
         } else {
             None
         };
@@ -172,13 +171,14 @@ impl MultiMarketManager {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        // Get best shard
-        let shard = match self.shard_manager.get_best_shard().await {
+        // Get best shard for this market type (routes Crypto/Economics/Politics to CryptoShard)
+        let shard = match self.shard_manager.get_best_shard_for_type(&event.market_type).await {
             Some(s) => s,
             None => {
                 warn!(
-                    "No healthy shards available for event {}",
-                    event.event_id
+                    "No healthy shards available for event {} (type: {})",
+                    event.event_id,
+                    event.market_type.type_name()
                 );
                 return;
             }

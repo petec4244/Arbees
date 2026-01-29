@@ -1,10 +1,12 @@
 //! Crypto Event Provider
 //!
 //! Discovers and tracks cryptocurrency prediction markets from Kalshi and Polymarket.
-//! Combines market discovery with live price data from CoinGecko.
+//! Combines market discovery with live price data from multiple sources
+//! (Coinbase → Binance → CoinGecko fallback chain).
 
 use super::{CryptoStateData, EventInfo, EventProvider, EventState, EventStatus, StateData};
-use crate::clients::coingecko::CoinGeckoClient;
+use crate::clients::chained_price::ChainedPriceProvider;
+use crate::clients::crypto_price::CryptoPriceProvider;
 use crate::models::{CryptoPredictionType, MarketType};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -20,11 +22,12 @@ use tracing::{info, warn};
 /// Crypto event provider
 ///
 /// Discovers crypto prediction markets and enriches them with live price data.
+/// Uses ChainedPriceProvider for resilient price fetching (Coinbase → Binance → CoinGecko).
 pub struct CryptoEventProvider {
     /// HTTP client for API requests
     client: Client,
-    /// CoinGecko client for price data
-    coingecko: Arc<CoinGeckoClient>,
+    /// Price provider with fallback chain
+    price_provider: Arc<dyn CryptoPriceProvider>,
     /// Cache for discovered markets
     market_cache: Arc<RwLock<HashMap<String, CryptoMarket>>>,
     /// Last cache update time
@@ -58,13 +61,14 @@ pub const TRACKED_ASSETS: &[&str] = &[
 ];
 
 impl CryptoEventProvider {
-    /// Create a new crypto event provider
+    /// Create a new crypto event provider with default chained price provider
+    /// (Coinbase → Binance → CoinGecko fallback)
     pub fn new() -> Self {
-        Self::with_coingecko(Arc::new(CoinGeckoClient::new()))
+        Self::with_price_provider(Arc::new(ChainedPriceProvider::new_default()))
     }
 
-    /// Create with shared CoinGecko client
-    pub fn with_coingecko(coingecko: Arc<CoinGeckoClient>) -> Self {
+    /// Create with custom price provider
+    pub fn with_price_provider(price_provider: Arc<dyn CryptoPriceProvider>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("Arbees/1.0")
@@ -73,7 +77,7 @@ impl CryptoEventProvider {
 
         Self {
             client,
-            coingecko,
+            price_provider,
             market_cache: Arc::new(RwLock::new(HashMap::new())),
             last_update: Arc::new(RwLock::new(None)),
             cache_ttl_secs: 300, // 5 minute cache
@@ -341,12 +345,12 @@ impl CryptoEventProvider {
 
     /// Enrich a market with live price data
     async fn enrich_with_price(&self, market: &CryptoMarket) -> Result<EventState> {
-        // Get current price from CoinGecko
-        let price = self.coingecko.get_price(&market.asset).await?;
+        // Get current price from chained provider (Coinbase → Binance → CoinGecko)
+        let price = self.price_provider.get_price(&market.asset).await?;
 
         // Calculate volatility
         let volatility = self
-            .coingecko
+            .price_provider
             .calculate_volatility(&market.asset, 30)
             .await
             .map(|v| v.daily_volatility)
@@ -366,13 +370,12 @@ impl CryptoEventProvider {
                 target_price: market.target_price,
                 target_date: market.target_date,
                 volatility_24h: volatility,
-                volume_24h: Some(price.total_volume),
+                volume_24h: Some(price.volume_24h),
                 metadata: serde_json::json!({
                     "market_cap": price.market_cap,
                     "high_24h": price.high_24h,
                     "low_24h": price.low_24h,
-                    "ath": price.ath,
-                    "atl": price.atl,
+                    "price_source": price.source,
                     "yes_price": market.yes_price,
                     "no_price": market.no_price,
                     "platform": market.platform,

@@ -170,6 +170,8 @@ pub async fn monitor_event(
                 drop(prices); // Release lock early
 
                 // Use Redis price if available, otherwise fallback to metadata
+                // Track whether we're using metadata prices (stale data)
+                let is_metadata_price = redis_price.is_none() && fallback_price.is_some();
                 let price = redis_price.or(fallback_price);
 
                 if let Some(ref price) = price {
@@ -178,44 +180,52 @@ pub async fn monitor_event(
                     let edge_pct = (probability - market_mid).abs() * 100.0;
 
                     if edge_pct >= config.min_edge_pct {
-                        let direction = if probability > market_mid {
-                            SignalDirection::Buy
-                        } else {
-                            SignalDirection::Sell
-                        };
-
-                        let signal_key = (entity_a.clone(), format!("{:?}", direction).to_lowercase());
-
-                        // Check debounce
-                        let should_emit = match last_signal_times.get(&signal_key) {
-                            Some(last_time) => {
-                                last_time.elapsed().as_secs() >= config.signal_debounce_secs
-                            }
-                            None => true,
-                        };
-
-                        if should_emit {
-                            info!(
-                                "EDGE: {} {} model={:.1}% market={:.1}% edge={:.1}%",
-                                event_id, entity_a, probability * 100.0, market_mid * 100.0, edge_pct
+                        // Skip signals if we're using stale metadata prices
+                        if is_metadata_price {
+                            debug!(
+                                "Skipping signal for {} - using stale metadata prices (model={:.1}% market={:.1}% edge={:.1}%)",
+                                event_id, probability * 100.0, market_mid * 100.0, edge_pct
                             );
+                        } else {
+                            let direction = if probability > market_mid {
+                                SignalDirection::Buy
+                            } else {
+                                SignalDirection::Sell
+                            };
 
-                            if emit_event_signal(
-                                &redis,
-                                &event_id,
-                                &market_type,
-                                &entity_a,
-                                direction,
-                                price,
-                                probability,
-                                edge_pct,
-                                &zmq_pub,
-                                &zmq_seq,
-                                transport_mode,
-                            )
-                            .await
-                            {
-                                last_signal_times.insert(signal_key, Instant::now());
+                            let signal_key = (entity_a.clone(), format!("{:?}", direction).to_lowercase());
+
+                            // Check debounce
+                            let should_emit = match last_signal_times.get(&signal_key) {
+                                Some(last_time) => {
+                                    last_time.elapsed().as_secs() >= config.signal_debounce_secs
+                                }
+                                None => true,
+                            };
+
+                            if should_emit {
+                                info!(
+                                    "EDGE: {} {} model={:.1}% market={:.1}% edge={:.1}%",
+                                    event_id, entity_a, probability * 100.0, market_mid * 100.0, edge_pct
+                                );
+
+                                if emit_event_signal(
+                                    &redis,
+                                    &event_id,
+                                    &market_type,
+                                    &entity_a,
+                                    direction,
+                                    price,
+                                    probability,
+                                    edge_pct,
+                                    &zmq_pub,
+                                    &zmq_seq,
+                                    transport_mode,
+                                )
+                                .await
+                                {
+                                    last_signal_times.insert(signal_key, Instant::now());
+                                }
                             }
                         }
                     }
