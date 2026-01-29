@@ -218,7 +218,7 @@ impl ServiceRegistry {
                             info!("Removing zombie game {} from shard {}", game_id, instance_id);
                             let remove_channel = format!("shard:{}:command", instance_id);
                             let remove_cmd = json!({
-                                "command": "remove_game",
+                                "type": "remove_game",
                                 "game_id": game_id
                             });
 
@@ -690,7 +690,7 @@ impl ServiceRegistry {
                 // Send remove command to old shard (best effort)
                 let remove_channel = format!("shard:{}:command", old_shard_id);
                 let remove_cmd = json!({
-                    "command": "remove_game",
+                    "type": "remove_game",
                     "game_id": game_id
                 });
                 let _ = self.redis.publish(&remove_channel, &remove_cmd).await;
@@ -706,7 +706,7 @@ impl ServiceRegistry {
                     // Send assignment to new shard
                     let add_channel = format!("shard:{}:command", shard.instance_id);
                     let add_cmd = json!({
-                        "command": "add_game",
+                        "type": "add_game",
                         "game_id": assignment.game_id,
                         "sport": assignment.sport,
                         "kalshi_market_id": assignment.kalshi_market_id,

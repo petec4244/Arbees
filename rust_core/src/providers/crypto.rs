@@ -18,7 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 /// Crypto event provider
@@ -38,6 +38,8 @@ pub struct CryptoEventProvider {
     cache_ttl_secs: i64,
     /// Mutex to prevent concurrent cache refreshes (prevents stack overflow)
     refresh_lock: Arc<Mutex<()>>,
+    /// Semaphore to limit concurrent get_event_state calls (prevents stack overflow)
+    state_semaphore: Arc<Semaphore>,
 }
 
 /// Represents a crypto prediction market
@@ -86,6 +88,9 @@ impl CryptoEventProvider {
             last_update: Arc::new(RwLock::new(None)),
             cache_ttl_secs: 300, // 5 minute cache
             refresh_lock: Arc::new(Mutex::new(())),
+            // Limit concurrent get_event_state calls to prevent stack overflow
+            // when many events are monitored simultaneously
+            state_semaphore: Arc::new(Semaphore::new(3)),
         }
     }
 
@@ -488,6 +493,10 @@ impl EventProvider for CryptoEventProvider {
     }
 
     async fn get_event_state(&self, event_id: &str) -> Result<EventState> {
+        // Acquire semaphore to limit concurrent calls (prevents stack overflow)
+        let _permit = self.state_semaphore.acquire().await
+            .map_err(|e| anyhow!("Failed to acquire state semaphore: {}", e))?;
+
         // Check if cache is empty and needs refresh
         // Use refresh_lock to prevent concurrent refreshes (which cause stack overflow)
         {
