@@ -19,7 +19,7 @@ import {
   DollarSign,
   ArrowUpDown,
 } from 'lucide-react'
-import { getSportConfig, SportBackground } from '../utils/sports'
+import { getMarketConfig, MarketBackground } from '../utils/board_config'
 
 // Types
 interface FuturesGame {
@@ -72,7 +72,7 @@ interface FuturesStats {
   by_sport: Record<string, number>
 }
 
-// Sport color map - REPLACED by utils/sports
+// Sport color map - REPLACED by utils/board_config
 // const sportColors: Record<string, string> = { ... }
 
 const TIME_WINDOW_OPTIONS = [
@@ -165,7 +165,7 @@ export default function FuturesGames() {
   }, [stats])
 
   const getSportClass = (sport: string) => {
-    return getSportConfig(sport).badge
+    return getMarketConfig(sport).badge
   }
 
   const formatHoursUntil = (hours: number) => {
@@ -190,7 +190,7 @@ export default function FuturesGames() {
             Futures Monitoring
           </h1>
           <span className="text-sm text-gray-400">
-            Pre-game market tracking and line movement analysis
+            Pre-market tracking and line movement analysis
           </span>
         </div>
 
@@ -243,7 +243,7 @@ export default function FuturesGames() {
           >
             <ArrowUpDown className="w-4 h-4" />
             <span className="text-sm">
-              {sortBy === 'movement' ? 'Movement' : sortBy === 'time' ? 'Time' : 'Sport'}
+              {sortBy === 'movement' ? 'Movement' : sortBy === 'time' ? 'Time' : 'Type'}
             </span>
           </button>
         </div>
@@ -253,7 +253,7 @@ export default function FuturesGames() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatsCard
           icon={<Eye className="w-5 h-5 text-purple-400" />}
-          title="Monitored Games"
+          title="Monitored"
           value={stats?.total_monitored || 0}
         />
         <StatsCard
@@ -279,28 +279,28 @@ export default function FuturesGames() {
         {/* Games List */}
         <div className="lg:col-span-2 bg-gray-800 rounded-lg overflow-hidden flex flex-col">
           <div className="p-4 border-b border-gray-700">
-            <h2 className="font-bold text-lg">Monitored Games</h2>
+            <h2 className="font-bold text-lg">Monitored Markets</h2>
           </div>
 
           <div className="flex-1 overflow-y-auto">
             {isLoading && (
               <div className="flex items-center justify-center p-12 text-gray-400">
                 <div className="animate-spin w-6 h-6 border-2 border-purple-400 border-t-transparent rounded-full mr-3" />
-                Loading futures games...
+                Loading futures...
               </div>
             )}
 
             {isError && (
               <div className="flex flex-col items-center justify-center p-12 text-red-400">
                 <AlertCircle className="w-8 h-8 mb-2" />
-                <p>Failed to load futures games</p>
+                <p>Failed to load futures</p>
               </div>
             )}
 
             {!isLoading && !isError && games?.length === 0 && (
               <div className="flex flex-col items-center justify-center p-12 text-gray-500">
                 <Eye className="w-12 h-12 mb-4 opacity-20" />
-                <p>No games being monitored</p>
+                <p>No markets being monitored</p>
               </div>
             )}
 
@@ -404,7 +404,7 @@ function GameRow({
       : 'text-gray-400'
     : 'text-gray-500'
 
-  const sportConfig = getSportConfig(game.sport)
+  const sportConfig = getMarketConfig(game.sport)
 
   return (
     <div
@@ -412,7 +412,7 @@ function GameRow({
       className={`p-4 relative overflow-hidden group hover:bg-gray-700/50 cursor-pointer transition-colors border-l-4 ${sportConfig.colors.replace('border-', 'border-l-')}`}
       style={{ borderLeftColor: 'var(--tw-border-opacity)' }} // Fallback/hack if generic border class doesn't mapped well to border-l. Actually let's just use the config's color for border-l manually or just the bg.
     >
-      <SportBackground sport={game.sport} />
+      <MarketBackground type={game.sport} />
       <div className="relative z-10">
         <div className="flex justify-between items-start mb-2">
           <div className="flex items-center gap-2">

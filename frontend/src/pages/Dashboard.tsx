@@ -118,7 +118,7 @@ export default function Dashboard() {
           icon={<Target className="w-4 h-4 text-blue-400" />}
         />
         <StatCard
-          title="Active Games"
+          title="Active Markets"
           value={games?.length || 0}
           subtext={`${stats?.total_active || 0} opportunities`}
           icon={<Activity className="w-4 h-4 text-green-400" />}
@@ -150,7 +150,7 @@ export default function Dashboard() {
         {/* Live Games */}
         {showLiveGames && (
           <CollapsibleSection
-            title="Live Games"
+            title="Live Events"
             badge={`${games?.length || 0} active`}
             sectionId="dashboard-live-games"
           >
@@ -204,7 +204,7 @@ export default function Dashboard() {
               {(!games || games.length === 0) && (
                 <div className="flex flex-col items-center justify-center h-48 text-gray-500">
                   <Activity className="w-8 h-8 mb-2 opacity-50" />
-                  <p>No live games at the moment</p>
+                  <p>No live events at the moment</p>
                 </div>
               )}
             </div>
@@ -267,7 +267,7 @@ export default function Dashboard() {
       {/* Upcoming Games */}
       {showUpcomingGames && (
         <CollapsibleSection
-          title="Upcoming Games"
+          title="Market Schedule"
           badge={`${upcomingGames?.length || 0} in next 6h`}
           sectionId="dashboard-upcoming-games"
         >
@@ -379,8 +379,8 @@ function ViewToggle() {
   const toggles = [
     { label: 'Equity', value: showEquityCurve, set: setShowEquityCurve },
     { label: 'Risk', value: showRiskBar, set: setShowRiskBar },
-    { label: 'Games', value: showLiveGames, set: setShowLiveGames },
-    { label: 'Upcoming', value: showUpcomingGames, set: setShowUpcomingGames },
+    { label: 'Events', value: showLiveGames, set: setShowLiveGames },
+    { label: 'Markets', value: showUpcomingGames, set: setShowUpcomingGames },
     { label: 'Trades', value: showRecentTrades, set: setShowRecentTrades },
     { label: 'Opps', value: showOpportunities, set: setShowOpportunities },
   ]
@@ -392,8 +392,8 @@ function ViewToggle() {
           key={toggle.label}
           onClick={() => toggle.set(!toggle.value)}
           className={`p-2 rounded text-xs transition-colors ${toggle.value
-              ? 'bg-gray-700 text-white'
-              : 'text-gray-500 hover:text-gray-300'
+            ? 'bg-gray-700 text-white'
+            : 'text-gray-500 hover:text-gray-300'
             }`}
           title={`${toggle.value ? 'Hide' : 'Show'} ${toggle.label}`}
         >
@@ -463,7 +463,7 @@ function UpcomingGamesList({ games }: { games?: any[] }) {
     return (
       <div className="flex flex-col items-center justify-center h-48 text-gray-500">
         <Calendar className="w-8 h-8 mb-2 opacity-50" />
-        <p>No upcoming games in the next 6 hours</p>
+        <p>No upcoming events in the next 6 hours</p>
       </div>
     )
   }
@@ -491,11 +491,11 @@ function UpcomingGamesList({ games }: { games?: any[] }) {
               <div className="flex-1">
                 <div className="flex justify-between">
                   <span className="text-gray-300">{game.away_team_abbrev || game.away_team}</span>
-                  <span className="text-xs text-gray-500">AWAY</span>
+                  <span className="text-xs text-gray-500">NO / AWAY</span>
                 </div>
                 <div className="flex justify-between mt-1">
                   <span className="text-white font-medium">{game.home_team_abbrev || game.home_team}</span>
-                  <span className="text-xs text-gray-500">HOME</span>
+                  <span className="text-xs text-gray-500">YES / HOME</span>
                 </div>
               </div>
             </div>
@@ -514,7 +514,7 @@ function UpcomingGamesList({ games }: { games?: any[] }) {
         to="/upcoming-games"
         className="flex items-center justify-center gap-2 p-3 text-sm text-blue-400 hover:text-blue-300 hover:bg-gray-700/50 rounded transition-colors"
       >
-        View all upcoming games
+        View all markets
         <ArrowRight className="w-4 h-4" />
       </Link>
     </div>

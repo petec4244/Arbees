@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ChevronUp, Activity, Filter, ArrowUpDown, CheckCircle } from 'lucide-react'
 import { useWebSocket } from '../hooks/useWebSocket'
 import GameTracker from '../components/GameTracker'
-import { getSportConfig, SportBackground } from '../utils/sports'
+import { getMarketConfig, MarketBackground } from '../utils/board_config'
 
 export default function LiveGames() {
   const { subscribe, lastMessage } = useWebSocket()
@@ -102,8 +102,8 @@ export default function LiveGames() {
     <div className="space-y-6 h-full flex flex-col">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div>
-          <h1 className="text-3xl font-bold">Live Games</h1>
-          <span className="text-sm text-gray-400">{filteredGames.length} active games</span>
+          <h1 className="text-3xl font-bold">Live Events</h1>
+          <span className="text-sm text-gray-400">{filteredGames.length} active events</span>
         </div>
 
         <div className="flex items-center space-x-3 bg-gray-800 p-2 rounded-lg">
@@ -129,14 +129,14 @@ export default function LiveGames() {
             className="flex items-center space-x-2 text-sm px-2 text-gray-300 hover:text-white"
           >
             <ArrowUpDown className="w-4 h-4" />
-            <span>{sortBy === 'time' ? 'Time' : sortBy === 'score' ? 'Score' : 'Sport'}</span>
+            <span>{sortBy === 'time' ? 'Time' : sortBy === 'score' ? 'Score' : 'Type'}</span>
           </button>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto min-h-0 pr-2 custom-scrollbar">
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 pb-4">
-          {isLoading && <p className="text-gray-400 animate-pulse">Loading games...</p>}
+          {isLoading && <p className="text-gray-400 animate-pulse">Loading events...</p>}
           {filteredGames.map((game: any) => (
             <GameCard
               key={game.game_id}
@@ -150,7 +150,7 @@ export default function LiveGames() {
           {(!isLoading && filteredGames.length === 0) && (
             <div className="col-span-full flex flex-col items-center justify-center p-12 text-gray-500 bg-gray-800/50 rounded-lg border border-gray-700 border-dashed">
               <Activity className="w-12 h-12 mb-4 opacity-20" />
-              <p>No active games matching criteria</p>
+              <p>No active events matching criteria</p>
             </div>
           )}
         </div>
@@ -235,11 +235,11 @@ function GameCard({ game, onSubscribe, isTracked, isPinned, onTogglePin }: { gam
     staleTime: 30000
   })
 
-  const sportConfig = getSportConfig(game.sport)
+  const sportConfig = getMarketConfig(game.sport)
 
   return (
     <div className={`rounded-lg overflow-hidden transition-all duration-300 relative group border ${sportConfig.colors} ${isFinal ? 'opacity-60 grayscale' : ''} ${expanded ? 'col-span-1 md:col-span-2 row-span-2 ring-2 ring-green-500/50' : ''}`}>
-      <SportBackground sport={game.sport} />
+      <MarketBackground type={game.sport} />
       <div className="p-4 relative z-10">
         {/* Header */}
         <div className="flex justify-between items-start mb-4">

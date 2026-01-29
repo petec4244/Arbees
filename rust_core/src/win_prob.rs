@@ -540,6 +540,15 @@ mod tests {
 
     fn make_nba_state(home_score: u16, away_score: u16, period: u8, time_remaining: u32) -> GameState {
         GameState {
+            // Universal fields (new)
+            event_id: "test".to_string(),
+            market_type: Some(crate::models::MarketType::sport(Sport::NBA)),
+            entity_a: Some("PHI".to_string()),
+            entity_b: Some("NYK".to_string()),
+            event_start: Some(Utc::now()),
+            event_end: None,
+            resolution_criteria: None,
+            // Legacy fields
             game_id: "test".to_string(),
             sport: Sport::NBA,
             home_team: "PHI".to_string(),
@@ -552,6 +561,7 @@ mod tests {
             fetched_at: Utc::now(),
             pregame_home_prob: None,
             sport_specific: SportSpecificState::Basketball(BasketballState::default()),
+            market_specific: None,
         }
     }
 
@@ -629,6 +639,15 @@ mod tests {
     fn test_ncaab_home_advantage_larger() {
         // NCAAB has larger home court advantage than NBA
         let nba_state = GameState {
+            // Universal fields (new)
+            event_id: "test".to_string(),
+            market_type: Some(crate::models::MarketType::sport(Sport::NBA)),
+            entity_a: Some("PHI".to_string()),
+            entity_b: Some("NYK".to_string()),
+            event_start: Some(Utc::now()),
+            event_end: None,
+            resolution_criteria: None,
+            // Legacy fields
             game_id: "test".to_string(),
             sport: Sport::NBA,
             home_team: "PHI".to_string(),
@@ -641,6 +660,7 @@ mod tests {
             fetched_at: Utc::now(),
             pregame_home_prob: None,
             sport_specific: SportSpecificState::Basketball(BasketballState::default()),
+            market_specific: None,
         };
 
         let ncaab_state = GameState {

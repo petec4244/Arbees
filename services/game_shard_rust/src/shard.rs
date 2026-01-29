@@ -3,9 +3,11 @@ use arbees_rust_core::atomic_orderbook::kalshi_fee_cents;
 use arbees_rust_core::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
-    channels, FootballState, GameState, Platform, SignalDirection, SignalType, Sport,
+    channels, FootballState, GameState, MarketType, Platform, SignalDirection, SignalType, Sport,
     SportSpecificState, TradingSignal, TransportMode,
 };
+use arbees_rust_core::ProbabilityModelRegistry;
+use arbees_rust_core::providers::EventProviderRegistry;
 use arbees_rust_core::redis::bus::RedisBus;
 use arbees_rust_core::simd::{check_arbs_simd, calculate_profit_cents, decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
 use arbees_rust_core::utils::matching::match_team_in_text;
@@ -169,10 +171,13 @@ pub struct GameShard {
     process_id: String,
     /// Process start time (unchanging, for restart detection)
     started_at: chrono::DateTime<Utc>,
+    /// Probability model registry for edge calculation (multi-market support)
+    probability_registry: Arc<ProbabilityModelRegistry>,
 }
 
+/// Market price data for a specific contract
 #[derive(Debug, Clone)]
-struct MarketPriceData {
+pub struct MarketPriceData {
     pub market_id: String,
     pub platform: String,
     pub contract_team: String,
@@ -191,7 +196,10 @@ struct MarketPriceData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameContext {
     pub game_id: String,
-    pub sport: String,
+    pub sport: String,                   // Keep for backward compatibility
+    pub market_type: Option<MarketType>, // Universal market type
+    pub entity_a: Option<String>,        // Generic entity A (home_team for sports)
+    pub entity_b: Option<String>,        // Generic entity B (away_team for sports)
     pub polymarket_id: Option<String>,
     pub kalshi_id: Option<String>,
 }
@@ -210,9 +218,14 @@ struct ShardCommand {
     #[serde(rename = "type")]
     command_type: String,
     game_id: Option<String>,
+    event_id: Option<String>,           // Universal event ID (for non-sports markets)
     sport: Option<String>,
+    market_type: Option<MarketType>,    // Universal market type (sport, crypto, economics, politics)
+    entity_a: Option<String>,           // Generic entity A (home_team for sports)
+    entity_b: Option<String>,           // Generic entity B (away_team for sports)
     kalshi_market_id: Option<String>,
     polymarket_market_id: Option<String>,
+    metadata: Option<serde_json::Value>, // Additional market-specific metadata
 }
 
 /// Incoming market price message from polymarket_monitor
@@ -312,6 +325,9 @@ impl GameShard {
         let process_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
 
+        // Initialize probability model registry for multi-market support
+        let probability_registry = Arc::new(ProbabilityModelRegistry::new());
+
         Ok(Self {
             shard_id,
             redis,
@@ -332,6 +348,7 @@ impl GameShard {
             zmq_pub_port,
             process_id,
             started_at,
+            probability_registry,
         })
     }
 
@@ -424,6 +441,9 @@ impl GameShard {
         let context = GameContext {
             game_id: game_id.clone(),
             sport: sport.clone(),
+            market_type: None,  // Will be set to Sport by monitor_game based on sport string
+            entity_a: None,     // Will be set to home_team by monitor_game
+            entity_b: None,     // Will be set to away_team by monitor_game
             polymarket_id,
             kalshi_id,
         };
@@ -455,6 +475,93 @@ impl GameShard {
                 market_prices,
                 min_edge,
                 espn_cb,
+                zmq_pub,
+                zmq_seq,
+                transport_mode,
+            )
+            .await;
+        });
+
+        games.insert(
+            context.game_id.clone(),
+            GameEntry {
+                context,
+                task,
+                last_home_win_prob: last_prob,
+                opening_home_prob: Arc::new(RwLock::new(None)),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Add a universal event (crypto, economics, politics) to be monitored
+    pub async fn add_event(
+        &self,
+        event_id: String,
+        market_type: MarketType,
+        entity_a: String,
+        entity_b: Option<String>,
+        polymarket_id: Option<String>,
+        kalshi_id: Option<String>,
+    ) -> Result<()> {
+        info!(
+            "Adding event: {} ({:?}) entity_a={}, entity_b={:?}",
+            event_id,
+            market_type.type_name(),
+            entity_a,
+            entity_b
+        );
+
+        let mut games = self.games.lock().await;
+        if games.contains_key(&event_id) {
+            warn!("Event already tracked: {}", event_id);
+            return Ok(());
+        }
+
+        let context = GameContext {
+            game_id: event_id.clone(),
+            sport: market_type.type_name().to_string(),
+            market_type: Some(market_type.clone()),
+            entity_a: Some(entity_a.clone()),
+            entity_b: entity_b.clone(),
+            polymarket_id,
+            kalshi_id,
+        };
+
+        // Create provider and probability registries
+        let provider_registry = Arc::new(EventProviderRegistry::with_defaults());
+
+        // Create config from environment
+        let config = crate::event_monitor::EventMonitorConfig::from_env();
+
+        // Clone shared state for the monitoring task
+        let redis = self.redis.clone();
+        let db_pool = self.db_pool.clone();
+        let market_prices = self.market_prices.clone();
+        let zmq_pub = self.zmq_pub.clone();
+        let zmq_seq = self.zmq_seq.clone();
+        let transport_mode = self.transport_mode;
+        let probability_registry = self.probability_registry.clone();
+        let eid = event_id.clone();
+        let mt = market_type.clone();
+        let ea = entity_a.clone();
+        let eb = entity_b.clone();
+
+        // Spawn the monitoring task
+        let last_prob = Arc::new(RwLock::new(None));
+        let task = tokio::spawn(async move {
+            crate::event_monitor::monitor_event(
+                redis,
+                db_pool,
+                eid,
+                mt,
+                ea,
+                eb,
+                config,
+                provider_registry,
+                probability_registry,
+                market_prices,
                 zmq_pub,
                 zmq_seq,
                 transport_mode,
@@ -541,6 +648,54 @@ impl GameShard {
                         }
                     } else {
                         warn!("remove_game command missing game_id");
+                    }
+                }
+                "add_event" => {
+                    // Universal path for all market types (sports, crypto, economics, politics)
+                    // Falls back to event_id if game_id not provided
+                    let event_id = command.event_id.clone().or(command.game_id.clone());
+                    if let (Some(event_id), Some(market_type)) = (event_id, command.market_type.clone()) {
+                        info!(
+                            "Received add_event: {} ({:?}) kalshi={:?} poly={:?}",
+                            event_id, market_type, command.kalshi_market_id, command.polymarket_market_id
+                        );
+
+                        if market_type.is_sport() {
+                            // Sports: use legacy monitor_game for backward compatibility
+                            let sport = market_type.as_sport()
+                                .map(|s| format!("{:?}", s).to_lowercase())
+                                .unwrap_or_else(|| "nba".to_string());
+                            if let Err(e) = self
+                                .add_game(
+                                    event_id,
+                                    sport,
+                                    command.polymarket_market_id,
+                                    command.kalshi_market_id,
+                                )
+                                .await
+                            {
+                                error!("Failed to add_event (sport): {}", e);
+                            }
+                        } else {
+                            // Non-sports: use new monitor_event
+                            let entity_a = command.entity_a.clone().unwrap_or_else(|| event_id.clone());
+                            let entity_b = command.entity_b.clone();
+                            if let Err(e) = self
+                                .add_event(
+                                    event_id,
+                                    market_type,
+                                    entity_a,
+                                    entity_b,
+                                    command.polymarket_market_id,
+                                    command.kalshi_market_id,
+                                )
+                                .await
+                            {
+                                error!("Failed to add_event (non-sport): {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("add_event command missing event_id or market_type");
                     }
                 }
                 other => {
@@ -800,38 +955,6 @@ impl GameShard {
         game_prices.insert(key, data);
 
         self.price_stats.messages_processed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Publish a trading signal via ZMQ for low-latency consumers
-    async fn publish_signal_zmq(&self, signal: &TradingSignal) {
-        if let Some(ref zmq_pub) = self.zmq_pub {
-            let topic = format!("signals.trade.{}", signal.signal_id);
-            let seq = self.zmq_seq.fetch_add(1, Ordering::Relaxed);
-
-            let envelope = ZmqEnvelope {
-                seq,
-                timestamp_ms: Utc::now().timestamp_millis(),
-                source: Some("game_shard".to_string()),
-                payload: serde_json::to_value(signal).unwrap_or_default(),
-            };
-
-            let payload = match serde_json::to_vec(&envelope) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to serialize ZMQ signal envelope: {}", e);
-                    return;
-                }
-            };
-
-            let mut socket = zmq_pub.lock().await;
-            let mut msg = ZmqMessage::from(topic.as_bytes().to_vec());
-            msg.push_back(payload.into());
-            if let Err(e) = socket.send(msg).await {
-                warn!("Failed to publish signal via ZMQ: {}", e);
-            } else {
-                debug!("Published signal {} via ZMQ (seq={})", signal.signal_id, seq);
-            }
-        }
     }
 
     async fn heartbeat_loop(&self) -> Result<()> {
@@ -1096,23 +1219,9 @@ async fn monitor_game(
                         }
                     }
                 }
-
-                if let Some((arb_mask, profit)) = check_cross_platform_arb(away_kalshi, away_poly, MIN_ARB_PROFIT_CENTS) {
-                    let arb_key = (game.away_team.clone(), "arb".to_string());
-                    let should_emit_arb = match last_signal_times.get(&arb_key) {
-                        Some(last_time) => last_time.elapsed().as_secs() >= signal_debounce_secs,
-                        None => true,
-                    };
-                    if should_emit_arb {
-                        if emit_arb_signal(
-                            &redis, &game_id, sport_enum, &game.away_team,
-                            arb_mask, profit, away_kalshi.unwrap(), away_poly.unwrap(),
-                            &zmq_pub, &zmq_seq
-                        ).await {
-                            last_signal_times.insert(arb_key, Instant::now());
-                        }
-                    }
-                }
+                // NOTE: We only check home team for arbitrage. In a two-outcome market,
+                // away team arb is mathematically equivalent (TeamA YES = TeamB NO),
+                // so checking both would emit duplicate signals for the same trade.
                 // ===== END ARBITRAGE CHECK =====
 
                 // ===== SCORE-CHANGE LATENCY SIGNALS (DISABLED) =====
@@ -1343,26 +1452,6 @@ fn find_team_prices<'a>(
     (best_kalshi.map(|(p, _)| p), best_poly.map(|(p, _)| p))
 }
 
-/// Select the best price from available platform prices (lowest ask for buying)
-fn select_best_price<'a>(
-    kalshi_price: Option<&'a MarketPriceData>,
-    poly_price: Option<&'a MarketPriceData>,
-) -> Option<(&'a MarketPriceData, Platform)> {
-    match (kalshi_price, poly_price) {
-        (Some(k), Some(p)) => {
-            // For buying, prefer lower ask price
-            if k.yes_ask <= p.yes_ask {
-                Some((k, Platform::Kalshi))
-            } else {
-                Some((p, Platform::Polymarket))
-            }
-        }
-        (Some(k), None) => Some((k, Platform::Kalshi)),
-        (None, Some(p)) => Some((p, Platform::Polymarket)),
-        (None, None) => None,
-    }
-}
-
 /// Select the best platform for a *tradeable* model-edge signal on a team.
 /// Uses executable entry prices + fees (YES ask for BUY, NO ask for SELL).
 fn select_best_platform_for_team<'a>(
@@ -1388,17 +1477,6 @@ fn select_best_platform_for_team<'a>(
     }
 
     best
-}
-
-/// Legacy function for backward compatibility - returns best price among all platforms
-fn find_team_price<'a>(
-    prices: &'a HashMap<String, MarketPriceData>,
-    team: &str,
-    sport: Sport,
-    max_age_secs: i64,
-) -> Option<&'a MarketPriceData> {
-    let (kalshi, poly) = find_team_prices(prices, team, sport, max_age_secs);
-    select_best_price(kalshi, poly).map(|(p, _)| p)
 }
 
 /// Publish a signal via ZMQ for low-latency consumers
@@ -1543,6 +1621,10 @@ async fn check_and_emit_signal(
         // Increased from 30s to 60s for better signal processing time
         expires_at: Some(Utc::now() + chrono::Duration::seconds(60)),
         play_id: None,
+        // Universal fields (backward compat - use game_id/team for sports)
+        event_id: None,
+        market_type: None,
+        entity: None,
     };
 
     // Format direction as "to win" / "to lose" for clarity
@@ -1635,6 +1717,15 @@ async fn fetch_game_state(
     };
 
     let state = GameState {
+        // Universal fields (new - Phase 1-5)
+        event_id: game.id.clone(),
+        market_type: Some(MarketType::sport(sport_enum)),
+        entity_a: Some(game.home_team.clone()),
+        entity_b: Some(game.away_team.clone()),
+        event_start: None,
+        event_end: None,
+        resolution_criteria: None,
+        // Legacy fields
         game_id: game.id.clone(),
         sport: sport_enum,
         home_team: game.home_team.clone(),
@@ -1647,6 +1738,7 @@ async fn fetch_game_state(
         fetched_at: Utc::now(), // Track when this state was fetched
         pregame_home_prob: None,
         sport_specific,
+        market_specific: None,
     };
 
     Some((game, state))
@@ -1832,6 +1924,10 @@ async fn emit_arb_signal(
         created_at: Utc::now(),
         expires_at: Some(Utc::now() + chrono::Duration::seconds(10)),
         play_id: None,
+        // Universal fields (backward compat - use game_id/team for sports)
+        event_id: None,
+        market_type: None,
+        entity: None,
     };
 
     info!(
@@ -1900,6 +1996,10 @@ async fn emit_latency_signal(
         created_at: Utc::now(),
         expires_at: Some(Utc::now() + chrono::Duration::seconds(60)), // 1 minute expiry
         play_id: None,
+        // Universal fields (backward compat - use game_id/team for sports)
+        event_id: None,
+        market_type: None,
+        entity: None,
     };
 
     // Publish via ZMQ for low-latency consumers

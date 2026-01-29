@@ -1,12 +1,12 @@
 import React from 'react';
 
-export interface SportStyle {
+export interface MarketStyle {
     colors: string;
     badge: string;
     emoji: string;
 }
 
-export const SPORT_CONFIG: Record<string, SportStyle> = {
+export const MARKET_CONFIG: Record<string, MarketStyle> = {
     nba: {
         colors: 'bg-orange-950/30 border-orange-500/20 hover:bg-orange-900/20',
         badge: 'bg-orange-900/50 text-orange-200 border-orange-700/50',
@@ -77,6 +77,27 @@ export const SPORT_CONFIG: Record<string, SportStyle> = {
         badge: 'bg-blue-900/50 text-blue-200 border-blue-700/50',
         emoji: '🏏'
     },
+    // New Market Types
+    crypto: {
+        colors: 'bg-indigo-950/30 border-indigo-500/20 hover:bg-indigo-900/20',
+        badge: 'bg-indigo-900/50 text-indigo-200 border-indigo-700/50',
+        emoji: '🪙'
+    },
+    economics: {
+        colors: 'bg-slate-950/30 border-slate-500/20 hover:bg-slate-900/20',
+        badge: 'bg-slate-900/50 text-slate-200 border-slate-700/50',
+        emoji: '📊'
+    },
+    politics: {
+        colors: 'bg-blue-900/20 border-red-500/20 hover:bg-blue-900/30', // US Politics feel
+        badge: 'bg-slate-800 text-slate-200 border-slate-600',
+        emoji: '🏛️'
+    },
+    entertainment: {
+        colors: 'bg-fuchsia-950/30 border-fuchsia-500/20 hover:bg-fuchsia-900/20',
+        badge: 'bg-fuchsia-900/50 text-fuchsia-200 border-fuchsia-700/50',
+        emoji: '🎬'
+    },
     default: {
         colors: 'bg-gray-800 border-gray-700 hover:bg-gray-750',
         badge: 'bg-gray-700 text-gray-300 border-gray-600',
@@ -84,13 +105,16 @@ export const SPORT_CONFIG: Record<string, SportStyle> = {
     }
 };
 
-export function getSportConfig(sport: string): SportStyle {
-    if (!sport) return SPORT_CONFIG.default;
-    return SPORT_CONFIG[sport.toLowerCase()] || SPORT_CONFIG.default;
+export function getMarketConfig(type: string): MarketStyle {
+    if (!type) return MARKET_CONFIG.default;
+    return MARKET_CONFIG[type.toLowerCase()] || MARKET_CONFIG.default;
 }
 
-export function SportBackground({ sport }: { sport: string }) {
-    const config = getSportConfig(sport);
+// Backward compatibility helper
+export const getSportConfig = getMarketConfig;
+
+export function MarketBackground({ type }: { type: string }) {
+    const config = getMarketConfig(type);
 
     return (
         <div className="absolute -bottom-4 -right-4 opacity-5 pointer-events-none select-none overflow-hidden z-0">
@@ -100,3 +124,6 @@ export function SportBackground({ sport }: { sport: string }) {
         </div>
     );
 }
+
+// Backward compatibility component
+export const SportBackground = ({ sport }: { sport: string }) => <MarketBackground type={sport} />;

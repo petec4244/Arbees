@@ -11,7 +11,6 @@ use chrono::Utc;
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
-use redis::aio::PubSub;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -222,17 +221,20 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting Rust Market Discovery Service...");
 
     // Redis Connection
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let client = redis::Client::open(redis_url)?;
+    let redis_bus = Arc::new(arbees_rust_core::redis::RedisBus::new().await?);
+    let client = redis_bus.get_client();
     let mut con = client.get_async_connection().await?;
 
-    // Separate pubsub connection (redis-rs requires a dedicated connection)
-    let pubsub_con = client.get_async_connection().await?;
-    let mut pubsub = pubsub_con.into_pubsub();
-    pubsub.subscribe(DISCOVERY_REQUESTS_CH).await?;
-    pubsub.subscribe(TEAM_MATCH_REQUEST_CH).await?;
+    // Use reconnecting subscriptions for both channels
+    let channels = vec![
+        DISCOVERY_REQUESTS_CH.to_string(),
+        TEAM_MATCH_REQUEST_CH.to_string(),
+    ];
+    let stream = redis_bus
+        .subscribe_with_reconnect(channels)
+        .into_message_stream();
     info!(
-        "Subscribed to channels: {}, {}",
+        "Subscribed to channels: {}, {} (auto-reconnect enabled)",
         DISCOVERY_REQUESTS_CH, TEAM_MATCH_REQUEST_CH
     );
 
@@ -267,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
     let kalshi_cache_req = kalshi_cache.clone();
     tokio::spawn(async move {
         if let Err(e) = request_listener(
-            pubsub,
+            stream,
             redis_client_req,
             poly_client_req,
             kalshi_client_req,
@@ -378,7 +380,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn request_listener(
-    mut pubsub: PubSub,
+    mut stream: arbees_rust_core::redis::ReconnectingMessageStream,
     redis_client: redis::Client,
     poly_client: PolymarketClient,
     kalshi_client: KalshiClient,
@@ -386,11 +388,10 @@ async fn request_listener(
     kalshi_cache: Arc<RwLock<HashMap<String, (Instant, Vec<KalshiMarket>)>>>,
 ) -> anyhow::Result<()> {
     info!(
-        "Listening for requests on {} and {}",
+        "Listening for requests on {} and {} (auto-reconnect enabled)",
         DISCOVERY_REQUESTS_CH, TEAM_MATCH_REQUEST_CH
     );
 
-    let mut stream = pubsub.on_message();
     while let Some(msg) = stream.next().await {
         let channel: String = msg.get_channel_name().to_string();
         let payload: Vec<u8> = match msg.get_payload() {

@@ -84,8 +84,10 @@ frontend/*.local
 .claude/
 CLAUDE.md
 
+#Other Bots to learn from
 # Polymarket-Kalshi-Arbitrage-bot
 Polymarket-Kalshi-Arbitrage-bot/
+polymarket-alpha-bot/
 
 # Signal-cli
 signal-cli-0.13.23/

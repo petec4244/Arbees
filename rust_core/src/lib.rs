@@ -16,9 +16,13 @@ mod types;
 pub mod win_prob;
 
 // Service modules (from arbees_rust_core merge)
+pub mod alerts;
 pub mod clients;
 pub mod db;
+pub mod matching;
 pub mod models;
+pub mod probability;
+pub mod providers;
 pub mod redis;
 pub mod utils;
 
@@ -41,6 +45,9 @@ use std::collections::HashMap;
 
 pub use types::*;
 pub use win_prob::*;
+
+// Re-export ProbabilityModelRegistry for use in services
+pub use probability::ProbabilityModelRegistry;
 
 /// Find cross-platform arbitrage opportunities (Kalshi vs Polymarket).
 ///

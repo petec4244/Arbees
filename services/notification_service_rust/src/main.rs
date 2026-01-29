@@ -24,8 +24,53 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::time::Instant;
 use thresholds::ThresholdTracker;
 use tokio::sync::RwLock;
+
+// ============================================================================
+// Orchestrator Notification Rate Limiter
+// ============================================================================
+
+/// Rate limiter for orchestrator notifications to prevent notification spam
+/// when services are flapping or having issues.
+struct OrchestratorRateLimiter {
+    /// Maps "service_type:notification_type" -> last sent time
+    last_sent: HashMap<String, Instant>,
+    /// Cooldown between identical notifications (5 minutes)
+    cooldown_secs: u64,
+}
+
+impl OrchestratorRateLimiter {
+    fn new(cooldown_secs: u64) -> Self {
+        Self {
+            last_sent: HashMap::new(),
+            cooldown_secs,
+        }
+    }
+
+    /// Check if we should send this notification type for this service.
+    /// Returns true if enough time has passed since the last notification.
+    fn should_send(&mut self, service_type: &str, notif_type: &str) -> bool {
+        // Critical notifications always go through with shorter cooldown
+        let cooldown = match notif_type {
+            "service_dead" | "circuit_breaker_opened" => 60, // 1 minute for critical
+            _ => self.cooldown_secs, // Standard cooldown for others
+        };
+
+        let key = format!("{}:{}", service_type, notif_type);
+        let now = Instant::now();
+
+        if let Some(last) = self.last_sent.get(&key) {
+            if now.duration_since(*last).as_secs() < cooldown {
+                return false;
+            }
+        }
+
+        self.last_sent.insert(key, now);
+        true
+    }
+}
 
 // ============================================================================
 // Orchestrator Notification Handler
@@ -37,6 +82,7 @@ async fn handle_orchestrator_notification(
     payload_bytes: &[u8],
     signal: &SignalClient,
     metrics: &Arc<RwLock<Metrics>>,
+    rate_limiter: &Arc<RwLock<OrchestratorRateLimiter>>,
 ) {
     // Parse as generic JSON
     let notification: serde_json::Value = match serde_json::from_slice(payload_bytes) {
@@ -141,7 +187,23 @@ async fn handle_orchestrator_notification(
         }
     };
 
-    // Send notification (always send fault tolerance events immediately)
+    // Check rate limiter before sending
+    let should_send = {
+        let mut limiter = rate_limiter.write().await;
+        limiter.should_send(service_type, notif_type)
+    };
+
+    if !should_send {
+        info!(
+            "Rate-limited orchestrator notification: type={} service={} (cooldown active)",
+            notif_type, service_type
+        );
+        let mut m = metrics.write().await;
+        m.filtered += 1;
+        return;
+    }
+
+    // Send notification
     if let Err(e) = signal.send(&message).await {
         error!("Failed to send orchestrator notification: {}", e);
         let mut m = metrics.write().await;
@@ -286,6 +348,9 @@ async fn main() -> Result<()> {
     // Legacy metrics for heartbeat compatibility
     let metrics: Arc<RwLock<Metrics>> = Arc::new(RwLock::new(Metrics::default()));
 
+    // Rate limiter for orchestrator notifications (5 minute cooldown for non-critical)
+    let orchestrator_rate_limiter = Arc::new(RwLock::new(OrchestratorRateLimiter::new(300)));
+
     // Start heartbeat
     let instance_id =
         env::var("HOSTNAME").unwrap_or_else(|_| "notification-service-rust-1".to_string());
@@ -386,9 +451,9 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Handle fault tolerance notifications separately
+        // Handle fault tolerance notifications separately (with rate limiting)
         if channel != channels::NOTIFICATION_EVENTS {
-            handle_orchestrator_notification(&channel, &payload_bytes, &signal, &metrics).await;
+            handle_orchestrator_notification(&channel, &payload_bytes, &signal, &metrics, &orchestrator_rate_limiter).await;
             continue;
         }
 

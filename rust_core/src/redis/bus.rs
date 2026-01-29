@@ -133,6 +133,28 @@ impl RedisBus {
         Ok(pubsub)
     }
 
+    /// Subscribe with automatic reconnection. Returns a ReconnectingPubSub wrapper.
+    ///
+    /// This is the preferred way to subscribe for long-running listeners.
+    /// The returned wrapper automatically handles connection failures and resubscribes.
+    pub fn subscribe_with_reconnect(&self, channels: Vec<String>) -> crate::redis::pubsub_reconnect::ReconnectingPubSub {
+        crate::redis::pubsub_reconnect::ReconnectingPubSub::subscribe(
+            self.client.clone(),
+            channels
+        )
+    }
+
+    /// Pattern subscribe with automatic reconnection. Returns a ReconnectingPubSub wrapper.
+    ///
+    /// This is the preferred way to psubscribe for long-running listeners.
+    /// The returned wrapper automatically handles connection failures and resubscribes.
+    pub fn psubscribe_with_reconnect(&self, pattern: String) -> crate::redis::pubsub_reconnect::ReconnectingPubSub {
+        crate::redis::pubsub_reconnect::ReconnectingPubSub::psubscribe(
+            self.client.clone(),
+            pattern
+        )
+    }
+
     /// Get the underlying client for advanced operations
     pub fn get_client(&self) -> Client {
         self.client.clone()
@@ -151,12 +173,27 @@ impl RedisBus {
         &self.stats
     }
 
-    /// Check if Redis is healthy by sending a PING
+    /// Check if Redis is healthy by sending a PING (returns bool for backward compatibility)
     pub async fn health_check(&self) -> bool {
         let mut conn = self.connection.clone();
         match redis::cmd("PING").query_async::<_, String>(&mut conn).await {
             Ok(response) => response == "PONG",
             Err(_) => false,
+        }
+    }
+
+    /// Check if Redis is healthy by sending a PING (returns Result for system monitoring)
+    pub async fn health_check_result(&self) -> Result<()> {
+        let mut conn = self.connection.clone();
+        let response = redis::cmd("PING")
+            .query_async::<_, String>(&mut conn)
+            .await
+            .context("Failed to send PING to Redis")?;
+
+        if response == "PONG" {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Redis PING returned unexpected response: {}", response))
         }
     }
 }
