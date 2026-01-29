@@ -34,6 +34,7 @@ use crate::signals::model_edge;
 use crate::signals::latency;
 use crate::monitoring::espn::{parse_sport, is_overtime, format_time_remaining, check_cross_platform_arb, espn_sport_league};
 use crate::price::matching::{find_team_prices, select_best_platform_for_team};
+use crate::price::listener::PriceListener;
 
 // Type definitions moved to types.rs
 // Configuration constants moved to config.rs
@@ -57,7 +58,7 @@ pub struct GameShard {
     price_stats: Arc<PriceListenerStats>,
     /// Circuit breaker for ESPN API calls
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
-    /// Transport mode configuration
+    /// Transport mode configuration (kept for event_monitor compatibility)
     transport_mode: TransportMode,
     /// ZMQ PUB socket for signals (wrapped in Arc<Mutex> for sharing)
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
@@ -162,17 +163,15 @@ impl GameShard {
         info!("Starting GameShard {}", self.shard_id);
 
         // Initialize ZMQ PUB socket for signals if enabled
-        if self.transport_mode.use_zmq() {
-            info!("ZMQ publishing enabled (transport_mode={:?}) - initializing sockets", self.transport_mode);
-            match Self::init_zmq_pub(self.zmq_pub_port).await {
-                Ok(pub_socket) => {
-                    self.zmq_pub = Some(Arc::new(Mutex::new(pub_socket)));
-                    info!("ZMQ PUB socket bound to port {}", self.zmq_pub_port);
-                }
-                Err(e) => {
-                    error!("Failed to initialize ZMQ PUB socket: {}", e);
-                    // Continue without ZMQ PUB
-                }
+        // ZMQ publishing (always enabled - ZMQ-only transport mode)
+        match Self::init_zmq_pub(self.zmq_pub_port).await {
+            Ok(pub_socket) => {
+                self.zmq_pub = Some(Arc::new(Mutex::new(pub_socket)));
+                info!("ZMQ PUB socket bound to port {}", self.zmq_pub_port);
+            }
+            Err(e) => {
+                error!("Failed to initialize ZMQ PUB socket: {}", e);
+                // Continue without ZMQ PUB
             }
         }
 
@@ -192,25 +191,20 @@ impl GameShard {
             }
         });
 
-        // Market price listener - ZMQ if enabled, Redis as fallback
-        if self.transport_mode.use_zmq() && !self.zmq_sub_endpoints.is_empty() {
-            // ZMQ price listener (primary for low latency)
-            let zmq_shard = self.clone();
+        // Unified ZMQ price listener (primary, low-latency)
+        if !self.zmq_sub_endpoints.is_empty() {
+            let listener = PriceListener::new(
+                self.zmq_sub_endpoints.clone(),
+                self.market_prices.clone(),
+                self.price_stats.clone(),
+            );
             tokio::spawn(async move {
-                if let Err(e) = zmq_shard.zmq_price_listener_loop().await {
-                    error!("ZMQ price listener loop exited: {}", e);
+                if let Err(e) = listener.start().await {
+                    error!("Unified ZMQ price listener exited: {}", e);
                 }
             });
-            info!("Started ZMQ price listener for endpoints: {:?}", self.zmq_sub_endpoints);
+            info!("Started unified ZMQ price listener for endpoints: {:?}", self.zmq_sub_endpoints);
         }
-
-        // Redis price listener (always run for backward compatibility)
-        let price_shard = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = price_shard.price_listener_loop().await {
-                error!("Redis price listener loop exited: {}", e);
-            }
-        });
 
         Ok(())
     }
@@ -262,8 +256,8 @@ impl GameShard {
         let sp = sport.clone();
         let zmq_pub = self.zmq_pub.clone();
         let zmq_seq = self.zmq_seq.clone();
-
         let transport_mode = self.transport_mode;
+
         let task = tokio::spawn(async move {
             monitor_game(
                 redis,
@@ -342,12 +336,12 @@ impl GameShard {
         let market_prices = self.market_prices.clone();
         let zmq_pub = self.zmq_pub.clone();
         let zmq_seq = self.zmq_seq.clone();
-        let transport_mode = self.transport_mode;
         let probability_registry = self.probability_registry.clone();
         let eid = event_id.clone();
         let mt = market_type.clone();
         let ea = entity_a.clone();
         let eb = entity_b.clone();
+        let transport_mode = self.transport_mode;
 
         // Spawn the monitoring task
         let last_prob = Arc::new(RwLock::new(None));
@@ -506,203 +500,6 @@ impl GameShard {
         }
 
         Ok(())
-    }
-
-    /// Listen for market price updates from polymarket_monitor
-    async fn price_listener_loop(&self) -> Result<()> {
-        // Subscribe to game:*:price pattern
-        let mut pubsub = self.redis.psubscribe("game:*:price").await?;
-        info!("Subscribed to game:*:price pattern");
-
-        // Track last time we logged stats for periodic reporting
-        let mut last_stats_log = Instant::now();
-        let stats_log_interval = Duration::from_secs(60);
-
-        let mut stream = pubsub.on_message();
-        while let Some(msg) = stream.next().await {
-            // Increment received counter
-            self.price_stats.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            let channel: String = match msg.get_channel::<String>() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            // Extract game_id from channel: game:{game_id}:price
-            let game_id = channel
-                .strip_prefix("game:")
-                .and_then(|s| s.strip_suffix(":price"))
-                .map(|s| s.to_string());
-
-            let game_id = match game_id {
-                Some(gid) => gid,
-                None => continue,
-            };
-
-            let payload: Vec<u8> = match msg.get_payload::<Vec<u8>>() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Try to parse as msgpack first, then JSON
-            let price: IncomingMarketPrice = match rmp_serde::from_slice(&payload) {
-                Ok(p) => p,
-                Err(msgpack_err) => match serde_json::from_slice(&payload) {
-                    Ok(p) => p,
-                    Err(json_err) => {
-                        // P0-5: Track and log parsing failures properly
-                        let failure_count = self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed) + 1;
-
-                        // Log at warn level for visibility, but rate-limit to avoid spam
-                        if failure_count <= 10 || failure_count % 100 == 0 {
-                            warn!(
-                                "Failed to parse price message (failure #{}) for game {}: msgpack={}, json={}",
-                                failure_count, game_id, msgpack_err, json_err
-                            );
-                        }
-
-                        // Log payload preview for debugging (first 100 bytes)
-                        if failure_count <= 5 {
-                            let preview: String = payload.iter()
-                                .take(100)
-                                .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
-                                .collect();
-                            debug!("Failed payload preview: {}", preview);
-                        }
-                        continue;
-                    }
-                },
-            };
-
-            // Use shared price processing logic
-            self.process_incoming_price(price).await;
-
-            // Periodically log stats for monitoring
-            if last_stats_log.elapsed() >= stats_log_interval {
-                let stats = self.price_stats.snapshot();
-                info!(
-                    "Price listener stats: received={}, processed={}, parse_failures={}, no_liquidity={}, no_team={}",
-                    stats.messages_received, stats.messages_processed, stats.parse_failures,
-                    stats.no_liquidity_skipped, stats.no_team_skipped
-                );
-
-                // Alert if parse failure rate is high (>5%)
-                if stats.messages_received > 100 {
-                    let failure_rate = stats.parse_failures as f64 / stats.messages_received as f64;
-                    if failure_rate > 0.05 {
-                        error!(
-                            "HIGH PARSE FAILURE RATE: {:.1}% of price messages failing to parse!",
-                            failure_rate * 100.0
-                        );
-                    }
-                }
-
-                last_stats_log = Instant::now();
-            }
-        }
-
-        Ok(())
-    }
-
-    /// ZMQ-based price listener for low-latency price updates
-    async fn zmq_price_listener_loop(&self) -> Result<()> {
-        info!("Starting ZMQ price listener loop...");
-
-        // Create ZMQ SUB socket
-        let mut socket = SubSocket::new();
-
-        // Connect to all endpoints
-        for endpoint in &self.zmq_sub_endpoints {
-            match socket.connect(endpoint).await {
-                Ok(_) => info!("ZMQ connected to {}", endpoint),
-                Err(e) => {
-                    warn!("Failed to connect to ZMQ endpoint {}: {}", endpoint, e);
-                }
-            }
-        }
-
-        // Subscribe to price topics
-        socket.subscribe("prices.").await?;
-        info!("ZMQ subscribed to prices.*");
-
-        // Track last stats log time
-        let mut last_stats_log = Instant::now();
-        let stats_log_interval = Duration::from_secs(60);
-        let mut zmq_messages_received: u64 = 0;
-
-        loop {
-            // Receive with timeout
-            let recv_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                socket.recv(),
-            ).await;
-
-            match recv_result {
-                Ok(Ok(msg)) => {
-                    zmq_messages_received += 1;
-
-                    // ZMQ multipart: [topic, payload]
-                    let parts: Vec<_> = msg.iter().collect();
-                    if parts.len() < 2 {
-                        continue;
-                    }
-
-                    let topic = String::from_utf8_lossy(parts[0].as_ref());
-                    let payload_bytes = parts[1].as_ref();
-
-                    // Parse envelope
-                    let envelope: ZmqEnvelope = match serde_json::from_slice(payload_bytes) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed);
-                            debug!("Failed to parse ZMQ price message: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Extract price data from payload
-                    let price: IncomingMarketPrice = match serde_json::from_value(envelope.payload) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed);
-                            debug!("Failed to parse ZMQ price payload: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Process the price (same logic as Redis path)
-                    self.process_incoming_price(price).await;
-
-                    // Log ZMQ latency periodically
-                    if zmq_messages_received % 1000 == 0 {
-                        let now_ms = Utc::now().timestamp_millis();
-                        let latency_ms = now_ms - envelope.timestamp_ms;
-                        debug!("ZMQ price #{}: latency={}ms topic={}", zmq_messages_received, latency_ms, topic);
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("ZMQ receive error: {}. Reconnecting...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    // Reconnect
-                    for endpoint in &self.zmq_sub_endpoints {
-                        let _ = socket.connect(endpoint).await;
-                    }
-                }
-                Err(_) => {
-                    // Timeout - normal for low-traffic periods
-                    debug!("No ZMQ price message in 30s");
-                }
-            }
-
-            // Periodic stats logging
-            if last_stats_log.elapsed() >= stats_log_interval {
-                info!(
-                    "ZMQ price listener: received={} messages",
-                    zmq_messages_received
-                );
-                last_stats_log = Instant::now();
-            }
-        }
     }
 
     /// Process an incoming price message (shared between Redis and ZMQ paths)
