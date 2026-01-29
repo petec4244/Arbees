@@ -82,6 +82,10 @@ impl CryptoProbabilityModel {
     ///
     /// For simplicity, we assume μ = 0 (drift-neutral), giving:
     /// d2 = [ln(S/K) - σ²T/2] / (σ√T)
+    ///
+    /// When current_price >= target_price, applies a time-decay factor:
+    /// This prevents overconfident signals when price is already at target but
+    /// has significant time remaining (price could fall back).
     pub fn calculate_price_target_probability(
         current_price: f64,
         target_price: f64,
@@ -106,7 +110,10 @@ impl CryptoProbabilityModel {
         // Probability of being above target = N(-d2) for current < target
         if current_price >= target_price {
             // Already above target - probability of staying above
-            normal_cdf(d2)
+            // Apply time-decay factor: more time remaining = higher chance of falling back
+            let base_prob = normal_cdf(d2);
+            let time_decay_factor = (-2.0 * t).exp(); // Decays from 1.0 at t=0 to ~0.14 at t=1 year
+            base_prob * time_decay_factor
         } else {
             // Below target - probability of rising above
             normal_cdf(-d2)
@@ -179,9 +186,9 @@ impl ProbabilityModel for CryptoProbabilityModel {
         // For "entity_a wins" (price above target), return prob
         // For "entity_b wins" (price below target), return 1 - prob
         if for_entity_a {
-            Ok(prob.clamp(0.001, 0.999))
+            Ok(prob.clamp(0.01, 0.99))
         } else {
-            Ok((1.0 - prob).clamp(0.001, 0.999))
+            Ok((1.0 - prob).clamp(0.01, 0.99))
         }
     }
 
@@ -217,9 +224,9 @@ impl ProbabilityModel for CryptoProbabilityModel {
         );
 
         if for_home_team {
-            Ok(prob.clamp(0.001, 0.999))
+            Ok(prob.clamp(0.01, 0.99))
         } else {
-            Ok((1.0 - prob).clamp(0.001, 0.999))
+            Ok((1.0 - prob).clamp(0.01, 0.99))
         }
     }
 
@@ -276,23 +283,28 @@ mod tests {
 
     #[test]
     fn test_price_target_probability() {
-        // Current price = target price, should be ~50%
+        // Current price = target price, should be < 50% due to time decay
+        // (with 30 days remaining, price can fall back)
         let prob = CryptoProbabilityModel::calculate_price_target_probability(
             100000.0, // current
             100000.0, // target
             30.0,     // 30 days
             0.80,     // 80% annual vol
         );
-        assert!(prob > 0.45 && prob < 0.55, "At-target prob: {}", prob);
+        // With time decay factor: e^(-2*30/365) ≈ 0.839
+        // Base probability at target ~0.5, decayed ≈ 0.42
+        assert!(prob > 0.30 && prob < 0.50, "At-target prob with decay: {}", prob);
 
-        // Current price well above target, should be high
+        // Current price well above target, should be high but with decay
+        // Decay factor significantly reduces extreme confidence when price just barely above
         let prob = CryptoProbabilityModel::calculate_price_target_probability(
             100000.0, // current
-            50000.0,  // target (half)
+            50000.0,  // target (50% below)
             30.0,     // 30 days
             0.80,     // 80% annual vol
         );
-        assert!(prob > 0.90, "Above-target prob: {}", prob);
+        // Even well above target, time decay limits extreme confidence
+        assert!(prob > 0.70 && prob < 0.95, "Above-target prob with decay: {}", prob);
 
         // With high volatility and being below target, longer time allows more random walk
         // Both probabilities should be meaningful (not extreme)
