@@ -45,6 +45,11 @@ impl ServiceRegistry {
 
     /// Handle incoming heartbeat from a service
     pub async fn handle_heartbeat(&self, payload: Value) -> Result<()> {
+        // Log all incoming heartbeats for debugging
+        if let Some(shard_id) = payload.get("shard_id").and_then(|v| v.as_str()) {
+            debug!("Received heartbeat from shard_id={}", shard_id);
+        }
+
         // Parse heartbeat payload
         let service_name = payload
             .get("service")
@@ -67,6 +72,21 @@ impl ServiceRegistry {
         let state = services
             .entry(instance_key.clone())
             .or_insert_with(|| ServiceState::new(service_type.clone(), instance_id.to_string()));
+
+        // Always update service_type from heartbeat (fixes routing for crypto vs sports shards)
+        if state.service_type != service_type {
+            info!(
+                "Updating service_type for {} from {:?} to {:?}",
+                instance_key, state.service_type, service_type
+            );
+            state.service_type = service_type.clone();
+        }
+
+        // Log when a new service is registered
+        debug!(
+            "Heartbeat processed: instance_key={}, service_type={:?}, status={:?}",
+            instance_key, state.service_type, state.status
+        );
 
         // Extract heartbeat fields
         let process_id = payload.get("process_id").and_then(|v| v.as_str()).map(String::from);

@@ -274,21 +274,22 @@ impl ServiceState {
     }
 
     pub fn available_capacity(&self) -> usize {
-        // For game shards, extract from metrics
-        if let ServiceType::GameShard = self.service_type {
-            let max_games = self.metrics
-                .get("max_games")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            let game_count = self.assigned_games.len();
+        // For game shards and crypto shards, extract from metrics
+        match self.service_type {
+            ServiceType::GameShard | ServiceType::CryptoShard => {
+                let max_games = self.metrics
+                    .get("max_games")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let game_count = self.assigned_games.len();
 
-            if game_count >= max_games {
-                0
-            } else {
-                max_games - game_count
+                if game_count >= max_games {
+                    0
+                } else {
+                    max_games - game_count
+                }
             }
-        } else {
-            0
+            _ => 0,
         }
     }
 }
