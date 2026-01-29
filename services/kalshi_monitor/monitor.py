@@ -181,13 +181,16 @@ class KalshiMonitor:
         # Heartbeat publisher for health monitoring
         self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
-        # ZMQ publisher for low-latency messaging (hot path)
-        transport_mode = os.environ.get("ZMQ_TRANSPORT_MODE", "redis_only").lower()
-        self._zmq_enabled = transport_mode in ("zmq_only", "both")
+        # ZMQ publisher for low-latency messaging (HOT PATH - always enabled)
+        # ZMQ is the primary transport for price data; Redis is only for slow-path consumers
         self._zmq_context: Optional["zmq.asyncio.Context"] = None
         self._zmq_pub: Optional["zmq.asyncio.Socket"] = None
         self._zmq_seq = 0
         self._zmq_pub_port = int(os.environ.get("ZMQ_PUB_PORT", "5555"))
+
+        # Redis publishing is now optional (only for backward compatibility)
+        transport_mode = os.environ.get("ZMQ_TRANSPORT_MODE", "zmq_only").lower()
+        self._redis_publish_prices = transport_mode in ("redis_only", "both")
 
     async def start(self):
         """Initialize connections and start monitoring."""
@@ -222,19 +225,21 @@ class KalshiMonitor:
         self._running = True
         self._health_ok = True
 
-        # Initialize ZMQ publisher if enabled
-        if self._zmq_enabled and ZMQ_AVAILABLE:
-            try:
-                self._zmq_context = zmq.asyncio.Context()
-                self._zmq_pub = self._zmq_context.socket(zmq.PUB)
-                self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
-                logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port}")
-            except Exception as e:
-                logger.error(f"Failed to initialize ZMQ: {e}")
-                self._zmq_enabled = False
-        elif self._zmq_enabled and not ZMQ_AVAILABLE:
-            logger.warning(f"ZMQ_TRANSPORT_MODE={transport_mode} but pyzmq not installed")
-            self._zmq_enabled = False
+        # Initialize ZMQ publisher (REQUIRED - ZMQ is the primary hot path)
+        if not ZMQ_AVAILABLE:
+            raise RuntimeError(
+                "pyzmq is required for KalshiMonitor. "
+                "Install with: pip install pyzmq"
+            )
+
+        try:
+            self._zmq_context = zmq.asyncio.Context()
+            self._zmq_pub = self._zmq_context.socket(zmq.PUB)
+            self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
+            logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port} (primary hot path)")
+        except Exception as e:
+            logger.error(f"Failed to initialize ZMQ: {e}")
+            raise RuntimeError(f"ZMQ initialization failed: {e}")
 
         # Setup signal handlers
         loop = asyncio.get_event_loop()
@@ -489,27 +494,24 @@ class KalshiMonitor:
             last_trade_price=price.last_trade_price,
         )
 
-        # Publish to per-game price channel
-        await self.redis.publish_market_price(game_id, normalized_price)
+        # PRIMARY: Publish to ZMQ (hot path - always)
+        await self._publish_zmq_price(ticker, game_id, normalized_price)
+
+        # SECONDARY: Optionally publish to Redis for backward compatibility
+        if self._redis_publish_prices:
+            await self.redis.publish_market_price(game_id, normalized_price)
 
         self._prices_published += 1
         self._last_price_time = datetime.utcnow()
 
-        # Publish to ZMQ for low-latency consumers (hot path)
-        if self._zmq_enabled and self._zmq_pub:
-            await self._publish_zmq_price(ticker, game_id, normalized_price)
-
         logger.debug(
             f"Published Kalshi price: {ticker[:12]}... team='{team_name}' "
             f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
-            f"game={game_id}"
+            f"game={game_id} (zmq=yes, redis={self._redis_publish_prices})"
         )
 
     async def _publish_zmq_price(self, ticker: str, game_id: str, price: MarketPrice):
-        """Publish price to ZMQ PUB socket for low-latency consumers."""
-        if not self._zmq_pub:
-            return
-
+        """Publish price to ZMQ PUB socket (primary hot path)."""
         try:
             topic = f"prices.kalshi.{ticker}".encode()
             envelope = {
