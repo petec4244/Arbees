@@ -1,6 +1,11 @@
 mod event_monitor;
 mod shard;
 
+// Submodules
+mod price;
+mod signals;
+mod monitoring;
+
 use anyhow::Result;
 use dotenv::dotenv;
 use log::info;

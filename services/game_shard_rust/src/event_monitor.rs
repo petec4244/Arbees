@@ -4,7 +4,7 @@
 //! (crypto, economics, politics). It follows a similar pattern to monitor_game
 //! but uses the universal EventProvider abstraction.
 
-use crate::shard::MarketPriceData;
+use crate::price::data::MarketPriceData;
 use arbees_rust_core::models::{
     channels, MarketType, Platform, SignalDirection, SignalType, Sport, TradingSignal,
     TransportMode,

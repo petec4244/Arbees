@@ -1,5 +1,4 @@
 use anyhow::Result;
-use arbees_rust_core::atomic_orderbook::kalshi_fee_cents;
 use arbees_rust_core::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
@@ -9,8 +8,7 @@ use arbees_rust_core::models::{
 use arbees_rust_core::ProbabilityModelRegistry;
 use arbees_rust_core::providers::EventProviderRegistry;
 use arbees_rust_core::redis::bus::RedisBus;
-use arbees_rust_core::simd::{check_arbs_simd, calculate_profit_cents, decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
-use arbees_rust_core::utils::matching::match_team_in_text;
+use arbees_rust_core::simd::{decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
 use arbees_rust_core::win_prob::calculate_win_probability;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -28,6 +26,15 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use zeromq::{Socket, SocketRecv, SocketSend, PubSocket, SubSocket, ZmqMessage};
 
+// Import from sibling modules
+use crate::price::data::{MarketPriceData, IncomingMarketPrice};
+use crate::signals::edge::{compute_team_net_edge, fee_for_price};
+use crate::monitoring::espn::{parse_sport, is_overtime, format_time_remaining, check_cross_platform_arb, espn_sport_league};
+use crate::price::matching::{find_team_prices, select_best_platform_for_team};
+
+// Re-export types for external use
+pub use crate::price::data::{MarketPriceData as PublicMarketPriceData};
+
 /// ZMQ message envelope format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ZmqEnvelope {
@@ -44,64 +51,6 @@ const DEFAULT_MIN_EDGE_PCT: f64 = 15.0;
 const MAX_BUY_PROB: f64 = 0.95;
 /// Minimum probability to buy (avoid buying very unlikely outcomes)
 const MIN_BUY_PROB: f64 = 0.05;
-/// Polymarket fee rate (2% per side)
-const POLYMARKET_FEE_RATE: f64 = 0.02;
-
-/// Fee per contract (in $) for entering/exiting at a given price.
-/// For $1 face-value contracts, fee dollars are equivalent to "probability points".
-fn fee_for_price(platform: Platform, price: f64) -> f64 {
-    let price = price.clamp(0.0, 1.0);
-    let price_cents = (price * 100.0).round() as u16;
-    match platform {
-        Platform::Kalshi | Platform::Paper => kalshi_fee_cents(price_cents) as f64 / 100.0,
-        Platform::Polymarket => price * POLYMARKET_FEE_RATE,
-    }
-}
-
-/// Compute the *tradeable* (executable) net edge for a team on a given platform.
-///
-/// - If model thinks YES is underpriced: BUY YES at `yes_ask`.
-/// - If model thinks YES is overpriced: BUY NO at `no_ask = 1 - yes_bid` (represented as SELL on the team).
-///
-/// Returns (direction, signal_type, net_edge_pct, gross_edge_pct_abs, market_yes_mid).
-fn compute_team_net_edge(
-    model_yes_prob: f64,
-    price: &MarketPriceData,
-    platform: Platform,
-) -> (SignalDirection, SignalType, f64, f64, f64) {
-    let model_yes_prob = model_yes_prob.clamp(0.0, 1.0);
-    let market_yes_mid = price.mid_price.clamp(0.0, 1.0);
-    let gross_edge_pct_abs = ((model_yes_prob - market_yes_mid).abs()) * 100.0;
-
-    if model_yes_prob >= market_yes_mid {
-        // BUY YES at ask
-        let entry = price.yes_ask.clamp(0.0, 1.0);
-        let entry_fee = fee_for_price(platform, entry);
-        let exit_fee = fee_for_price(platform, model_yes_prob);
-        let net_edge_pct = (model_yes_prob - entry - entry_fee - exit_fee) * 100.0;
-        (
-            SignalDirection::Buy,
-            SignalType::ModelEdgeYes,
-            net_edge_pct,
-            gross_edge_pct_abs,
-            market_yes_mid,
-        )
-    } else {
-        // BUY NO at no_ask = 1 - yes_bid
-        let model_no_prob = (1.0 - model_yes_prob).clamp(0.0, 1.0);
-        let no_ask = (1.0 - price.yes_bid).clamp(0.0, 1.0);
-        let entry_fee = fee_for_price(platform, no_ask);
-        let exit_fee = fee_for_price(platform, model_no_prob);
-        let net_edge_pct = (model_no_prob - no_ask - entry_fee - exit_fee) * 100.0;
-        (
-            SignalDirection::Sell,
-            SignalType::ModelEdgeNo,
-            net_edge_pct,
-            gross_edge_pct_abs,
-            market_yes_mid,
-        )
-    }
-}
 
 /// Statistics for monitoring price message processing health
 #[derive(Debug, Default)]
@@ -177,23 +126,6 @@ pub struct GameShard {
     event_provider_registry: Arc<EventProviderRegistry>,
 }
 
-/// Market price data for a specific contract
-#[derive(Debug, Clone)]
-pub struct MarketPriceData {
-    pub market_id: String,
-    pub platform: String,
-    pub contract_team: String,
-    pub yes_bid: f64,
-    pub yes_ask: f64,
-    pub mid_price: f64,
-    pub timestamp: chrono::DateTime<Utc>,
-    /// Liquidity available at the yes bid (contracts available to sell)
-    pub yes_bid_size: Option<f64>,
-    /// Liquidity available at the yes ask (contracts available to buy)
-    pub yes_ask_size: Option<f64>,
-    /// Total liquidity in the market (if reported)
-    pub total_liquidity: Option<f64>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameContext {
@@ -230,25 +162,6 @@ struct ShardCommand {
     metadata: Option<serde_json::Value>, // Additional market-specific metadata
 }
 
-/// Incoming market price message from polymarket_monitor
-#[derive(Debug, Deserialize)]
-struct IncomingMarketPrice {
-    market_id: String,
-    platform: String,
-    game_id: String,
-    contract_team: Option<String>,
-    yes_bid: f64,
-    yes_ask: f64,
-    mid_price: Option<f64>,
-    implied_probability: Option<f64>,
-    timestamp: Option<String>,
-    /// Liquidity at the yes bid (contracts available to sell)
-    yes_bid_size: Option<f64>,
-    /// Liquidity at the yes ask (contracts available to buy)
-    yes_ask_size: Option<f64>,
-    /// Total market liquidity (optional)
-    liquidity: Option<f64>,
-}
 
 impl GameShard {
     pub async fn new(shard_id: String) -> Result<Self> {
@@ -1429,71 +1342,6 @@ async fn monitor_game(
 
 /// Find all platform prices for a team (returns up to one price per platform)
 /// Filters out stale prices based on max_age_secs.
-fn find_team_prices<'a>(
-    prices: &'a HashMap<String, MarketPriceData>,
-    team: &str,
-    sport: Sport,
-    max_age_secs: i64,
-) -> (Option<&'a MarketPriceData>, Option<&'a MarketPriceData>) {
-    // Use the shared matcher instead of substring matching (prevents LA/Louisiana/etc collisions).
-    let mut best_kalshi: Option<(&MarketPriceData, f64)> = None;
-    let mut best_poly: Option<(&MarketPriceData, f64)> = None;
-    let now = Utc::now();
-
-    for (_key, price) in prices {
-        // Skip stale prices
-        let age_secs = (now - price.timestamp).num_seconds();
-        if age_secs > max_age_secs {
-            continue;
-        }
-
-        let platform = price.platform.to_lowercase();
-        let result = match_team_in_text(team, &price.contract_team, sport.as_str());
-        if !result.is_match() {
-            continue;
-        }
-
-        let score = result.score;
-        if platform.contains("kalshi") {
-            if best_kalshi.map(|(_, s)| s).unwrap_or(0.0) < score {
-                best_kalshi = Some((price, score));
-            }
-        } else if platform.contains("polymarket") {
-            if best_poly.map(|(_, s)| s).unwrap_or(0.0) < score {
-                best_poly = Some((price, score));
-            }
-        }
-    }
-
-    (best_kalshi.map(|(p, _)| p), best_poly.map(|(p, _)| p))
-}
-
-/// Select the best platform for a *tradeable* model-edge signal on a team.
-/// Uses executable entry prices + fees (YES ask for BUY, NO ask for SELL).
-fn select_best_platform_for_team<'a>(
-    model_yes_prob: f64,
-    kalshi_price: Option<&'a MarketPriceData>,
-    poly_price: Option<&'a MarketPriceData>,
-) -> Option<(&'a MarketPriceData, Platform, f64)> {
-    let mut best: Option<(&MarketPriceData, Platform, f64)> = None;
-
-    if let Some(k) = kalshi_price {
-        let (_dir, _ty, net_edge_pct, _gross_abs, _mid) =
-            compute_team_net_edge(model_yes_prob, k, Platform::Kalshi);
-        best = Some((k, Platform::Kalshi, net_edge_pct));
-    }
-
-    if let Some(p) = poly_price {
-        let (_dir, _ty, net_edge_pct, _gross_abs, _mid) =
-            compute_team_net_edge(model_yes_prob, p, Platform::Polymarket);
-        match best {
-            Some((_, _, best_edge)) if best_edge >= net_edge_pct => {}
-            _ => best = Some((p, Platform::Polymarket, net_edge_pct)),
-        }
-    }
-
-    best
-}
 
 /// Publish a signal via ZMQ for low-latency consumers
 async fn publish_signal_zmq_fn(
@@ -1760,122 +1608,7 @@ async fn fetch_game_state(
     Some((game, state))
 }
 
-fn parse_sport(sport: &str) -> Option<Sport> {
-    match sport.to_lowercase().as_str() {
-        "nfl" => Some(Sport::NFL),
-        "ncaaf" => Some(Sport::NCAAF),
-        "nba" => Some(Sport::NBA),
-        "ncaab" => Some(Sport::NCAAB),
-        "nhl" => Some(Sport::NHL),
-        "mlb" => Some(Sport::MLB),
-        "mls" => Some(Sport::MLS),
-        "soccer" => Some(Sport::Soccer),
-        "tennis" => Some(Sport::Tennis),
-        "mma" => Some(Sport::MMA),
-        _ => None,
-    }
-}
 
-/// Check if a game is in overtime based on sport and period
-/// Returns true if the game has exceeded regular periods/innings
-fn is_overtime(sport: Sport, period: u8) -> bool {
-    match sport {
-        Sport::NHL => period > 3,       // Regular NHL: 3 periods
-        Sport::NBA => period > 4,       // Regular NBA: 4 quarters
-        Sport::NFL => period > 4,       // Regular NFL: 4 quarters
-        Sport::NCAAF => period > 4,     // Regular NCAAF: 4 quarters
-        Sport::NCAAB => period > 2,     // Regular NCAAB: 2 halves
-        Sport::MLB => period > 9,       // Regular MLB: 9 innings
-        Sport::MLS | Sport::Soccer => period > 2, // Regular soccer: 2 halves
-        Sport::Tennis => false,         // Tennis doesn't have overtime
-        Sport::MMA => false,            // MMA doesn't have overtime
-    }
-}
-
-fn espn_sport_league(sport: &str) -> Option<(&'static str, &'static str)> {
-    match sport.to_lowercase().as_str() {
-        "nfl" => Some(("football", "nfl")),
-        "ncaaf" => Some(("football", "college-football")),
-        "nba" => Some(("basketball", "nba")),
-        "ncaab" => Some(("basketball", "mens-college-basketball")),
-        "nhl" => Some(("hockey", "nhl")),
-        "mlb" => Some(("baseball", "mlb")),
-        "mls" => Some(("soccer", "usa.1")),
-        "soccer" => Some(("soccer", "eng.1")),
-        _ => None,
-    }
-}
-
-/// Format seconds into a time remaining string like "12:34" or "5:00"
-fn format_time_remaining(seconds: u32) -> String {
-    let mins = seconds / 60;
-    let secs = seconds % 60;
-    format!("{}:{:02}", mins, secs)
-}
-
-/// Check for cross-platform arbitrage opportunities using SIMD scanner.
-///
-/// Returns Some((arb_mask, profit_cents)) if an arb is found, None otherwise.
-///
-/// Arbitrage exists when:
-/// - Kalshi YES + Poly NO < 100¢ (or vice versa)
-/// - This means buying both sides guarantees profit
-fn check_cross_platform_arb(
-    kalshi_price: Option<&MarketPriceData>,
-    poly_price: Option<&MarketPriceData>,
-    min_profit_cents: i16,
-) -> Option<(u8, i16)> {
-    let (kalshi, poly) = match (kalshi_price, poly_price) {
-        (Some(k), Some(p)) => (k, p),
-        _ => return None, // Need both platforms for cross-platform arb
-    };
-
-    // Convert prices to cents (0-100 scale)
-    let k_yes = (kalshi.yes_ask * 100.0).round() as u16;
-    let k_no = ((1.0 - kalshi.yes_bid) * 100.0).round() as u16; // NO ask = 1 - YES bid
-    let p_yes = (poly.yes_ask * 100.0).round() as u16;
-    let p_no = ((1.0 - poly.yes_bid) * 100.0).round() as u16;
-
-    // Use SIMD scanner to check for arbs (threshold 100 = $1.00)
-    let arb_mask = check_arbs_simd(k_yes, k_no, p_yes, p_no, 100);
-
-    if arb_mask == 0 {
-        return None;
-    }
-
-    // Calculate profit for cross-platform arbs only
-    let cross_platform_mask = arb_mask & (ARB_POLY_YES_KALSHI_NO | ARB_KALSHI_YES_POLY_NO);
-
-    if cross_platform_mask == 0 {
-        return None;
-    }
-
-    // Find the most profitable cross-platform arb
-    let mut best_profit = 0i16;
-    let mut best_mask = 0u8;
-
-    if arb_mask & ARB_POLY_YES_KALSHI_NO != 0 {
-        let profit = calculate_profit_cents(k_yes, k_no, p_yes, p_no, ARB_POLY_YES_KALSHI_NO);
-        if profit > best_profit {
-            best_profit = profit;
-            best_mask = ARB_POLY_YES_KALSHI_NO;
-        }
-    }
-
-    if arb_mask & ARB_KALSHI_YES_POLY_NO != 0 {
-        let profit = calculate_profit_cents(k_yes, k_no, p_yes, p_no, ARB_KALSHI_YES_POLY_NO);
-        if profit > best_profit {
-            best_profit = profit;
-            best_mask = ARB_KALSHI_YES_POLY_NO;
-        }
-    }
-
-    if best_profit >= min_profit_cents {
-        Some((best_mask, best_profit))
-    } else {
-        None
-    }
-}
 
 /// Emit a cross-platform arbitrage signal
 async fn emit_arb_signal(
@@ -2044,285 +1777,11 @@ async fn emit_latency_signal(
 // ============================================================================
 // Unit Tests
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ========================================================================
-    // compute_team_net_edge tests
-    // ========================================================================
-
-    fn make_price(yes_bid: f64, yes_ask: f64) -> MarketPriceData {
-        MarketPriceData {
-            market_id: "test".to_string(),
-            platform: "kalshi".to_string(),
-            contract_team: "Test Team".to_string(),
-            yes_bid,
-            yes_ask,
-            mid_price: (yes_bid + yes_ask) / 2.0,
-            timestamp: Utc::now(),
-            yes_bid_size: Some(1000.0),
-            yes_ask_size: Some(1000.0),
-            total_liquidity: Some(2000.0),
-        }
-    }
-
-    #[test]
-    fn test_compute_net_edge_buy_yes() {
-        // Model thinks 60% YES, market at 50% mid (bid=48, ask=52)
-        let price = make_price(0.48, 0.52);
-        let (direction, signal_type, net_edge, gross_edge, market_mid) =
-            compute_team_net_edge(0.60, &price, Platform::Kalshi);
-
-        assert_eq!(direction, SignalDirection::Buy);
-        assert_eq!(signal_type, SignalType::ModelEdgeYes);
-        assert!((gross_edge - 10.0).abs() < 0.1); // 60% - 50% = 10% gross
-        assert!(net_edge < gross_edge); // Net should be less due to fees
-        assert!(net_edge > 0.0); // Should still be positive
-        assert!((market_mid - 0.50).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_compute_net_edge_buy_no() {
-        // Model thinks 40% YES (60% NO), market at 50% mid
-        let price = make_price(0.48, 0.52);
-        let (direction, signal_type, net_edge, gross_edge, market_mid) =
-            compute_team_net_edge(0.40, &price, Platform::Kalshi);
-
-        assert_eq!(direction, SignalDirection::Sell);
-        assert_eq!(signal_type, SignalType::ModelEdgeNo);
-        assert!((gross_edge - 10.0).abs() < 0.1); // |40% - 50%| = 10% gross
-        assert!(net_edge < gross_edge); // Net should be less due to fees
-        assert!((market_mid - 0.50).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_compute_net_edge_platform_fees_differ() {
-        let price = make_price(0.48, 0.52);
-
-        let (_, _, kalshi_net, _, _) = compute_team_net_edge(0.60, &price, Platform::Kalshi);
-        let (_, _, poly_net, _, _) = compute_team_net_edge(0.60, &price, Platform::Polymarket);
-
-        // Both should have positive gross edge (model 60% vs market ~50%)
-        // Net edges will differ based on fee structure
-        // At mid-range prices, Polymarket's 2% per-side fee may be higher than Kalshi's tiered fees
-        // The important thing is both calculations work and produce reasonable values
-        assert!(kalshi_net > -20.0 && kalshi_net < 20.0); // Reasonable range
-        assert!(poly_net > -20.0 && poly_net < 20.0); // Reasonable range
-
-        // Both should be less than the gross edge of ~10%
-        assert!(kalshi_net < 10.0);
-        assert!(poly_net < 10.0);
-    }
-
-    #[test]
-    fn test_compute_net_edge_no_edge() {
-        // Model matches market exactly
-        let price = make_price(0.48, 0.52);
-        let (direction, _, net_edge, gross_edge, _) =
-            compute_team_net_edge(0.50, &price, Platform::Kalshi);
-
-        assert_eq!(direction, SignalDirection::Buy); // Slight bias to buy when equal
-        assert!(gross_edge.abs() < 0.1); // Near zero gross edge
-        assert!(net_edge < 0.0); // Negative after fees (no real edge)
-    }
-
-    // ========================================================================
-    // is_overtime tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_overtime_nhl() {
-        assert!(!is_overtime(Sport::NHL, 1));
-        assert!(!is_overtime(Sport::NHL, 2));
-        assert!(!is_overtime(Sport::NHL, 3));
-        assert!(is_overtime(Sport::NHL, 4)); // OT
-        assert!(is_overtime(Sport::NHL, 5)); // 2OT
-    }
-
-    #[test]
-    fn test_is_overtime_nba() {
-        assert!(!is_overtime(Sport::NBA, 1));
-        assert!(!is_overtime(Sport::NBA, 4));
-        assert!(is_overtime(Sport::NBA, 5)); // OT
-    }
-
-    #[test]
-    fn test_is_overtime_nfl() {
-        assert!(!is_overtime(Sport::NFL, 1));
-        assert!(!is_overtime(Sport::NFL, 4));
-        assert!(is_overtime(Sport::NFL, 5)); // OT
-    }
-
-    #[test]
-    fn test_is_overtime_ncaab() {
-        assert!(!is_overtime(Sport::NCAAB, 1));
-        assert!(!is_overtime(Sport::NCAAB, 2));
-        assert!(is_overtime(Sport::NCAAB, 3)); // OT (college has 2 halves)
-    }
-
-    #[test]
-    fn test_is_overtime_mlb() {
-        assert!(!is_overtime(Sport::MLB, 1));
-        assert!(!is_overtime(Sport::MLB, 9));
-        assert!(is_overtime(Sport::MLB, 10)); // Extra innings
-    }
-
-    #[test]
-    fn test_is_overtime_soccer() {
-        assert!(!is_overtime(Sport::Soccer, 1));
-        assert!(!is_overtime(Sport::Soccer, 2));
-        assert!(is_overtime(Sport::Soccer, 3)); // Extra time
-    }
-
-    // ========================================================================
-    // format_time_remaining tests
-    // ========================================================================
-
-    #[test]
-    fn test_format_time_remaining() {
-        assert_eq!(format_time_remaining(0), "0:00");
-        assert_eq!(format_time_remaining(30), "0:30");
-        assert_eq!(format_time_remaining(60), "1:00");
-        assert_eq!(format_time_remaining(90), "1:30");
-        assert_eq!(format_time_remaining(720), "12:00"); // 12 minutes
-        assert_eq!(format_time_remaining(754), "12:34");
-    }
-
-    // ========================================================================
-    // parse_sport tests
-    // ========================================================================
-
-    #[test]
-    fn test_parse_sport_valid() {
-        assert_eq!(parse_sport("nfl"), Some(Sport::NFL));
-        assert_eq!(parse_sport("NFL"), Some(Sport::NFL));
-        assert_eq!(parse_sport("nba"), Some(Sport::NBA));
-        assert_eq!(parse_sport("nhl"), Some(Sport::NHL));
-        assert_eq!(parse_sport("mlb"), Some(Sport::MLB));
-        assert_eq!(parse_sport("ncaaf"), Some(Sport::NCAAF));
-        assert_eq!(parse_sport("ncaab"), Some(Sport::NCAAB));
-        assert_eq!(parse_sport("mls"), Some(Sport::MLS));
-        assert_eq!(parse_sport("soccer"), Some(Sport::Soccer));
-    }
-
-    #[test]
-    fn test_parse_sport_invalid() {
-        assert_eq!(parse_sport("invalid"), None);
-        assert_eq!(parse_sport(""), None);
-        assert_eq!(parse_sport("cricket"), None);
-    }
-
-    // ========================================================================
-    // espn_sport_league tests
-    // ========================================================================
-
-    #[test]
-    fn test_espn_sport_league_mapping() {
-        assert_eq!(espn_sport_league("nfl"), Some(("football", "nfl")));
-        assert_eq!(espn_sport_league("ncaaf"), Some(("football", "college-football")));
-        assert_eq!(espn_sport_league("nba"), Some(("basketball", "nba")));
-        assert_eq!(espn_sport_league("ncaab"), Some(("basketball", "mens-college-basketball")));
-        assert_eq!(espn_sport_league("nhl"), Some(("hockey", "nhl")));
-        assert_eq!(espn_sport_league("mlb"), Some(("baseball", "mlb")));
-        assert_eq!(espn_sport_league("mls"), Some(("soccer", "usa.1")));
-        assert_eq!(espn_sport_league("soccer"), Some(("soccer", "eng.1")));
-    }
-
-    #[test]
-    fn test_espn_sport_league_invalid() {
-        assert_eq!(espn_sport_league("invalid"), None);
-        assert_eq!(espn_sport_league("tennis"), None);
-    }
-
-    // ========================================================================
-    // check_cross_platform_arb tests
-    // ========================================================================
-
-    #[test]
-    fn test_check_arb_no_arb() {
-        // Efficient market: no arbitrage
-        let kalshi = make_price(0.48, 0.52);
-        let poly = make_price(0.47, 0.53);
-
-        let result = check_cross_platform_arb(Some(&kalshi), Some(&poly), 1);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_check_arb_missing_platform() {
-        let kalshi = make_price(0.48, 0.52);
-
-        // Need both platforms for cross-platform arb
-        assert!(check_cross_platform_arb(Some(&kalshi), None, 1).is_none());
-        assert!(check_cross_platform_arb(None, Some(&kalshi), 1).is_none());
-        assert!(check_cross_platform_arb(None, None, 1).is_none());
-    }
-
-    #[test]
-    fn test_check_arb_found() {
-        // Arb opportunity: Kalshi YES 48¢ + Poly NO 48¢ = 96¢ < 100¢
-        // Kalshi: bid=50, ask=48 (YES at 48¢)
-        // Poly: bid=54, ask=56 (NO = 1-bid = 46¢, but we need ask)
-        // Actually need: Kalshi ask + (1 - Poly bid) < 100
-        // 48 + (100 - 54) = 48 + 46 = 94 < 100 ✓
-
-        let kalshi = make_price(0.50, 0.48); // YES ask = 48¢
-        let poly = make_price(0.54, 0.56);   // NO ask = 1 - 0.54 = 46¢
-
-        let result = check_cross_platform_arb(Some(&kalshi), Some(&poly), 1);
-        assert!(result.is_some());
-
-        let (mask, profit) = result.unwrap();
-        assert!(profit > 0);
-        assert!(mask != 0);
-    }
-
-    // ========================================================================
-    // MarketPriceData tests
-    // ========================================================================
-
-    #[test]
-    fn test_market_price_data_mid_calculation() {
-        let price = make_price(0.40, 0.60);
-        assert!((price.mid_price - 0.50).abs() < 0.01);
-
-        let price2 = make_price(0.30, 0.35);
-        assert!((price2.mid_price - 0.325).abs() < 0.01);
-    }
-
-    // ========================================================================
-    // fee_for_price tests
-    // ========================================================================
-
-    #[test]
-    fn test_fee_for_price_kalshi() {
-        // Kalshi fees are tiered based on price
-        let fee_low = fee_for_price(Platform::Kalshi, 0.10);
-        let fee_mid = fee_for_price(Platform::Kalshi, 0.50);
-        let fee_high = fee_for_price(Platform::Kalshi, 0.90);
-
-        // Fees should all be positive and reasonable
-        assert!(fee_low > 0.0 && fee_low < 0.10);
-        assert!(fee_mid > 0.0 && fee_mid < 0.10);
-        assert!(fee_high > 0.0 && fee_high < 0.10);
-    }
-
-    #[test]
-    fn test_fee_for_price_polymarket() {
-        // Polymarket charges 2% of price
-        let fee = fee_for_price(Platform::Polymarket, 0.50);
-        assert!((fee - 0.01).abs() < 0.001); // 2% of 0.50 = 0.01
-    }
-
-    #[test]
-    fn test_fee_for_price_clamped() {
-        // Prices should be clamped to 0-1
-        let fee_negative = fee_for_price(Platform::Kalshi, -0.5);
-        let fee_over = fee_for_price(Platform::Kalshi, 1.5);
-
-        assert!(fee_negative >= 0.0);
-        assert!(fee_over >= 0.0);
-    }
-}
+//
+// Tests moved to submodules:
+// - signals/edge.rs: compute_team_net_edge, fee_for_price tests
+// - monitoring/espn.rs: parse_sport, is_overtime, format_time_remaining, check_cross_platform_arb tests
+// - price/matching.rs: find_team_prices, select_best_platform_for_team tests
+//
+// Run all tests with:
+// cargo test --package game_shard_rust
