@@ -821,9 +821,12 @@ impl ZmqListener {
 
             // Publish health status
             if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
+                let instance_id = std::env::var("HOSTNAME").unwrap_or_else(|_| "zmq-listener-1".to_string());
                 let health = serde_json::json!({
                     "service": "zmq_listener_rust",
+                    "instance_id": instance_id,
                     "mode": "observer",
+                    "status": "healthy",
                     "healthy": true,
                     "messages_received": snapshot.messages_received,
                     "messages_logged": snapshot.messages_logged,
