@@ -1,14 +1,14 @@
-//! Signal generation and publishing
+//! Signal generation and publishing (ZMQ-only)
 //!
 //! Modules:
 //! - `edge`: Edge calculation and fee handling
-//! - `emission`: ZMQ-only signal publishing (Phase 3)
-//! - `arbitrage`: Arbitrage signal detection (Phase 3)
-//! - `model_edge`: Model-based signal generation (Phase 3)
+//! - `emission`: Core ZMQ signal publishing
+//! - `arbitrage`: Cross-platform arbitrage signal detection and emission
+//! - `model_edge`: Model-based signal detection and emission
+//! - `latency`: Score-change latency signal detection (disabled by default)
 
 pub mod edge;
-
-// Phase 3+
-// pub mod emission;
-// pub mod arbitrage;
-// pub mod model_edge;
+pub mod emission;
+pub mod arbitrage;
+pub mod model_edge;
+pub mod latency;
