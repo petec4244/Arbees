@@ -8,14 +8,16 @@
 
 use anyhow::{Context, Result};
 use arbees_rust_core::models::{
-    channels, ExecutionRequest, ExecutionSide, MarketType, NotificationEvent, NotificationPriority,
-    NotificationType, Platform, RuleDecision, RuleDecisionType, SignalDirection, SignalType, Sport,
-    TradingSignal, TransportMode,
+    channels, ExecutionRequest, ExecutionResult, ExecutionSide, ExecutionStatus, MarketType,
+    NotificationEvent, NotificationPriority, NotificationType, Platform, RuleDecision,
+    RuleDecisionType, SignalDirection, SignalType, Sport, TradingSignal, TransportMode,
 };
 use arbees_rust_core::redis::RedisBus;
 use arbees_rust_core::utils::matching::match_team_in_text;
 use chrono::{DateTime, Duration, Utc};
 use dotenv::dotenv;
+use execution_service_rust::balance::start_balance_refresh_loop;
+use execution_service_rust::{DailyPnlTracker, ExecutionEngine};
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -272,6 +274,11 @@ struct SignalProcessorState {
     pool: PgPool,
     redis: RedisBus,
 
+    // Inline execution mode (consolidated path)
+    execution_inline: bool,
+    execution_engine: Option<Arc<ExecutionEngine>>,
+    pnl_tracker: Option<Arc<DailyPnlTracker>>,
+
     // Transport configuration
     transport_mode: TransportMode,
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
@@ -301,6 +308,9 @@ impl SignalProcessorState {
         redis: RedisBus,
         transport_mode: TransportMode,
         zmq_pub: Option<Arc<Mutex<PubSocket>>>,
+        execution_inline: bool,
+        execution_engine: Option<Arc<ExecutionEngine>>,
+        pnl_tracker: Option<Arc<DailyPnlTracker>>,
     ) -> Self {
         let mut rejected_counts = HashMap::new();
         for key in &[
@@ -320,6 +330,9 @@ impl SignalProcessorState {
             config,
             pool,
             redis,
+            execution_inline,
+            execution_engine,
+            pnl_tracker,
             transport_mode,
             zmq_pub,
             zmq_seq: Arc::new(AtomicU64::new(0)),
@@ -1261,15 +1274,24 @@ impl SignalProcessorState {
         self.in_flight
             .insert(exec_request.idempotency_key.clone(), Utc::now());
 
-        // Publish to execution channel based on transport mode
-        if self.transport_mode.use_redis() {
-            self.redis
-                .publish(channels::EXECUTION_REQUESTS, &exec_request)
-                .await?;
-        }
+        if self.execution_inline {
+            if let Some(engine) = &self.execution_engine {
+                let result = self.execute_inline_request(engine, exec_request).await;
+                self.publish_execution_result(&result).await;
+            } else {
+                error!("Execution inline enabled but engine not initialized");
+            }
+        } else {
+            // Publish to execution channel based on transport mode
+            if self.transport_mode.use_redis() {
+                self.redis
+                    .publish(channels::EXECUTION_REQUESTS, &exec_request)
+                    .await?;
+            }
 
-        if self.transport_mode.use_zmq() {
-            self.publish_zmq(&exec_request).await;
+            if self.transport_mode.use_zmq() {
+                self.publish_zmq(&exec_request).await;
+            }
         }
 
         self.approved_count += 1;
@@ -1284,6 +1306,42 @@ impl SignalProcessorState {
         );
 
         Ok(())
+    }
+
+    async fn execute_inline_request(
+        &self,
+        engine: &ExecutionEngine,
+        request: ExecutionRequest,
+    ) -> ExecutionResult {
+        inline_execute_request(engine, request).await
+    }
+
+    async fn publish_execution_result(&self, result: &ExecutionResult) {
+        if let Some(pnl_tracker) = &self.pnl_tracker {
+            if result.status == ExecutionStatus::Filled {
+                pnl_tracker.record_pnl(-result.fees).await;
+            }
+        }
+
+        if result.status == ExecutionStatus::Failed {
+            let event = NotificationEvent {
+                event_type: NotificationType::Error,
+                priority: NotificationPriority::Error,
+                data: serde_json::json!({
+                    "service": "signal_processor_rust",
+                    "request_id": result.request_id,
+                    "message": result.rejection_reason.clone().unwrap_or_else(|| "execution_failed".to_string()),
+                }),
+                ts: Some(Utc::now()),
+            };
+            if let Err(e) = self.redis.publish(channels::NOTIFICATION_EVENTS, &event).await {
+                warn!("Failed to publish notification event: {}", e);
+            }
+        }
+
+        if let Err(e) = self.redis.publish(channels::EXECUTION_RESULTS, result).await {
+            error!("Failed to publish execution result: {}", e);
+        }
     }
 
     async fn cleanup_stale_inflight(&mut self) {
@@ -1319,6 +1377,78 @@ impl SignalProcessorState {
                 warn!("Failed to publish execution request via ZMQ: {}", e);
             }
         }
+    }
+}
+
+async fn inline_execute_request(
+    engine: &ExecutionEngine,
+    request: ExecutionRequest,
+) -> ExecutionResult {
+    match engine.execute(request.clone()).await {
+        Ok(res) => res,
+        Err(e) => {
+            error!("Inline execution failed for {}: {}", request.request_id, e);
+            let executed_at = Utc::now();
+            let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
+            ExecutionResult {
+                request_id: request.request_id,
+                idempotency_key: request.idempotency_key,
+                rejection_reason: Some(e.to_string()),
+                status: ExecutionStatus::Failed,
+                order_id: None,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                fees: 0.0,
+                platform: request.platform,
+                market_id: request.market_id,
+                contract_team: request.contract_team,
+                game_id: request.game_id,
+                sport: request.sport,
+                signal_id: request.signal_id,
+                signal_type: request.signal_type,
+                edge_pct: request.edge_pct,
+                side: request.side,
+                requested_at: request.created_at,
+                executed_at,
+                latency_ms,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn test_inline_execute_request_paper() {
+        let engine = ExecutionEngine::with_safeguards(true, None, None, None).await;
+        let request = ExecutionRequest {
+            request_id: Uuid::new_v4().to_string(),
+            idempotency_key: "test_game_team_buy".to_string(),
+            game_id: "test_game".to_string(),
+            sport: Sport::NBA,
+            platform: Platform::Paper,
+            market_id: "test_market".to_string(),
+            contract_team: Some("HOME".to_string()),
+            token_id: None,
+            side: ExecutionSide::Yes,
+            limit_price: 0.55,
+            size: 10.0,
+            signal_id: Uuid::new_v4().to_string(),
+            signal_type: "test".to_string(),
+            edge_pct: 2.0,
+            model_prob: 0.60,
+            market_prob: Some(0.55),
+            reason: "test".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+        };
+
+        let result = inline_execute_request(&engine, request).await;
+        assert_eq!(result.status, ExecutionStatus::Filled);
+        assert_eq!(result.platform, Platform::Paper);
     }
 }
 
@@ -1567,9 +1697,48 @@ async fn main() -> Result<()> {
         config.min_edge_pct, config.max_buy_prob, config.min_sell_prob
     );
 
+    // Inline execution (consolidated path)
+    let execution_inline = env::var("EXECUTION_INLINE")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let paper_trading = env::var("PAPER_TRADING")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true);
+
+    let (execution_engine, pnl_tracker) = if execution_inline {
+        info!("Execution inline enabled - creating execution engine");
+        let engine = ExecutionEngine::with_safeguards(paper_trading, Some(redis.clone()), None, None).await;
+        let idempotency = engine.idempotency_tracker();
+        let _cleanup_task = execution_service_rust::idempotency::start_cleanup_task(idempotency);
+
+        if !paper_trading {
+            let _balance_refresh_task = start_balance_refresh_loop(
+                engine.balance_cache(),
+                engine.kalshi_client(),
+                engine.config().balance_refresh_secs,
+            );
+        }
+
+        (Some(Arc::new(engine)), Some(Arc::new(DailyPnlTracker::new())))
+    } else {
+        (None, None)
+    };
+
     // Initialize state
     let state = Arc::new(RwLock::new(
-        SignalProcessorState::new(config, pool, redis.clone(), transport_mode, zmq_pub).await,
+        SignalProcessorState::new(
+            config,
+            pool,
+            redis.clone(),
+            transport_mode,
+            zmq_pub,
+            execution_inline,
+            execution_engine,
+            pnl_tracker,
+        )
+        .await,
     ));
 
     // Load rules from DB

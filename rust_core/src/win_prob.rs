@@ -961,4 +961,24 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_batch_calculate_win_probs_matches_sequential() {
+        let states = vec![
+            make_nba_state(50, 50, 2, 600),
+            make_nba_state(72, 65, 3, 420),
+            make_nba_state(90, 95, 4, 120),
+        ];
+
+        let batch = batch_calculate_win_probs(&states, true);
+        let sequential: Vec<f64> = states
+            .iter()
+            .map(|state| calculate_win_probability(state, true))
+            .collect();
+
+        assert_eq!(batch.len(), sequential.len());
+        for (b, s) in batch.iter().zip(sequential.iter()) {
+            assert!((b - s).abs() < 1e-9);
+        }
+    }
 }
