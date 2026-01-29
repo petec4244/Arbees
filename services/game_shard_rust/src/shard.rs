@@ -173,6 +173,8 @@ pub struct GameShard {
     started_at: chrono::DateTime<Utc>,
     /// Probability model registry for edge calculation (multi-market support)
     probability_registry: Arc<ProbabilityModelRegistry>,
+    /// Event provider registry for fetching event state (shared across all events)
+    event_provider_registry: Arc<EventProviderRegistry>,
 }
 
 /// Market price data for a specific contract
@@ -328,6 +330,14 @@ impl GameShard {
         // Initialize probability model registry for multi-market support
         let probability_registry = Arc::new(ProbabilityModelRegistry::new());
 
+        // Initialize event provider registry once (shared across all events)
+        // This creates HTTP clients for ESPN, CoinGecko, Binance, Coinbase, etc.
+        let event_provider_registry = Arc::new(EventProviderRegistry::with_defaults());
+        info!(
+            "Event provider registry initialized with {} providers",
+            event_provider_registry.list_providers().len()
+        );
+
         Ok(Self {
             shard_id,
             redis,
@@ -349,6 +359,7 @@ impl GameShard {
             process_id,
             started_at,
             probability_registry,
+            event_provider_registry,
         })
     }
 
@@ -529,8 +540,8 @@ impl GameShard {
             kalshi_id,
         };
 
-        // Create provider and probability registries
-        let provider_registry = Arc::new(EventProviderRegistry::with_defaults());
+        // Use shared provider registry (created once at shard startup)
+        let provider_registry = self.event_provider_registry.clone();
 
         // Create config from environment
         let config = crate::event_monitor::EventMonitorConfig::from_env();
