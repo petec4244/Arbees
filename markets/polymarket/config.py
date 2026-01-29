@@ -83,18 +83,33 @@ def get_polymarket_ws_url(override_url: Optional[str] = None) -> str:
 
 
 def get_polymarket_ws_reconnect_base() -> float:
-    """Base delay (seconds) for WS exponential backoff."""
-    return _get_env_float("POLYMARKET_WS_RECONNECT_BASE", 0.25)
+    """Base delay (seconds) for WS exponential backoff. Default 5s per recommendations."""
+    return _get_env_float("POLYMARKET_WS_RECONNECT_BASE", 5.0)
 
 
 def get_polymarket_ws_reconnect_max() -> float:
-    """Max delay (seconds) for WS exponential backoff."""
-    return _get_env_float("POLYMARKET_WS_RECONNECT_MAX", 30.0)
+    """Max delay (seconds) for WS exponential backoff. Default 2min per recommendations."""
+    return _get_env_float("POLYMARKET_WS_RECONNECT_MAX", 120.0)
 
 
 def get_polymarket_ws_reconnect_jitter() -> float:
     """Jitter percentage (0-1) for WS exponential backoff."""
     return _get_env_float("POLYMARKET_WS_RECONNECT_JITTER", 0.2)
+
+
+def get_polymarket_ws_ping_interval() -> float:
+    """Ping interval (seconds) for WebSocket heartbeat."""
+    return _get_env_float("POLYMARKET_WS_PING_INTERVAL", 30.0)
+
+
+def get_polymarket_ws_ping_timeout() -> float:
+    """Ping timeout (seconds) - close connection if pong not received."""
+    return _get_env_float("POLYMARKET_WS_PING_TIMEOUT", 10.0)
+
+
+def get_polymarket_ws_stale_timeout() -> float:
+    """Stale timeout (seconds) - reconnect if no messages received in this time."""
+    return _get_env_float("POLYMARKET_WS_STALE_TIMEOUT", 60.0)
 
 
 def get_polymarket_api_key() -> Optional[str]:

@@ -141,7 +141,28 @@ async fn main() -> Result<()> {
         error!("Shard heartbeat listener exited unexpectedly");
     }));
 
-    // 3. Market Discovery Listener - with auto-reconnect
+    // 3. Monitor Heartbeats (kalshi_monitor, polymarket_monitor) - with auto-reconnect
+    let sr_clone_hb = service_registry.clone();
+    let redis_bus_clone_hb = redis_bus.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Listening for monitor heartbeats (auto-reconnect enabled)...");
+        let mut stream = redis_bus_clone_hb
+            .subscribe_with_reconnect(vec!["health:heartbeats".to_string()])
+            .into_message_stream();
+
+        while let Some(msg) = stream.next().await {
+            if let Ok(payload_str) = msg.get_payload::<String>() {
+                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+                    if let Err(e) = sr_clone_hb.handle_heartbeat(payload).await {
+                        error!("Failed to handle monitor heartbeat: {}", e);
+                    }
+                }
+            }
+        }
+        error!("Monitor heartbeat listener exited unexpectedly");
+    }));
+
+    // 4. Market Discovery Listener - with auto-reconnect
     let gm_clone2 = game_manager.clone();
     let redis_bus_clone2 = redis_bus.clone();
     tasks.push(tokio::spawn(async move {
@@ -160,7 +181,7 @@ async fn main() -> Result<()> {
         error!("Market discovery listener exited unexpectedly");
     }));
 
-    // 4. Scheduled Sync Loop
+    // 5. Scheduled Sync Loop
     let gm_clone3 = game_manager.clone();
     let sync_interval = config.scheduled_sync_interval_secs;
     tasks.push(tokio::spawn(async move {
@@ -174,7 +195,7 @@ async fn main() -> Result<()> {
         }
     }));
 
-    // 5. Health Check Loop
+    // 6. Health Check Loop
     let sm_clone2 = shard_manager.clone();
     let health_interval = config.health_check_interval_secs;
     tasks.push(tokio::spawn(async move {
@@ -185,7 +206,7 @@ async fn main() -> Result<()> {
         }
     }));
 
-    // 6. Service Resync Loop (for fault tolerance)
+    // 7. Service Resync Loop (for fault tolerance)
     let sr_clone = service_registry.clone();
     let gm_clone4 = game_manager.clone();
     tasks.push(tokio::spawn(async move {
@@ -196,7 +217,7 @@ async fn main() -> Result<()> {
         }
     }));
 
-    // 7. Multi-Market Discovery Loop (for crypto, economics, politics)
+    // 8. Multi-Market Discovery Loop (for crypto, economics, politics)
     if let Some(mm_manager) = multi_market_manager.clone() {
         let mm_interval = config.multi_market_discovery_interval_secs;
         tasks.push(tokio::spawn(async move {
@@ -211,7 +232,7 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // 8. Multi-Market Heartbeat Handler - with auto-reconnect
+    // 9. Multi-Market Heartbeat Handler - with auto-reconnect
     if let Some(mm_manager) = multi_market_manager {
         let redis_bus_clone3 = redis_bus.clone();
         tasks.push(tokio::spawn(async move {
@@ -231,7 +252,7 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // 9. System Monitor - Health checks and critical alerts
+    // 10. System Monitor - Health checks and critical alerts
     let system_monitor_clone = system_monitor.clone();
     let monitor_interval = 30; // Check every 30 seconds
     tasks.push(tokio::spawn(async move {

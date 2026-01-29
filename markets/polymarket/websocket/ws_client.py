@@ -33,16 +33,18 @@ class PolymarketWebSocketClient:
     
     # Default URL (overridden by config)
     WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    # The Rust reference bot pings every 30s using WS ping frames. Polymarket docs
-    # sometimes require more frequent pings; we use 5s to be safe.
-    PING_INTERVAL = 5  # seconds
-    RECONNECT_DELAY_BASE = 1.0  # seconds (legacy default)
-    RECONNECT_DELAY_MAX = 60.0  # seconds (legacy default)
+
+    # Legacy constants (now configured via environment, kept for reference)
+    # PING_INTERVAL: 30s (POLYMARKET_WS_PING_INTERVAL)
+    # PING_TIMEOUT: 10s (POLYMARKET_WS_PING_TIMEOUT)
+    # RECONNECT_BASE: 5s (POLYMARKET_WS_RECONNECT_BASE)
+    # RECONNECT_MAX: 120s (POLYMARKET_WS_RECONNECT_MAX)
+    # STALE_TIMEOUT: 60s (POLYMARKET_WS_STALE_TIMEOUT)
     
     def __init__(self, ws_url: Optional[str] = None):
         """
         Initialize Polymarket WebSocket client.
-        
+
         Args:
             ws_url: Override WebSocket URL (or use POLYMARKET_WS_URL env var)
         """
@@ -50,9 +52,12 @@ class PolymarketWebSocketClient:
             get_polymarket_ws_reconnect_base,
             get_polymarket_ws_reconnect_jitter,
             get_polymarket_ws_reconnect_max,
+            get_polymarket_ws_ping_interval,
+            get_polymarket_ws_ping_timeout,
+            get_polymarket_ws_stale_timeout,
             get_polymarket_ws_url,
         )
-        
+
         self._ws_url = get_polymarket_ws_url(override_url=ws_url)
         self._ws: Optional[WebSocketClientProtocol] = None
         self._subscribed_token_ids: Set[str] = set()
@@ -63,16 +68,27 @@ class PolymarketWebSocketClient:
         self._last_disconnect_at: Optional[float] = None
         self._last_reconnect_at: Optional[float] = None
 
+        # Reconnection settings (exponential backoff: 5s → 10s → 20s → ... → 120s max)
         self._reconnect_base = get_polymarket_ws_reconnect_base()
         self._reconnect_max = get_polymarket_ws_reconnect_max()
         self._reconnect_jitter = max(0.0, min(get_polymarket_ws_reconnect_jitter(), 1.0))
-        
+
+        # Ping/pong and staleness detection settings
+        self._ping_interval = get_polymarket_ws_ping_interval()
+        self._ping_timeout = get_polymarket_ws_ping_timeout()
+        self._stale_timeout = get_polymarket_ws_stale_timeout()
+
+        # Connection health tracking
+        self._last_message_time: Optional[float] = None
+        self._messages_received = 0
+
         # Message queue for async iteration
         self._message_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-        
+
         # Tasks
         self._receive_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
     
     @property
     def subscribed_markets(self) -> Set[str]:
@@ -104,28 +120,37 @@ class PolymarketWebSocketClient:
         if self.is_connected:
             logger.warning("Already connected to Polymarket WebSocket")
             return
-        
+
         try:
             logger.info(f"Connecting to Polymarket WebSocket: {self._ws_url}")
-            
+
             self._ws = await websockets.connect(
                 self._ws_url,
-                ping_interval=None,  # We handle ping ourselves
+                ping_interval=self._ping_interval,
+                ping_timeout=self._ping_timeout,
+                close_timeout=10,
             )
-            
+
             self._running = True
             self._reconnect_count = 0
-            
+            self._last_message_time = time.monotonic()
+            self._messages_received = 0
+
             # Start background tasks
             self._receive_task = asyncio.create_task(self._receive_loop())
             self._ping_task = asyncio.create_task(self._ping_loop())
-            
-            logger.info("Connected to Polymarket WebSocket")
-            
+            self._health_task = asyncio.create_task(self._health_monitor_loop())
+
+            logger.info(
+                f"Connected to Polymarket WebSocket "
+                f"(ping_interval={self._ping_interval}s, ping_timeout={self._ping_timeout}s, "
+                f"stale_timeout={self._stale_timeout}s)"
+            )
+
             # Re-subscribe to markets after reconnect
             if self._subscribed_token_ids:
                 await self._resubscribe_all()
-                
+
         except Exception as e:
             logger.error(f"Failed to connect to Polymarket WebSocket: {e}")
             raise
@@ -134,26 +159,24 @@ class PolymarketWebSocketClient:
         """Disconnect from Polymarket WebSocket."""
         logger.info("Disconnecting from Polymarket WebSocket")
         self._running = False
-        
+
         # Cancel tasks
-        if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
-        
-        if self._ping_task:
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except asyncio.CancelledError:
-                pass
-        
+        for task in [self._receive_task, self._ping_task, self._health_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        self._receive_task = None
+        self._ping_task = None
+        self._health_task = None
+
         # Close connection
         if self._ws and self.is_connected:
             await self._ws.close()
-        
+
         self._ws = None
         logger.info("Disconnected from Polymarket WebSocket")
     
@@ -269,7 +292,11 @@ class PolymarketWebSocketClient:
             async for message in self._ws:
                 if not self._running:
                     break
-                
+
+                # Track message receipt for health monitoring
+                self._last_message_time = time.monotonic()
+                self._messages_received += 1
+
                 try:
                     data = json.loads(message)
 
@@ -289,7 +316,7 @@ class PolymarketWebSocketClient:
                                 logger.warning("Message queue full, dropping Polymarket price update")
                         elif msg_type == "error":
                             logger.error(f"Polymarket WebSocket error: {event}")
-                    
+
                 except json.JSONDecodeError:
                     # Polymarket sometimes sends non-JSON responses like "INVALID OPERATION"
                     # This is usually non-fatal - REST poll fallback handles pricing
@@ -299,7 +326,7 @@ class PolymarketWebSocketClient:
                         logger.warning(f"Invalid JSON from Polymarket WebSocket: {message}")
                 except Exception as e:
                     logger.error(f"Error processing Polymarket WebSocket message: {e}")
-        
+
         except websockets.exceptions.ConnectionClosed:
             close_code = getattr(self._ws, "close_code", None)
             close_reason = getattr(self._ws, "close_reason", None)
@@ -314,18 +341,65 @@ class PolymarketWebSocketClient:
                 asyncio.create_task(self._handle_reconnect())
     
     async def _ping_loop(self) -> None:
-        """Background task to send periodic pings."""
+        """Background task to send periodic pings (backup - websockets library handles this too)."""
         while self._running:
             try:
-                await asyncio.sleep(self.PING_INTERVAL)
-                
+                await asyncio.sleep(self._ping_interval)
+
                 if self.is_connected:
-                    # Send a WS ping frame (matches Rust bot behavior)
-                    await self._ws.ping()
-                    logger.debug("Sent ping to Polymarket")
-            
+                    # Send a WS ping frame (backup ping in case library ping fails)
+                    try:
+                        await self._ws.ping()
+                        logger.debug("Sent ping to Polymarket")
+                    except Exception as ping_err:
+                        logger.warning(f"Ping failed: {ping_err}")
+
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Error in Polymarket ping loop: {e}")
+
+    async def _health_monitor_loop(self) -> None:
+        """
+        Background task to monitor connection health.
+
+        Detects stale connections (no messages received for stale_timeout seconds)
+        and triggers reconnection.
+        """
+        check_interval = min(self._stale_timeout / 2, 15.0)  # Check at most every 15s
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+
+                if not self._running:
+                    break
+
+                # Only check staleness if we have subscriptions
+                if not self._subscribed_token_ids:
+                    continue
+
+                # Check for stale connection
+                if self._last_message_time is not None:
+                    elapsed = time.monotonic() - self._last_message_time
+                    if elapsed > self._stale_timeout:
+                        logger.warning(
+                            f"Polymarket WebSocket stale: no messages for {elapsed:.1f}s "
+                            f"(threshold={self._stale_timeout}s, subscriptions={len(self._subscribed_token_ids)})"
+                        )
+                        if self._running and not self._reconnect_in_progress:
+                            self._last_disconnect_at = time.monotonic()
+                            asyncio.create_task(self._handle_reconnect())
+                    elif elapsed > self._stale_timeout / 2:
+                        logger.debug(
+                            f"Polymarket WS health: last message {elapsed:.1f}s ago "
+                            f"(msgs={self._messages_received})"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in health monitor loop: {e}")
     
     async def _handle_reconnect(self) -> None:
         """Handle WebSocket reconnection with exponential backoff + jitter."""
@@ -334,8 +408,19 @@ class PolymarketWebSocketClient:
 
         self._reconnect_in_progress = True
         try:
+            # Cancel existing tasks before reconnect
+            for task in [self._receive_task, self._ping_task, self._health_task]:
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+
             while self._running:
                 self._reconnect_count += 1
+
+                # Exponential backoff: 5s → 10s → 20s → 40s → 80s → 120s (capped)
                 base_delay = min(
                     self._reconnect_base * (2 ** max(self._reconnect_count - 1, 0)),
                     self._reconnect_max,
@@ -346,8 +431,8 @@ class PolymarketWebSocketClient:
                 delay = min(base_delay * jitter, self._reconnect_max)
 
                 logger.info(
-                    f"Reconnecting to Polymarket WebSocket in {delay:.2f}s "
-                    f"(attempt {self._reconnect_count})"
+                    f"Reconnecting to Polymarket WebSocket in {delay:.1f}s "
+                    f"(attempt {self._reconnect_count}, base={self._reconnect_base}s, max={self._reconnect_max}s)"
                 )
                 await asyncio.sleep(delay)
 
@@ -358,19 +443,22 @@ class PolymarketWebSocketClient:
                             await self._ws.close()
                         except Exception:
                             pass
+                        self._ws = None
 
-                    # Reconnect
+                    # Reconnect (this restarts receive/ping/health tasks)
                     await self.connect()
                     self._last_reconnect_at = time.monotonic()
+
                     if self._last_disconnect_at is not None:
                         reconnect_time = self._last_reconnect_at - self._last_disconnect_at
                         logger.info(
-                            f"Polymarket WS reconnected in {reconnect_time:.2f}s "
-                            f"(attempts={self._reconnect_count})"
+                            f"Polymarket WS reconnected in {reconnect_time:.1f}s "
+                            f"(attempts={self._reconnect_count}, subscriptions={len(self._subscribed_token_ids)})"
                         )
                     return
+
                 except Exception as e:
-                    logger.error(f"Polymarket reconnect failed: {e}")
+                    logger.error(f"Polymarket reconnect attempt {self._reconnect_count} failed: {e}")
         finally:
             self._reconnect_in_progress = False
     
