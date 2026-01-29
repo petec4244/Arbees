@@ -7,6 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 
 /// Unified cryptocurrency price data structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,10 @@ pub struct VolatilityResult {
 ///
 /// Implementations must be Send + Sync for use in async contexts.
 /// All methods are async and return Results to handle network/API errors.
+///
+/// Note: `get_price` and `calculate_volatility` return boxed futures to prevent
+/// stack overflow when used in deeply nested async call chains (e.g., ChainedPriceProvider
+/// with multiple fallback providers).
 #[async_trait]
 pub trait CryptoPriceProvider: Send + Sync {
     /// Get the provider's display name (e.g., "Binance", "Coinbase", "CoinGecko")
@@ -93,13 +99,18 @@ pub trait CryptoPriceProvider: Send + Sync {
 
     /// Get current price for a single coin
     ///
+    /// Returns a boxed future to prevent stack overflow in nested async contexts.
+    ///
     /// # Arguments
     /// * `coin_id` - Can be a symbol (BTC) or provider-specific ID
     ///
     /// # Returns
     /// * `Ok(CryptoPrice)` - Current price data
     /// * `Err` - If the coin is not found or API error
-    async fn get_price(&self, coin_id: &str) -> Result<CryptoPrice>;
+    fn get_price<'a>(
+        &'a self,
+        coin_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CryptoPrice>> + Send + 'a>>;
 
     /// Get prices for multiple coins at once
     ///
@@ -130,7 +141,7 @@ pub trait CryptoPriceProvider: Send + Sync {
 
     /// Calculate historical volatility for a coin
     ///
-    /// Default implementation uses get_historical_prices and computes log returns.
+    /// Returns a boxed future to prevent stack overflow in nested async contexts.
     ///
     /// # Arguments
     /// * `coin_id` - Symbol or provider-specific ID
@@ -139,8 +150,21 @@ pub trait CryptoPriceProvider: Send + Sync {
     /// # Returns
     /// * `Ok(VolatilityResult)` - Volatility data
     /// * `Err` - If insufficient data or API error
-    async fn calculate_volatility(&self, coin_id: &str, days: u32) -> Result<VolatilityResult> {
-        let prices = self.get_historical_prices(coin_id, days).await?;
+    fn calculate_volatility<'a>(
+        &'a self,
+        coin_id: &'a str,
+        days: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<VolatilityResult>> + Send + 'a>>;
+}
+
+/// Default implementation for calculate_volatility using historical prices
+pub fn default_calculate_volatility<'a, P: CryptoPriceProvider + ?Sized>(
+    provider: &'a P,
+    coin_id: &'a str,
+    days: u32,
+) -> Pin<Box<dyn Future<Output = Result<VolatilityResult>> + Send + 'a>> {
+    Box::pin(async move {
+        let prices = provider.get_historical_prices(coin_id, days).await?;
 
         if prices.len() < 2 {
             anyhow::bail!("Insufficient price data for volatility calculation");
@@ -194,13 +218,13 @@ pub trait CryptoPriceProvider: Send + Sync {
         let daily_volatility = std_dev * periods_per_day.sqrt();
 
         Ok(VolatilityResult {
-            coin_id: self.symbol_to_id(coin_id),
+            coin_id: provider.symbol_to_id(coin_id),
             annualized_volatility,
             daily_volatility,
             periods_used: log_returns.len() as u32,
             calculated_at: Utc::now(),
         })
-    }
+    })
 }
 
 #[cfg(test)]

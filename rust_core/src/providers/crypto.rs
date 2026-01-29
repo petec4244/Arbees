@@ -14,6 +14,8 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -347,44 +349,67 @@ impl CryptoEventProvider {
     }
 
     /// Enrich a market with live price data
-    async fn enrich_with_price(&self, market: &CryptoMarket) -> Result<EventState> {
-        // Get current price from chained provider (Coinbase → Binance → CoinGecko)
-        let price = self.price_provider.get_price(&market.asset).await?;
+    ///
+    /// Returns a boxed future to prevent stack overflow in deeply nested async call chains.
+    /// Uses tokio::spawn to run price and volatility fetches in parallel, which also
+    /// breaks the call chain depth by executing on separate tasks.
+    fn enrich_with_price<'a>(
+        &'a self,
+        market: &'a CryptoMarket,
+    ) -> Pin<Box<dyn Future<Output = Result<EventState>> + Send + 'a>> {
+        Box::pin(async move {
+            // Spawn price and volatility fetches in parallel on separate tasks.
+            // This breaks the call chain depth and runs both operations concurrently.
+            let price_provider = self.price_provider.clone();
+            let asset = market.asset.clone();
 
-        // Calculate volatility
-        let volatility = self
-            .price_provider
-            .calculate_volatility(&market.asset, 30)
-            .await
-            .map(|v| v.daily_volatility)
-            .unwrap_or(0.03); // Default 3% daily vol
+            let price_handle = tokio::spawn(async move { price_provider.get_price(&asset).await });
 
-        Ok(EventState {
-            event_id: market.market_id.clone(),
-            market_type: MarketType::Crypto {
-                asset: market.asset.clone(),
-                prediction_type: market.prediction_type,
-            },
-            entity_a: market.asset.clone(),
-            entity_b: None,
-            status: market.status,
-            state: StateData::Crypto(CryptoStateData {
-                current_price: price.current_price,
-                target_price: market.target_price,
-                target_date: market.target_date,
-                volatility_24h: volatility,
-                volume_24h: Some(price.volume_24h),
-                metadata: serde_json::json!({
-                    "market_cap": price.market_cap,
-                    "high_24h": price.high_24h,
-                    "low_24h": price.low_24h,
-                    "price_source": price.source,
-                    "yes_price": market.yes_price,
-                    "no_price": market.no_price,
-                    "platform": market.platform,
+            let price_provider2 = self.price_provider.clone();
+            let asset2 = market.asset.clone();
+
+            let volatility_handle = tokio::spawn(async move {
+                price_provider2.calculate_volatility(&asset2, 30).await
+            });
+
+            // Await both in parallel
+            let price = price_handle
+                .await
+                .context("Price fetch task panicked")??;
+
+            let volatility = volatility_handle
+                .await
+                .context("Volatility fetch task panicked")?
+                .map(|v| v.daily_volatility)
+                .unwrap_or(0.03); // Default 3% daily vol
+
+            Ok(EventState {
+                event_id: market.market_id.clone(),
+                market_type: MarketType::Crypto {
+                    asset: market.asset.clone(),
+                    prediction_type: market.prediction_type,
+                },
+                entity_a: market.asset.clone(),
+                entity_b: None,
+                status: market.status,
+                state: StateData::Crypto(CryptoStateData {
+                    current_price: price.current_price,
+                    target_price: market.target_price,
+                    target_date: market.target_date,
+                    volatility_24h: volatility,
+                    volume_24h: Some(price.volume_24h),
+                    metadata: serde_json::json!({
+                        "market_cap": price.market_cap,
+                        "high_24h": price.high_24h,
+                        "low_24h": price.low_24h,
+                        "price_source": price.source,
+                        "yes_price": market.yes_price,
+                        "no_price": market.no_price,
+                        "platform": market.platform,
+                    }),
                 }),
-            }),
-            fetched_at: Utc::now(),
+                fetched_at: Utc::now(),
+            })
         })
     }
 }

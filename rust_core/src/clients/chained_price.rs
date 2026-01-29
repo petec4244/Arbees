@@ -12,6 +12,8 @@ use super::crypto_price::{CryptoPrice, CryptoPriceProvider, ProviderStatus, Vola
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -102,45 +104,50 @@ impl CryptoPriceProvider for ChainedPriceProvider {
             .unwrap_or_else(|| symbol.to_string())
     }
 
-    async fn get_price(&self, coin_id: &str) -> Result<CryptoPrice> {
-        let mut last_error: Option<anyhow::Error> = None;
+    fn get_price<'a>(
+        &'a self,
+        coin_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CryptoPrice>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut last_error: Option<anyhow::Error> = None;
 
-        for provider in &self.providers {
-            // Skip providers with bad status
-            if self.should_skip(provider.as_ref()) {
-                debug!(
-                    "Skipping {} (status: {:?})",
-                    provider.provider_name(),
-                    provider.status()
-                );
-                continue;
-            }
-
-            match provider.get_price(coin_id).await {
-                Ok(price) => {
+            for provider in &self.providers {
+                // Skip providers with bad status
+                if self.should_skip(provider.as_ref()) {
                     debug!(
-                        "Got price for {} from {} (${:.2})",
-                        coin_id,
+                        "Skipping {} (status: {:?})",
                         provider.provider_name(),
-                        price.current_price
+                        provider.status()
                     );
-                    return Ok(price);
+                    continue;
                 }
-                Err(e) => {
-                    warn!(
-                        "{} failed for {}: {}",
-                        provider.provider_name(),
-                        coin_id,
-                        e
-                    );
-                    last_error = Some(e);
-                    // Continue to next provider
+
+                match provider.get_price(coin_id).await {
+                    Ok(price) => {
+                        debug!(
+                            "Got price for {} from {} (${:.2})",
+                            coin_id,
+                            provider.provider_name(),
+                            price.current_price
+                        );
+                        return Ok(price);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "{} failed for {}: {}",
+                            provider.provider_name(),
+                            coin_id,
+                            e
+                        );
+                        last_error = Some(e);
+                        // Continue to next provider
+                    }
                 }
             }
-        }
 
-        // All providers failed
-        Err(last_error.unwrap_or_else(|| anyhow!("No providers available for {}", coin_id)))
+            // All providers failed
+            Err(last_error.unwrap_or_else(|| anyhow!("No providers available for {}", coin_id)))
+        })
     }
 
     async fn get_prices(&self, coin_ids: &[&str]) -> Result<Vec<CryptoPrice>> {
@@ -231,39 +238,45 @@ impl CryptoPriceProvider for ChainedPriceProvider {
         }))
     }
 
-    async fn calculate_volatility(&self, coin_id: &str, days: u32) -> Result<VolatilityResult> {
-        let mut last_error: Option<anyhow::Error> = None;
+    fn calculate_volatility<'a>(
+        &'a self,
+        coin_id: &'a str,
+        days: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<VolatilityResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut last_error: Option<anyhow::Error> = None;
 
-        for provider in &self.providers {
-            if self.should_skip(provider.as_ref()) {
-                continue;
+            for provider in &self.providers {
+                if self.should_skip(provider.as_ref()) {
+                    continue;
+                }
+
+                match provider.calculate_volatility(coin_id, days).await {
+                    Ok(vol) => {
+                        debug!(
+                            "Got volatility for {} from {}: {:.2}%",
+                            coin_id,
+                            provider.provider_name(),
+                            vol.annualized_volatility * 100.0
+                        );
+                        return Ok(vol);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "{} volatility calc failed for {}: {}",
+                            provider.provider_name(),
+                            coin_id,
+                            e
+                        );
+                        last_error = Some(e);
+                    }
+                }
             }
 
-            match provider.calculate_volatility(coin_id, days).await {
-                Ok(vol) => {
-                    debug!(
-                        "Got volatility for {} from {}: {:.2}%",
-                        coin_id,
-                        provider.provider_name(),
-                        vol.annualized_volatility * 100.0
-                    );
-                    return Ok(vol);
-                }
-                Err(e) => {
-                    warn!(
-                        "{} volatility calc failed for {}: {}",
-                        provider.provider_name(),
-                        coin_id,
-                        e
-                    );
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            anyhow!("No providers available for volatility: {}", coin_id)
-        }))
+            Err(last_error.unwrap_or_else(|| {
+                anyhow!("No providers available for volatility: {}", coin_id)
+            }))
+        })
     }
 }
 
@@ -302,35 +315,40 @@ impl CryptoPriceProvider for CoinGeckoClientAdapter {
         CoinGeckoClient::symbol_to_id(symbol).to_string()
     }
 
-    async fn get_price(&self, coin_id: &str) -> Result<CryptoPrice> {
-        match self.client.get_price(coin_id).await {
-            Ok(price) => {
-                *self.status.write().unwrap() = ProviderStatus::Healthy;
-                Ok(CryptoPrice {
-                    id: price.id,
-                    symbol: price.symbol.to_uppercase(),
-                    name: price.name,
-                    current_price: price.current_price,
-                    high_24h: price.high_24h,
-                    low_24h: price.low_24h,
-                    price_change_24h: price.price_change_24h,
-                    price_change_percentage_24h: price.price_change_percentage_24h,
-                    volume_24h: price.total_volume,
-                    market_cap: Some(price.market_cap),
-                    last_updated: Utc::now(),
-                    source: "CoinGecko".to_string(),
-                })
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("429") || err_str.contains("rate") {
-                    *self.status.write().unwrap() = ProviderStatus::RateLimited;
-                } else {
-                    *self.status.write().unwrap() = ProviderStatus::Error;
+    fn get_price<'a>(
+        &'a self,
+        coin_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CryptoPrice>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.client.get_price(coin_id).await {
+                Ok(price) => {
+                    *self.status.write().unwrap() = ProviderStatus::Healthy;
+                    Ok(CryptoPrice {
+                        id: price.id,
+                        symbol: price.symbol.to_uppercase(),
+                        name: price.name,
+                        current_price: price.current_price,
+                        high_24h: price.high_24h,
+                        low_24h: price.low_24h,
+                        price_change_24h: price.price_change_24h,
+                        price_change_percentage_24h: price.price_change_percentage_24h,
+                        volume_24h: price.total_volume,
+                        market_cap: Some(price.market_cap),
+                        last_updated: Utc::now(),
+                        source: "CoinGecko".to_string(),
+                    })
                 }
-                Err(e)
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("429") || err_str.contains("rate") {
+                        *self.status.write().unwrap() = ProviderStatus::RateLimited;
+                    } else {
+                        *self.status.write().unwrap() = ProviderStatus::Error;
+                    }
+                    Err(e)
+                }
             }
-        }
+        })
     }
 
     async fn get_prices(&self, coin_ids: &[&str]) -> Result<Vec<CryptoPrice>> {
@@ -381,15 +399,21 @@ impl CryptoPriceProvider for CoinGeckoClientAdapter {
         Ok(prices)
     }
 
-    async fn calculate_volatility(&self, coin_id: &str, days: u32) -> Result<VolatilityResult> {
-        let vol = self.client.calculate_volatility(coin_id, days).await?;
+    fn calculate_volatility<'a>(
+        &'a self,
+        coin_id: &'a str,
+        days: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<VolatilityResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let vol = self.client.calculate_volatility(coin_id, days).await?;
 
-        Ok(VolatilityResult {
-            coin_id: vol.coin_id,
-            annualized_volatility: vol.annualized_volatility,
-            daily_volatility: vol.daily_volatility,
-            periods_used: vol.days_used,
-            calculated_at: vol.calculated_at,
+            Ok(VolatilityResult {
+                coin_id: vol.coin_id,
+                annualized_volatility: vol.annualized_volatility,
+                daily_volatility: vol.daily_volatility,
+                periods_used: vol.days_used,
+                calculated_at: vol.calculated_at,
+            })
         })
     }
 }

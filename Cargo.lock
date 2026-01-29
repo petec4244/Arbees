@@ -3687,6 +3687,7 @@ dependencies = [
  "chrono",
  "dotenv",
  "env_logger",
+ "execution_service_rust",
  "futures-util",
  "hostname",
  "log",
