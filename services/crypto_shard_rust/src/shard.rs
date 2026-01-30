@@ -66,6 +66,7 @@ pub struct ShardStats {
     pub model_signals: Arc<AtomicU64>,
     pub execution_requests_sent: Arc<AtomicU64>,
     pub risk_blocks: Arc<AtomicU64>,
+    pub stale_price_warnings: Arc<AtomicU64>,
 }
 
 impl ShardStats {
@@ -77,6 +78,7 @@ impl ShardStats {
             model_signals: Arc::new(AtomicU64::new(0)),
             execution_requests_sent: Arc::new(AtomicU64::new(0)),
             risk_blocks: Arc::new(AtomicU64::new(0)),
+            stale_price_warnings: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -88,6 +90,7 @@ impl ShardStats {
             model_signals: self.model_signals.load(Ordering::Relaxed),
             execution_requests_sent: self.execution_requests_sent.load(Ordering::Relaxed),
             risk_blocks: self.risk_blocks.load(Ordering::Relaxed),
+            stale_price_warnings: self.stale_price_warnings.load(Ordering::Relaxed),
         }
     }
 }
@@ -106,6 +109,7 @@ pub struct ShardStatsSnapshot {
     pub model_signals: u64,
     pub execution_requests_sent: u64,
     pub risk_blocks: u64,
+    pub stale_price_warnings: u64,
 }
 
 impl CryptoShard {
@@ -331,12 +335,13 @@ impl CryptoShard {
             if stats_log_counter % 12 == 0 {  // Log every ~60s (if poll_interval_secs=5)
                 let snapshot = self.stats.snapshot();
                 info!(
-                    "CryptoShard stats: events={}, arb_signals={}, model_signals={}, exec_sent={}, risk_blocks={}",
+                    "CryptoShard stats: events={}, arb_signals={}, model_signals={}, exec_sent={}, risk_blocks={}, stale_warnings={}",
                     snapshot.events_monitored,
                     snapshot.arbitrage_signals,
                     snapshot.model_signals,
                     snapshot.execution_requests_sent,
-                    snapshot.risk_blocks
+                    snapshot.risk_blocks,
+                    snapshot.stale_price_warnings
                 );
             }
         }
@@ -552,7 +557,11 @@ impl CryptoShard {
             // Check for stale prices
             let price_staleness = Duration::from_secs(self.config.price_staleness_secs);
             if asset_prices.iter().all(|p| p.is_stale(price_staleness)) {
-                warn!("Stale prices for event {}", event_id);
+                let warning_count = self.stats.stale_price_warnings.fetch_add(1, Ordering::Relaxed);
+                // Rate limit: only log every 100 stale price events
+                if warning_count % 100 == 0 {
+                    warn!("Stale prices for event {} (logged {} stale price events)", event_id, warning_count + 1);
+                }
                 continue;
             }
 

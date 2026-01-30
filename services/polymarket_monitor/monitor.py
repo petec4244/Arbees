@@ -113,9 +113,13 @@ class PolymarketMonitor:
         """Initialize connections and start monitoring."""
         logger.info("Starting PolymarketMonitor...")
 
-        # Verify VPN before anything else
-        await self._verify_vpn()
-        self._health_ok = True
+        # Verify VPN (non-blocking - log warning if it fails)
+        try:
+            await self._verify_vpn()
+            self._health_ok = True
+        except Exception as e:
+            logger.warning(f"VPN verification failed on startup (continuing anyway): {e}")
+            self._health_ok = False
 
         # Connect to Redis
         await self.redis.connect()
@@ -265,9 +269,6 @@ class PolymarketMonitor:
             # Update active mapping even if we're already subscribed; orchestrator may be correcting IDs.
             self._active_by_game_type[(str(game_id), str(market_type))] = str(condition_id)
 
-            if condition_id in self.subscribed_conditions:
-                continue
-
             try:
                 await self._subscribe_to_market(condition_id, game_id, market_type)
             except Exception as e:
@@ -286,11 +287,13 @@ class PolymarketMonitor:
 
         Simplified: Only fetch token IDs, don't parse outcomes or store metadata.
         Team names are inferred from token prices themselves.
+
+        Gracefully skips markets that don't exist on CLOB (may be Gamma-only or not yet synced).
         """
         # Fetch market to get token IDs
         market = await self.poly_client.get_market(condition_id)
         if not market:
-            logger.warning(f"Market not found: {condition_id}")
+            logger.debug(f"Market not found on CLOB (may be Gamma-only or not yet synced): {condition_id}")
             return
 
         # Get token IDs (may be in clobTokenIds or resolve from market)
@@ -415,25 +418,6 @@ class PolymarketMonitor:
             last_trade_price=price.last_trade_price,
         )
 
-        # region agent log
-        if normalized_price.yes_ask >= 0.99 or normalized_price.yes_bid <= 0.01:
-            self._agent_dbg(
-                "H1",
-                "services/polymarket_monitor/monitor.py:_handle_price_update",
-                "published_extreme_price",
-                {
-                    "game_id": game_id,
-                    "condition_id": condition_id,
-                    "contract_team": contract_team,
-                    "yes_bid": float(normalized_price.yes_bid),
-                    "yes_ask": float(normalized_price.yes_ask),
-                    "mid": float(normalized_price.mid_price),
-                    "market_title": normalized_price.market_title,
-                    "source": "ws",
-                },
-            )
-        # endregion
-
         # PRIMARY: Publish to ZMQ (hot path - always)
         await self._publish_zmq_price(condition_id, game_id, normalized_price)
 
@@ -445,9 +429,9 @@ class PolymarketMonitor:
         self._last_price_time = datetime.utcnow()
 
         logger.debug(
-            f"Published Polymarket price: {condition_id[:12]}... team='{contract_team}' "
+            f"Published Polymarket price: {condition_id[:12]}... "
             f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
-            f"game={game_id} (zmq=yes, redis={self._redis_publish_prices})"
+            f"game={game_id}"
         )
 
     async def _publish_zmq_price(self, condition_id: str, game_id: str, price: MarketPrice):
@@ -655,7 +639,7 @@ class PolymarketMonitor:
                         "ws_ok": ws_ok,
                     })
                     self._heartbeat_publisher.update_metrics({
-                        "subscribed_markets": float(len(self.subscribed_conditions)),
+                        "subscribed_markets": float(len(self.subscribed_tokens)),
                         "prices_published": float(self._prices_published),
                         "last_price_age_s": staleness_s,
                     })
@@ -671,7 +655,7 @@ class PolymarketMonitor:
                     "type": "POLYMARKET_MONITOR_HEALTH",
                     "service": "polymarket_monitor",
                     "healthy": True,
-                    "subscribed_markets": len(self.subscribed_conditions),
+                    "subscribed_markets": len(self.subscribed_tokens),
                     "prices_published": self._prices_published,
                     "timestamp": datetime.utcnow().isoformat(),
                 })

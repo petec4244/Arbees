@@ -471,9 +471,9 @@ class PolymarketClient(BaseMarketClient):
             if e.status == 404:
                 logger.debug(f"Market not found in CLOB for condition_id: {condition_id}")
             else:
-                logger.warning(f"CLOB API error for {condition_id}: {e}")
+                logger.debug(f"CLOB API error for {condition_id}: {e}")
         except Exception as e:
-            logger.warning(f"Error fetching market from CLOB by condition_id {condition_id}: {e}")
+            logger.debug(f"Error fetching market from CLOB by condition_id {condition_id}: {e}")
 
         # Fallback: search Gamma API (slower, but covers more cases)
         try:

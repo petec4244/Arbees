@@ -32,6 +32,9 @@ pub struct EventAssignment {
     pub kalshi_market_id: Option<String>,
     pub polymarket_market_id: Option<String>,
     pub assigned_at: DateTime<Utc>,
+    pub target_price: Option<f64>,
+    pub target_date: Option<DateTime<Utc>>,
+    pub metadata: serde_json::Value,
 }
 
 /// Multi-market manager for Crypto, Economics, and Politics
@@ -184,7 +187,14 @@ impl MultiMarketManager {
             }
         };
 
-        // Create assignment
+        // Extract target_price and target_date for assignment storage
+        let target_price = event.metadata
+            .get("target_price")
+            .and_then(|v| v.as_f64());
+
+        let target_date = event.scheduled_time;
+
+        // Create assignment with all necessary fields for republishing
         let assignment = EventAssignment {
             event_id: event.event_id.clone(),
             market_type: event.market_type.clone(),
@@ -194,6 +204,9 @@ impl MultiMarketManager {
             kalshi_market_id: kalshi_id.clone(),
             polymarket_market_id: polymarket_id.clone(),
             assigned_at: Utc::now(),
+            target_price,
+            target_date: Some(target_date),
+            metadata: event.metadata.clone(),
         };
 
         // Construct market IDs by type
@@ -210,10 +223,7 @@ impl MultiMarketManager {
         }
 
         // Send command to shard
-        let target_price = event.metadata
-            .get("target_price")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let target_price_val = target_price.unwrap_or(0.0);
 
         debug!(
             "Event metadata for {}: {:?}",
@@ -222,7 +232,7 @@ impl MultiMarketManager {
         );
         debug!(
             "Extracted target_price for {}: {}",
-            event.event_id, target_price
+            event.event_id, target_price_val
         );
 
         let command = serde_json::json!({
@@ -231,7 +241,7 @@ impl MultiMarketManager {
             "market_type": event.market_type,
             "entity_a": event.entity_a,
             "entity_b": event.entity_b,
-            "target_price": target_price,
+            "target_price": target_price_val,
             "target_date": event.scheduled_time.to_rfc3339(),
             "kalshi_market_id": kalshi_id,
             "polymarket_market_id": polymarket_id,
@@ -318,14 +328,54 @@ impl MultiMarketManager {
             })
             .unwrap_or_default();
 
-        let mut assignments = self.assignments.write().await;
-        let mut events_to_remove = Vec::new();
-        let mut missing_count = 0;
+        let assignments = self.assignments.read().await;
 
+        // Find all events assigned to this shard
+        let mut events_for_shard = Vec::new();
         for (event_id, assignment) in assignments.iter() {
-            if assignment.shard_id == shard_id && !reported_events.contains(event_id) {
-                missing_count += 1;
-                events_to_remove.push(event_id.clone());
+            if assignment.shard_id == shard_id {
+                events_for_shard.push(assignment.clone());
+            }
+        }
+        drop(assignments);
+
+        // If shard has events but reports 0 events, it likely reconnected and lost state
+        // Republish all assigned events to the shard
+        if !events_for_shard.is_empty() && reported_events.is_empty() {
+            info!(
+                "Detected shard {} reconnection with {} assigned events - republishing",
+                shard_id,
+                events_for_shard.len()
+            );
+
+            if let Ok(mut conn) = self.redis.get_async_connection().await {
+                for assignment in events_for_shard {
+                    let target_price_val = assignment.target_price.unwrap_or(0.0);
+                    let target_date_str = assignment
+                        .target_date
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| (Utc::now() + chrono::Duration::hours(24)).to_rfc3339());
+
+                    let command = serde_json::json!({
+                        "type": "add_event",
+                        "event_id": assignment.event_id,
+                        "market_type": assignment.market_type,
+                        "entity_a": assignment.entity_a,
+                        "entity_b": assignment.entity_b,
+                        "target_price": target_price_val,
+                        "target_date": target_date_str,
+                        "kalshi_market_id": assignment.kalshi_market_id,
+                        "polymarket_market_id": assignment.polymarket_market_id,
+                        "metadata": serde_json::json!(assignment.metadata),
+                    });
+
+                    let channel = format!("shard:{}:command", shard_id);
+                    if let Err(e) = conn.publish::<_, _, ()>(channel, command.to_string()).await {
+                        error!("Failed to republish event {} to shard {}: {}", assignment.event_id, shard_id, e);
+                    }
+                }
+            } else {
+                error!("Failed to connect to Redis for republishing events to shard {}", shard_id);
             }
         }
 
@@ -333,22 +383,6 @@ impl MultiMarketManager {
         // This was too aggressive and removed events immediately after assignment
         // TODO: Implement grace period (e.g., require 3 consecutive heartbeats with missing events)
         // before removing, to account for race conditions between assignment and heartbeat reporting.
-
-        // Rate limit missing event warnings: only log every 1000
-        /*
-        if missing_count > 0 && missing_count % 1000 == 0 {
-            warn!(
-                "Missing {} events from shard {} report (total affected: {})",
-                missing_count % 1000,
-                shard_id,
-                events_to_remove.len()
-            );
-        }
-
-        for event_id in events_to_remove {
-            assignments.remove(&event_id);
-        }
-        */
     }
 
     /// Get statistics about current assignments
@@ -399,6 +433,9 @@ mod tests {
             kalshi_market_id: Some("KBTC-100K".to_string()),
             polymarket_market_id: None,
             assigned_at: Utc::now(),
+            target_price: Some(50000.0),
+            target_date: Some(Utc::now() + chrono::Duration::days(1)),
+            metadata: serde_json::json!({}),
         };
 
         let json = serde_json::to_string(&assignment).unwrap();
