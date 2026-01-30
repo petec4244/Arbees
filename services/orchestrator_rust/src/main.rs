@@ -279,7 +279,9 @@ async fn main() -> Result<()> {
             .into_message_stream();
 
         while let Some(msg) = stream.next().await {
+            debug!("Received message on startup_state_request stream");
             if let Ok(payload_str) = msg.get_payload::<String>() {
+                info!("Parsed startup state request payload: {}", payload_str);
                 if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str) {
                     // Get monitor_type from request
                     if let Some(monitor_type) = payload.get("monitor_type").and_then(|v| v.as_str()) {

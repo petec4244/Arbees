@@ -268,6 +268,10 @@ class KalshiMonitor:
 
         logger.info("KalshiMonitor started successfully")
 
+        # Start Redis listener loop BEFORE requesting startup state
+        # (so subscription callbacks are processed when responses arrive)
+        await self.redis.start_listening()
+
         # REQUEST CURRENT ASSIGNMENTS FROM ORCHESTRATOR ON STARTUP
         # This ensures that if the monitor was restarted, it recovers assignments
         # without waiting for new discoveries (which could take minutes)
@@ -318,30 +322,74 @@ class KalshiMonitor:
             responses_received = []
 
             async def collect_response(data: dict):
+                logger.info(f"Received response from orchestrator: {data}")
                 responses_received.append(data)
 
             await self.redis.subscribe(response_channel, collect_response)
 
-            # Send startup state request
-            await self.redis.publish(request_channel, {
-                "monitor_type": "kalshi",
-                "timestamp": asyncio.get_event_loop().time(),
-            })
+            # Retry logic: Try up to 3 times with 2-second delays to ensure orchestrator is subscribed
+            max_retries = 3
+            for attempt in range(max_retries):
+                # Send startup state request as JSON string (not msgpack)
+                request_payload = {
+                    "monitor_type": "kalshi",
+                    "timestamp": asyncio.get_event_loop().time(),
+                }
+                request_json = json.dumps(request_payload)
+                logger.info(f"Publishing startup state request (attempt {attempt + 1}/{max_retries}) to {request_channel}: {request_json}")
+                # Publish as raw string to Redis (not through RedisBus which uses msgpack)
+                await self.redis._client.publish(request_channel, request_json)
 
-            # Wait for response with 10-second timeout
-            start_time = asyncio.get_event_loop().time()
-            while not responses_received and asyncio.get_event_loop().time() - start_time < 10:
-                await asyncio.sleep(0.1)
+                # Wait for response with 5-second timeout per attempt
+                start_time = asyncio.get_event_loop().time()
+                while not responses_received and asyncio.get_event_loop().time() - start_time < 5:
+                    await asyncio.sleep(0.1)
 
-            if responses_received:
-                assignments = responses_received[0]
-                logger.info(f"Received {len(assignments.get('markets', []))} Kalshi market assignments from orchestrator")
+                if responses_received:
+                    response = responses_received[0]
+                    markets = response.get("markets", [])
+                    logger.info(f"Received {len(markets)} Kalshi market assignments from orchestrator")
 
-                # Process each assignment immediately
-                for assignment in assignments.get("markets", []):
-                    await self._handle_assignment(assignment)
-            else:
-                logger.warning("No startup state response from orchestrator (timeout after 10s)")
+                    # Group markets by event_id and convert to assignment message format
+                    assignments_by_event = {}
+                    for market in markets:
+                        event_id = market.get("event_id")
+                        kalshi_market_id = market.get("kalshi_market_id")
+                        market_type = market.get("market_type", {})
+                        entity_a = market.get("entity_a")
+
+                        if not event_id or not kalshi_market_id:
+                            continue
+
+                        if event_id not in assignments_by_event:
+                            assignments_by_event[event_id] = {
+                                "type": "kalshi_assign",
+                                "event_id": event_id,
+                                "market_type": market_type.get("type", "crypto"),
+                                "markets": [],
+                            }
+
+                        # Add market to this event's assignment
+                        assignments_by_event[event_id]["markets"].append({
+                            "ticker": kalshi_market_id,
+                            "market_id": kalshi_market_id,
+                            "market_type": market_type.get("type", "crypto"),
+                            "team_name": entity_a,  # For crypto, this is the asset (BTC, ETH, etc.)
+                        })
+
+                    # Process each grouped assignment immediately
+                    for event_id, assignment in assignments_by_event.items():
+                        await self._handle_assignment(assignment)
+
+                    logger.info(f"Processed {len(assignments_by_event)} grouped market assignments")
+                    return  # Success, exit
+
+                # If not the last attempt, wait before retrying
+                if attempt < max_retries - 1:
+                    logger.debug(f"No response received, waiting 2 seconds before retry...")
+                    await asyncio.sleep(2)
+
+            logger.warning("No startup state response from orchestrator after 3 attempts (will wait for assignment listener)")
         except Exception as e:
             logger.warning(f"Failed to request startup state: {e} (will wait for assignment listener)")
 
@@ -357,9 +405,7 @@ class KalshiMonitor:
 
         logger.info("Assignment listener subscribed, waiting for market assignments from orchestrator...")
 
-        # Start the listener (runs in background)
-        await self.redis.start_listening()
-
+        # (Listener already started in start() method before _request_startup_state())
         # Keep this task alive while running
         while self._running:
             await asyncio.sleep(1)
@@ -463,6 +509,8 @@ class KalshiMonitor:
         """Stream prices from Kalshi WebSocket and publish to Redis."""
         logger.info("Starting price streaming loop...")
         idle_log_counter = 0
+        prices_received_count = 0
+        prices_published_count = 0
 
         while self._running:
             try:
@@ -483,9 +531,11 @@ class KalshiMonitor:
                     await asyncio.sleep(5)
                     continue
 
-                logger.debug(f"Streaming prices for {len(self.subscribed_tickers)} Kalshi markets")
+                logger.info(f"Starting to stream prices for {len(self.subscribed_tickers)} Kalshi markets")
 
                 async for price in self.kalshi_ws.stream_prices():
+                    prices_received_count += 1
+
                     if not self._running:
                         break
 
@@ -494,7 +544,18 @@ class KalshiMonitor:
                         logger.warning("WebSocket disconnected during streaming")
                         break
 
+                    # Log every 100 prices received
+                    if prices_received_count % 100 == 0:
+                        logger.info(f"[INSTRUMENTATION] Received {prices_received_count} prices from Kalshi WS, published {prices_published_count}")
+
+                    prev_published = self._prices_published
                     await self._handle_price_update(price)
+
+                    # Check if price was actually published
+                    if self._prices_published > prev_published:
+                        prices_published_count += 1
+                        if prices_published_count % 100 == 0:
+                            logger.info(f"[INSTRUMENTATION] Successfully published {prices_published_count} prices to ZMQ")
 
             except RuntimeError as e:
                 if "Not connected" in str(e):
@@ -535,6 +596,7 @@ class KalshiMonitor:
         # Drop stale markets: only publish if ticker is in the active set for this (game_id, market_type)
         active_set = self._active_by_game_type.get((str(game_id), str(market_type)))
         if active_set and ticker not in active_set:
+            logger.debug(f"[INSTRUMENTATION] Filtering out price for {ticker} - not in active set for ({game_id}, {market_type})")
             return
 
         # Get metadata
@@ -579,7 +641,8 @@ class KalshiMonitor:
     async def _publish_zmq_price(self, ticker: str, game_id: str, price: MarketPrice):
         """Publish price to ZMQ PUB socket (primary hot path)."""
         try:
-            topic = f"prices.kalshi.{ticker}".encode()
+            topic_str = f"prices.kalshi.{ticker}"
+            topic = topic_str.encode()
             envelope = {
                 "seq": self._zmq_seq,
                 "timestamp_ms": int(time.time() * 1000),
@@ -587,22 +650,22 @@ class KalshiMonitor:
                 "payload": {
                     "market_id": price.market_id,
                     "platform": "kalshi",
-                    "game_id": game_id,
-                    "contract_team": price.contract_team,
+                    "asset": price.contract_team,  # Renamed: contract_team -> asset (matches crypto_shard IncomingCryptoPrice)
                     "yes_bid": price.yes_bid,
                     "yes_ask": price.yes_ask,
                     "mid_price": price.mid_price,
                     "yes_bid_size": price.yes_bid_size,
                     "yes_ask_size": price.yes_ask_size,
-                    "volume": price.volume,
                     "liquidity": price.liquidity,
                     "timestamp": price.timestamp.isoformat() if price.timestamp else None,
                 },
             }
             self._zmq_seq += 1
             await self._zmq_pub.send_multipart([topic, json.dumps(envelope).encode()])
+            if self._zmq_seq % 1000 == 0:
+                logger.info(f"[INSTRUMENTATION] Published ZMQ price to topic '{topic_str}': {ticker} bid={price.yes_bid:.4f} ask={price.yes_ask:.4f}")
         except Exception as e:
-            logger.warning(f"Failed to publish to ZMQ: {e}")
+            logger.error(f"[INSTRUMENTATION] Failed to publish to ZMQ: {e}")
 
     async def _health_check_loop(self):
         """Periodic health checks."""

@@ -1224,7 +1224,12 @@ fn is_polymarket_directional(title: &str) -> bool {
                        t.contains("up/down") ||
                        t.contains("updown");
 
+    if !has_direction {
+        return false;
+    }
+
     // Check for timeframe indicators (15m, hourly, 4h, etc.)
+    // Also match time range patterns like "4:00pm-4:15pm" or "4:00PM-4:15PM ET"
     let has_timeframe = t.contains("15m") ||
                        t.contains("15-min") ||
                        t.contains("15 min") ||
@@ -1232,9 +1237,13 @@ fn is_polymarket_directional(title: &str) -> bool {
                        t.contains("hour") ||
                        t.contains("4h") ||
                        t.contains("4-hour") ||
-                       t.contains("4 hour");
+                       t.contains("4 hour") ||
+                       // Match time patterns like "4:00pm-4:15pm" (with or without AM/PM/ET)
+                       regex::Regex::new(r"\d{1,2}:\d{2}(?:am|pm)?\s*-\s*\d{1,2}:\d{2}(?:am|pm)?")
+                           .map(|re| re.is_match(&t))
+                           .unwrap_or(false);
 
-    has_direction && has_timeframe
+    has_timeframe
 }
 
 /// Check if text contains asset as a whole word (not part of another word)

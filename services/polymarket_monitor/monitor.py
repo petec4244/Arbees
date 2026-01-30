@@ -170,6 +170,10 @@ class PolymarketMonitor:
 
         logger.info("PolymarketMonitor started successfully")
 
+        # Start Redis listener loop BEFORE requesting startup state
+        # (so subscription callbacks are processed when responses arrive)
+        await self.redis.start_listening()
+
         # REQUEST CURRENT ASSIGNMENTS FROM ORCHESTRATOR ON STARTUP
         # This ensures that if the monitor was restarted, it recovers assignments
         # without waiting for new discoveries (which could take minutes)
@@ -247,30 +251,71 @@ class PolymarketMonitor:
             responses_received = []
 
             async def collect_response(data: dict):
+                logger.info(f"Received response from orchestrator: {data}")
                 responses_received.append(data)
 
             await self.redis.subscribe(response_channel, collect_response)
 
-            # Send startup state request
-            await self.redis.publish(request_channel, {
-                "monitor_type": "polymarket",
-                "timestamp": asyncio.get_event_loop().time(),
-            })
+            # Retry logic: Try up to 3 times with 2-second delays to ensure orchestrator is subscribed
+            max_retries = 3
+            for attempt in range(max_retries):
+                # Send startup state request as JSON string (not msgpack)
+                request_payload = {
+                    "monitor_type": "polymarket",
+                    "timestamp": asyncio.get_event_loop().time(),
+                }
+                request_json = json.dumps(request_payload)
+                logger.info(f"Publishing startup state request (attempt {attempt + 1}/{max_retries}) to {request_channel}: {request_json}")
+                # Publish as raw string to Redis (not through RedisBus which uses msgpack)
+                await self.redis._client.publish(request_channel, request_json)
 
-            # Wait for response with 10-second timeout
-            start_time = asyncio.get_event_loop().time()
-            while not responses_received and asyncio.get_event_loop().time() - start_time < 10:
-                await asyncio.sleep(0.1)
+                # Wait for response with 5-second timeout per attempt
+                start_time = asyncio.get_event_loop().time()
+                while not responses_received and asyncio.get_event_loop().time() - start_time < 5:
+                    await asyncio.sleep(0.1)
 
-            if responses_received:
-                assignments = responses_received[0]
-                logger.info(f"Received {len(assignments.get('markets', []))} Polymarket market assignments from orchestrator")
+                if responses_received:
+                    response = responses_received[0]
+                    markets = response.get("markets", [])
+                    logger.info(f"Received {len(markets)} Polymarket market assignments from orchestrator")
 
-                # Process each assignment immediately
-                for assignment in assignments.get("markets", []):
-                    await self._handle_assignment(assignment)
-            else:
-                logger.warning("No startup state response from orchestrator (timeout after 10s)")
+                    # Group markets by event_id and convert to assignment message format
+                    assignments_by_event = {}
+                    for market in markets:
+                        event_id = market.get("event_id")
+                        polymarket_market_id = market.get("polymarket_market_id")
+                        market_type = market.get("market_type", {})
+
+                        if not event_id or not polymarket_market_id:
+                            continue
+
+                        if event_id not in assignments_by_event:
+                            assignments_by_event[event_id] = {
+                                "type": "polymarket_assign",
+                                "event_id": event_id,
+                                "market_type": market_type.get("type", "crypto"),
+                                "markets": [],
+                            }
+
+                        # Add market to this event's assignment
+                        assignments_by_event[event_id]["markets"].append({
+                            "condition_id": polymarket_market_id,
+                            "market_type": market_type.get("type", "crypto"),
+                        })
+
+                    # Process each grouped assignment immediately
+                    for event_id, assignment in assignments_by_event.items():
+                        await self._handle_assignment(assignment)
+
+                    logger.info(f"Processed {len(assignments_by_event)} grouped market assignments")
+                    return  # Success, exit
+
+                # If not the last attempt, wait before retrying
+                if attempt < max_retries - 1:
+                    logger.debug(f"No response received, waiting 2 seconds before retry...")
+                    await asyncio.sleep(2)
+
+            logger.warning("No startup state response from orchestrator after 3 attempts (5s timeout each)")
 
         except Exception as e:
             logger.warning(f"Failed to request startup state: {e}")
@@ -287,8 +332,7 @@ class PolymarketMonitor:
 
         logger.info("Assignment listener subscribed, waiting for market assignments from orchestrator...")
 
-        # Start the listener
-        await self.redis.start_listening()
+        # (Listener already started in start() method before _request_startup_state())
 
     async def _handle_assignment(self, data: dict):
         """Handle a market assignment message from Orchestrator."""
@@ -398,6 +442,8 @@ class PolymarketMonitor:
         """Stream prices from Polymarket WebSocket and publish to Redis."""
         logger.info("Starting price streaming loop...")
         idle_log_counter = 0
+        prices_received_count = 0
+        prices_published_count = 0
 
         while self._running:
             try:
@@ -413,13 +459,26 @@ class PolymarketMonitor:
                 idle_log_counter = 0  # Reset when we have tokens
 
                 token_ids = list(self.subscribed_tokens)
-                logger.info(f"Streaming prices for {len(token_ids)} Polymarket markets")
+                logger.info(f"Starting to stream prices for {len(token_ids)} Polymarket markets")
 
                 async for price in self.poly_client.stream_prices(token_ids):
+                    prices_received_count += 1
+
                     if not self._running:
                         break
 
+                    # Log every 100 prices received
+                    if prices_received_count % 100 == 0:
+                        logger.info(f"[INSTRUMENTATION] Received {prices_received_count} prices from Polymarket WS, published {prices_published_count}")
+
+                    prev_published = self._prices_published
                     await self._handle_price_update(price)
+
+                    # Check if price was actually published
+                    if self._prices_published > prev_published:
+                        prices_published_count += 1
+                        if prices_published_count % 100 == 0:
+                            logger.info(f"[INSTRUMENTATION] Successfully published {prices_published_count} prices to ZMQ")
 
             except asyncio.CancelledError:
                 break
@@ -495,14 +554,12 @@ class PolymarketMonitor:
                 "payload": {
                     "market_id": price.market_id,
                     "platform": "polymarket",
-                    "game_id": game_id,
-                    "contract_team": price.contract_team,
+                    "asset": price.contract_team,  # Renamed: contract_team -> asset (matches crypto_shard IncomingCryptoPrice)
                     "yes_bid": price.yes_bid,
                     "yes_ask": price.yes_ask,
                     "mid_price": price.mid_price,
                     "yes_bid_size": price.yes_bid_size,
                     "yes_ask_size": price.yes_ask_size,
-                    "volume": price.volume,
                     "liquidity": price.liquidity,
                     "timestamp": price.timestamp.isoformat() if price.timestamp else None,
                 },

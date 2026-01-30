@@ -8,9 +8,9 @@ use crate::price::data::{CryptoPriceData, IncomingCryptoPrice};
 use crate::types::ZmqEnvelope;
 use anyhow::Result;
 use chrono::Utc;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc};
@@ -141,13 +141,19 @@ impl CryptoPriceListener {
         // Note: These subscriptions will work even if no publishers are connected yet
         // ZMQ will buffer/match messages once publishers connect
         if let Err(e) = socket.subscribe("prices.kalshi").await {
-            warn!("Failed to subscribe to prices.kalshi: {}", e);
+            error!("[INSTRUMENTATION] Failed to subscribe to prices.kalshi: {}", e);
+        } else {
+            info!("[INSTRUMENTATION] Successfully subscribed to prices.kalshi");
         }
         if let Err(e) = socket.subscribe("prices.poly").await {
-            warn!("Failed to subscribe to prices.poly: {}", e);
+            error!("[INSTRUMENTATION] Failed to subscribe to prices.poly: {}", e);
+        } else {
+            info!("[INSTRUMENTATION] Successfully subscribed to prices.poly");
         }
         if let Err(e) = socket.subscribe("crypto.prices").await {
-            warn!("Failed to subscribe to crypto.prices: {}", e);
+            error!("[INSTRUMENTATION] Failed to subscribe to crypto.prices: {}", e);
+        } else {
+            info!("[INSTRUMENTATION] Successfully subscribed to crypto.prices");
         }
         info!("Subscription setup complete (will receive prices.kalshi.*, prices.poly.*, crypto.prices.*)");
 
@@ -188,20 +194,47 @@ impl CryptoPriceListener {
             return;
         }
 
-        let _topic = String::from_utf8_lossy(parts[0].as_ref());
+        let topic = String::from_utf8_lossy(parts[0].as_ref());
         let payload_bytes = parts[1].as_ref();
 
+        // Log EVERY topic for 5 seconds after startup to diagnose delivery
+        let count_before = self.prices_received.load(Ordering::Relaxed);
+        if count_before < 500 {
+            info!("[INSTRUMENTATION] Message #{}: topic='{}' ({} bytes payload)", count_before, topic, payload_bytes.len());
+        } else if count_before % 100 == 99 {
+            debug!("[INSTRUMENTATION] Received message on topic: {}", topic);
+        }
+
         // Parse envelope
+        let count_before = self.prices_received.load(Ordering::Relaxed);
         let envelope: ZmqEnvelope<IncomingCryptoPrice> = match serde_json::from_slice(payload_bytes)
         {
             Ok(e) => e,
             Err(e) => {
-                debug!("Failed to parse incoming crypto price: {}", e);
+                // Log parse errors at INFO to diagnose issues
+                if count_before < 20 {
+                    let json_str = String::from_utf8_lossy(payload_bytes);
+                    info!("[INSTRUMENTATION] Parse error on message #{}: topic='{}'\n  Error: {}\n  JSON (first 1000 chars): {}",
+                        count_before, topic, e,
+                        if json_str.len() > 1000 { &json_str[..1000] } else { &json_str }
+                    );
+                } else if topic.to_string().starts_with("prices.kalshi") || topic.to_string().starts_with("prices.poly") {
+                    if count_before % 100 == 0 {
+                        info!("[INSTRUMENTATION] Kalshi/Poly parse error (msg #{}): {}", count_before, e);
+                    }
+                } else {
+                    debug!("Failed to parse incoming crypto price: {}", e);
+                }
                 return;
             }
         };
 
         let incoming = envelope.payload;
+
+        // Log successful parse for first few Kalshi messages
+        if topic.to_string().contains("kalshi") && count_before < 10 {
+            info!("[INSTRUMENTATION] ✓ Parsed Kalshi message #{}: asset={} platform={}", count_before, incoming.asset, incoming.platform);
+        }
 
         // Calculate latency
         let now_ms = Utc::now().timestamp_millis();
@@ -218,6 +251,20 @@ impl CryptoPriceListener {
 
         // Update statistics
         let count = self.prices_received.fetch_add(1, Ordering::Relaxed);
+
+        // ALWAYS log for first 5 messages regardless of source
+        if count < 5 {
+            info!("[INSTRUMENTATION] ✓ Stored price #{}: asset={} platform={} bid={:.4} ask={:.4} (topic={})",
+                count, price_data.asset, price_data.platform, price_data.yes_bid, price_data.yes_ask, topic);
+        }
+
+        // Log every 100 prices to track flow
+        if count % 100 == 0 {
+            info!(
+                "[INSTRUMENTATION] Received {} prices total. Latest: {}|{} bid={:.4} ask={:.4} (topic={})",
+                count, price_data.asset, price_data.platform, price_data.yes_bid, price_data.yes_ask, topic
+            );
+        }
 
         // Log latency periodically
         if count % self.config.latency_log_interval == 0 {

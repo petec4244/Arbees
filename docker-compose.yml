@@ -160,6 +160,11 @@ services:
         condition: service_started
     env_file:
       - .env
+    environment:
+      # Crypto market filtering: Only 15-minute intraday markets
+      # Set to "true" to include all crypto timeframes (KXBTC daily, KXBTCW weekly, etc.)
+      # Default "false": Only INXBTC/INXETH 15-minute markets (fastest arbitrage opportunities)
+      CRYPTO_ALLOW_ALL_TIMEFRAMES: "${CRYPTO_ALLOW_ALL_TIMEFRAMES:-false}"
     # NOTE: No volume mount for Rust orchestrator - binary is compiled in image
     # Mount Docker socket only if supervisor functionality is needed
     # volumes:
@@ -262,9 +267,9 @@ services:
       # ZMQ price subscriptions: Direct ZMQ feeds (hot path, not Redis)
       # Endpoints:
       #   - kalshi_monitor:5555 (Kalshi prediction markets)
+      #   - vpn:5556 (Polymarket 15-min directional markets - via VPN service)
       #   - crypto-spot-monitor:5560 (Coinbase/Binance spot prices)
-      #   - crypto-zmq-bridge:5564 (Polymarket via bridge)
-      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://crypto-spot-monitor:5560,tcp://crypto-zmq-bridge:5564"
+      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556,tcp://crypto-spot-monitor:5560"
       CRYPTO_EXECUTION_PUB_ENDPOINT: "tcp://0.0.0.0:5559"
       # Risk management
       CRYPTO_MIN_EDGE_PCT: "3.0"
