@@ -387,7 +387,12 @@ impl CryptoShard {
         let channel = format!("shard:{}:heartbeat", shard_id);
 
         loop {
-            let event_count = events.read().await.len();
+            let events_lock = events.read().await;
+            let event_count = events_lock.len();
+            // Collect event IDs for orchestrator zombie detection
+            let event_ids: Vec<String> = events_lock.keys().cloned().collect();
+            drop(events_lock);
+
             let snapshot = stats.snapshot();
 
             // Shard type for orchestrator routing
@@ -397,6 +402,10 @@ impl CryptoShard {
                 "shard_id": shard_id,
                 "shard_type": shard_type,
                 "event_count": event_count,
+                // Include event IDs for orchestrator zombie detection
+                // Service registry checks both "events" and "games" fields
+                "events": event_ids,
+                "max_games": 1000, // Crypto shards have high capacity
                 "timestamp": Utc::now().to_rfc3339(),
                 "status": "healthy",
                 "metrics": {

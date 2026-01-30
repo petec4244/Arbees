@@ -175,7 +175,12 @@ impl ServiceRegistry {
                     state.metrics.insert("max_games".to_string(), max_games.clone());
                 }
 
-                if let Some(games) = payload.get("games").and_then(|v| v.as_array()) {
+                // Check both "games" (for game shards) and "events" (for crypto shards)
+                if let Some(games) = payload
+                    .get("games")
+                    .or_else(|| payload.get("events"))
+                    .and_then(|v| v.as_array())
+                {
                     let reported_games: HashSet<String> = games
                         .iter()
                         .filter_map(|v| v.as_str().map(String::from))

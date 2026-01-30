@@ -201,6 +201,32 @@ services:
       - full
 
   # ==========================================================================
+  # Crypto ZMQ Bridge - Polymarket prices from VPN to arbees-network
+  # ==========================================================================
+  # Polymarket monitor runs behind VPN (network_mode: "service:vpn")
+  # Publishes to tcp://polymarket_monitor:5556 (unreachable from arbees-network)
+  # This bridge subscribes from VPN and republishes on arbees-network
+  # crypto_shard subscribes to this bridge at tcp://crypto-zmq-bridge:5564
+  # ==========================================================================
+  crypto-zmq-bridge:
+    build:
+      context: ./services/crypto_zmq_bridge
+      dockerfile: Dockerfile
+    container_name: arbees-crypto-zmq-bridge
+    environment:
+      LOG_LEVEL: "INFO"
+      POLYMARKET_ZMQ_ENDPOINT: "tcp://vpn:5556"
+      BRIDGE_PUB_ENDPOINT: "tcp://0.0.0.0:5564"
+    depends_on:
+      - polymarket_monitor
+    expose:
+      - "5564"
+    restart: unless-stopped
+    profiles:
+      - full
+      - crypto
+
+  # ==========================================================================
   # Crypto Shard - Self-contained crypto arbitrage service
   # ==========================================================================
   # Monitors crypto events and emits execution requests via ZMQ
@@ -221,17 +247,20 @@ services:
         condition: service_healthy
       crypto-spot-monitor:
         condition: service_started
+      crypto-zmq-bridge:
+        condition: service_started
     env_file:
       - .env
     environment:
       RUST_LOG: info
       SHARD_TYPE: "crypto"
       CRYPTO_SHARD_ID: "crypto_1"
-      # ZMQ price subscriptions: Spot prices primary, Kalshi secondary (optional if not running)
-      # Subscribe to Kalshi and spot prices
-      # Note: polymarket_monitor is behind VPN network and unreachable via hostname
-      # To add polymarket, create a separate service on arbees-network that bridges from VPN
-      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://crypto-spot-monitor:5560"
+      # ZMQ price subscriptions: Direct ZMQ feeds (hot path, not Redis)
+      # Endpoints:
+      #   - kalshi_monitor:5555 (Kalshi prediction markets)
+      #   - crypto-spot-monitor:5560 (Coinbase/Binance spot prices)
+      #   - crypto-zmq-bridge:5564 (Polymarket via bridge)
+      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://crypto-spot-monitor:5560,tcp://crypto-zmq-bridge:5564"
       CRYPTO_EXECUTION_PUB_ENDPOINT: "tcp://0.0.0.0:5559"
       # Risk management
       CRYPTO_MIN_EDGE_PCT: "3.0"
