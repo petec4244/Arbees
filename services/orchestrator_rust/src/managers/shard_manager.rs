@@ -28,10 +28,13 @@ impl ShardManager {
         }
     }
 
-    /// Get the best shard for assignment (any type)
-    /// Filters by: GameShard/CryptoShard type, Healthy status, Circuit Closed, Has Capacity
+    /// Get the best shard for assignment (GameShard only)
+    /// Filters by: GameShard type, Healthy status, Circuit Closed, Has Capacity
     pub async fn get_best_shard(&self) -> Option<ShardInfo> {
-        let healthy_shards = self.service_registry.get_healthy_shards().await;
+        let healthy_shards = self
+            .service_registry
+            .get_healthy_shards_by_type(ServiceType::GameShard)
+            .await;
         self.select_best_from_shards(healthy_shards)
     }
 

@@ -10,10 +10,10 @@ use anyhow::Result;
 use chrono::Utc;
 use log::{debug, info, warn};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
 /// Listens to ZMQ price feeds and maintains in-memory cache
@@ -28,8 +28,22 @@ pub struct CryptoPriceListener {
     /// Statistics: prices received
     pub prices_received: Arc<AtomicU64>,
 
+    /// Rate limiter for high latency warnings (log every 1000)
+    high_latency_warnings: Arc<AtomicU64>,
+
+    /// Channel for notifying when prices are updated (for event-driven evaluation)
+    pub price_update_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<PriceUpdate>>>>,
+
     /// Configuration
     pub config: ListenerConfig,
+}
+
+/// Signal sent when prices are updated
+#[derive(Debug, Clone)]
+pub struct PriceUpdate {
+    pub asset: String,
+    pub platform: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +82,16 @@ impl CryptoPriceListener {
             zmq_sub_endpoints,
             prices,
             prices_received,
+            high_latency_warnings: Arc::new(AtomicU64::new(0)),
+            price_update_tx: Arc::new(tokio::sync::Mutex::new(None)),
             config: ListenerConfig::default(),
         }
+    }
+
+    /// Set the price update notification channel
+    pub async fn set_price_update_notifier(&self, tx: mpsc::UnboundedSender<PriceUpdate>) {
+        let mut channel = self.price_update_tx.lock().await;
+        *channel = Some(tx);
     }
 
     pub fn with_config(mut self, config: ListenerConfig) -> Self {
@@ -205,12 +227,25 @@ impl CryptoPriceListener {
             );
         }
 
-        // Warn if latency is excessive
+        // Warn if latency is excessive (rate limited: every 1000 warnings)
         if latency_ms > 1000 {
-            warn!(
-                "High crypto price latency: {}ms for {} on {}",
-                latency_ms, price_data.asset, price_data.platform
-            );
+            let count = self.high_latency_warnings.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % 1000 == 0 {
+                warn!(
+                    "High crypto price latency: {}ms for {} on {} (1000th warning)",
+                    latency_ms, price_data.asset, price_data.platform
+                );
+            }
+        }
+
+        // Notify event-driven monitor if registered
+        let channel = self.price_update_tx.lock().await;
+        if let Some(ref tx) = *channel {
+            let _ = tx.send(PriceUpdate {
+                asset: price_data.asset.clone(),
+                platform: price_data.platform.clone(),
+                count: count + 1,
+            });
         }
     }
 

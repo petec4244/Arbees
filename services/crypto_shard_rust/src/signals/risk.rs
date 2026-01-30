@@ -25,6 +25,9 @@ pub struct CryptoRiskChecker {
     /// Statistics tracking
     pub trades_validated: Arc<AtomicU64>,
     pub trades_blocked: Arc<AtomicU64>,
+
+    /// Rate limiter for volatility scaling logs (log every 1000 events)
+    volatility_log_count: Arc<AtomicU64>,
 }
 
 impl CryptoRiskChecker {
@@ -47,6 +50,7 @@ impl CryptoRiskChecker {
             min_liquidity,
             trades_validated: Arc::new(AtomicU64::new(0)),
             trades_blocked: Arc::new(AtomicU64::new(0)),
+            volatility_log_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -98,10 +102,15 @@ impl CryptoRiskChecker {
         if self.volatility_scaling && volatility_factor > 1.5 {
             let original = adjusted_size;
             adjusted_size *= 0.7; // Reduce by 30% in high volatility
-            info!(
-                "Volatility scaling for {}: {} -> {} (factor: {:.2})",
-                asset, original, adjusted_size, volatility_factor
-            );
+
+            // Rate limit logging: only log every 1000 volatility scaling events
+            let count = self.volatility_log_count.fetch_add(1, Ordering::Relaxed);
+            if count % 1000 == 0 {
+                info!(
+                    "Volatility scaling for {}: {} -> {} (factor: {:.2})",
+                    asset, original, adjusted_size, volatility_factor
+                );
+            }
         }
 
         // Check 6: Asset exposure limit
@@ -243,6 +252,7 @@ mod tests {
             min_liquidity: 50.0,
             trades_validated: Arc::new(AtomicU64::new(0)),
             trades_blocked: Arc::new(AtomicU64::new(0)),
+            volatility_log_count: Arc::new(AtomicU64::new(0)),
         }
     }
 

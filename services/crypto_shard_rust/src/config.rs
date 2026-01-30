@@ -32,6 +32,7 @@ pub struct CryptoShardConfig {
     pub poll_interval_secs: u64,
     pub price_staleness_secs: u64,
     pub heartbeat_interval_secs: u64,
+    pub event_driven_evaluation: bool,
 
     // Database
     pub database_url: String,
@@ -103,9 +104,14 @@ impl CryptoShardConfig {
 
             model_min_confidence,
 
-            poll_interval_secs: parse_u64("CRYPTO_POLL_INTERVAL_SECS", 30)?,
-            price_staleness_secs: parse_u64("CRYPTO_PRICE_STALENESS_SECS", 60)?,
+            poll_interval_secs: parse_u64("CRYPTO_POLL_INTERVAL_SECS", 5)?,
+            price_staleness_secs: parse_u64("CRYPTO_PRICE_STALENESS_SECS", 10)?,
             heartbeat_interval_secs: parse_u64("CRYPTO_HEARTBEAT_INTERVAL_SECS", 5)?,
+
+            event_driven_evaluation: env::var("CRYPTO_EVENT_DRIVEN_EVALUATION")
+                .unwrap_or_else(|_| "true".to_string())
+                .to_lowercase()
+                .parse()?,
 
             database_url,
         })

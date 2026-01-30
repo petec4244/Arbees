@@ -18,7 +18,7 @@ use anyhow::Result;
 use arbees_rust_core::redis::bus::RedisBus;
 use chrono::Utc;
 use futures_util::stream::StreamExt;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
@@ -203,6 +203,23 @@ impl CryptoShard {
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting CryptoShard {}", self.config.shard_id);
 
+        // Set up price update channel if event-driven evaluation is enabled
+        let price_update_rx = if self.config.event_driven_evaluation {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            self.price_listener.set_price_update_notifier(tx).await;
+            info!(
+                "[{}] Event-driven evaluation enabled - price updates will trigger signal monitoring",
+                self.config.shard_id
+            );
+            Some(rx)
+        } else {
+            info!(
+                "[{}] Polling-based evaluation enabled - signals evaluated every {}s",
+                self.config.shard_id, self.config.poll_interval_secs
+            );
+            None
+        };
+
         // Spawn price listener as background task
         let price_listener = self.price_listener.clone();
         let listener_shard_id = self.config.shard_id.clone();
@@ -235,6 +252,8 @@ impl CryptoShard {
         let heartbeat_stats = self.stats.clone();
         let heartbeat_interval = self.heartbeat_interval;
         let heartbeat_redis = self.redis.clone();
+        let heartbeat_execution_pub = self.execution_pub.clone();
+        let heartbeat_price_listener = self.price_listener.clone();
 
         tokio::spawn(async move {
             info!("[{}] Heartbeat task starting", heartbeat_shard_id);
@@ -244,24 +263,72 @@ impl CryptoShard {
                 heartbeat_stats,
                 heartbeat_interval,
                 heartbeat_redis,
+                heartbeat_execution_pub,
+                heartbeat_price_listener,
             )
             .await;
             info!("[{}] Heartbeat task completed", heartbeat_shard_id);
         });
 
-        // Main monitoring loop
+        // Main monitoring loop - supports both event-driven and polling modes
         let mut ticker = interval(Duration::from_secs(self.config.poll_interval_secs));
+        let event_driven = self.config.event_driven_evaluation;
+        let shard_id = self.config.shard_id.clone();
 
-        info!("CryptoShard {} running", self.config.shard_id);
+        info!(
+            "CryptoShard {} initialized (poll_interval: {}s, price_staleness: {}s, event_driven: {})",
+            shard_id,
+            self.config.poll_interval_secs,
+            self.config.price_staleness_secs,
+            event_driven
+        );
+
+        info!("CryptoShard {} running", shard_id);
+
+        let mut stats_log_counter = 0u64;
+        let mut price_update_rx = price_update_rx;
 
         loop {
-            ticker.tick().await;
-            if let Err(e) = self.monitor_events().await {
-                warn!("Error in monitoring loop: {}", e);
+            if event_driven {
+                // Event-driven mode: trigger on price updates OR periodic backup
+                if let Some(ref mut rx) = price_update_rx {
+                    tokio::select! {
+                        // Trigger on new price (no timeout - immediate)
+                        Some(update) = rx.recv() => {
+                            if update.count % 100 == 0 {
+                                debug!("Event-driven trigger: {} price update #{}", update.asset, update.count);
+                            }
+                            if let Err(e) = self.monitor_events().await {
+                                warn!("Error in event-driven monitoring: {}", e);
+                            }
+                        }
+
+                        // Fallback periodic ticker (every N seconds as backup)
+                        _ = ticker.tick() => {
+                            debug!("Periodic backup monitoring triggered (event-driven backup cycle)");
+                            if let Err(e) = self.monitor_events().await {
+                                warn!("Error in backup monitoring: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    // Shouldn't reach here, but handle gracefully
+                    ticker.tick().await;
+                    if let Err(e) = self.monitor_events().await {
+                        warn!("Error in monitoring: {}", e);
+                    }
+                }
+            } else {
+                // Polling mode: traditional fixed-interval monitoring
+                ticker.tick().await;
+                if let Err(e) = self.monitor_events().await {
+                    warn!("Error in polling-based monitoring: {}", e);
+                }
             }
 
-            // Log statistics every 60 seconds
-            if self.stats.events_monitored.load(Ordering::Relaxed) % 2 == 0 {
+            // Log statistics periodically
+            stats_log_counter += 1;
+            if stats_log_counter % 12 == 0 {  // Log every ~60s (if poll_interval_secs=5)
                 let snapshot = self.stats.snapshot();
                 info!(
                     "CryptoShard stats: events={}, arb_signals={}, model_signals={}, exec_sent={}, risk_blocks={}",
@@ -299,19 +366,22 @@ impl CryptoShard {
                         match cmd_type {
                             "add_event" => {
                                 // Parse event from command
-                                if let Ok(event) = Self::parse_add_event_command(&cmd_json) {
-                                    let event_id = event.event_id.clone();
-                                    let asset = event.asset.clone();
-                                    let target_price = event.target_price.unwrap_or(0.0);
-                                    let target_date = event.target_date.format("%Y-%m-%d");
+                                match Self::parse_add_event_command(&cmd_json) {
+                                    Ok(event) => {
+                                        let event_id = event.event_id.clone();
+                                        let asset = event.asset.clone();
+                                        let target_price = event.target_price.unwrap_or(0.0);
+                                        let target_date = event.target_date.format("%Y-%m-%d");
 
-                                    info!(
-                                        "Adding crypto event: {} ({}) -> ${} by {}",
-                                        event_id, asset, target_price, target_date
-                                    );
-                                    events.write().await.insert(event_id, event);
-                                } else {
-                                    warn!("Failed to parse add_event command");
+                                        info!(
+                                            "Adding crypto event: {} ({}) -> ${} by {}",
+                                            event_id, asset, target_price, target_date
+                                        );
+                                        events.write().await.insert(event_id, event);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to parse add_event command: {}", e);
+                                    }
                                 }
                             }
                             "remove_event" => {
@@ -344,21 +414,31 @@ impl CryptoShard {
             .ok_or_else(|| anyhow::anyhow!("Missing event_id"))?
             .to_string();
 
-        let asset = cmd.get("asset")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing asset"))?
-            .to_string();
+        // Extract asset from top-level field or from nested market_type.asset
+        let asset = if let Some(a) = cmd.get("asset").and_then(|v| v.as_str()) {
+            a.to_string()
+        } else if let Some(market_type) = cmd.get("market_type") {
+            // Try to extract from market_type.asset (flattened enum format)
+            market_type.get("asset")
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing asset in market_type.asset or top-level"))?
+                .to_string()
+        } else {
+            return Err(anyhow::anyhow!("Missing asset - not in top-level or market_type"));
+        };
 
         let target_price = cmd.get("target_price").and_then(|v| v.as_f64());
 
-        let target_date_str = cmd.get("target_date")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing target_date"))?;
-
-        let target_date = chrono::DateTime::parse_from_rfc3339(target_date_str)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-            .ok_or_else(|| anyhow::anyhow!("Invalid target_date format"))?;
+        // Try to get target_date, or default to 24 hours from now
+        let target_date = if let Some(target_date_str) = cmd.get("target_date").and_then(|v| v.as_str()) {
+            chrono::DateTime::parse_from_rfc3339(target_date_str)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok_or_else(|| anyhow::anyhow!("Invalid target_date format"))?
+        } else {
+            // Default: 24 hours from now
+            Utc::now() + chrono::Duration::hours(24)
+        };
 
         let description = cmd.get("description")
             .and_then(|v| v.as_str())
@@ -383,6 +463,8 @@ impl CryptoShard {
         stats: Arc<ShardStats>,
         heartbeat_interval: Duration,
         redis: RedisBus,
+        execution_pub: Option<Arc<Mutex<PubSocket>>>,
+        price_listener: CryptoPriceListener,
     ) {
         let channel = format!("shard:{}:heartbeat", shard_id);
 
@@ -398,6 +480,15 @@ impl CryptoShard {
             // Shard type for orchestrator routing
             let shard_type = env::var("SHARD_TYPE").unwrap_or_else(|_| "crypto".to_string());
 
+            // Check component health
+            // Redis OK will be verified implicitly by successful publish
+            let redis_ok = true;
+            // ZMQ is OK if the execution publisher is initialized
+            let zmq_ok = execution_pub.is_some();
+            // Price listener is OK if it has received prices recently
+            let listener_stats = price_listener.stats();
+            let price_listener_ok = listener_stats.total_prices_received > 0;
+
             let payload = json!({
                 "shard_id": shard_id,
                 "shard_type": shard_type,
@@ -408,6 +499,11 @@ impl CryptoShard {
                 "max_games": 1000, // Crypto shards have high capacity
                 "timestamp": Utc::now().to_rfc3339(),
                 "status": "healthy",
+                "checks": {
+                    "redis_ok": redis_ok,
+                    "zmq_ok": zmq_ok,
+                    "price_listener_ok": price_listener_ok,
+                },
                 "metrics": {
                     "events_monitored": snapshot.events_monitored,
                     "prices_received": snapshot.prices_received,

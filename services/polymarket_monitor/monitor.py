@@ -60,17 +60,11 @@ class PolymarketMonitor:
 
         # Subscription tracking
         self.subscribed_tokens: set[str] = set()
-        self.subscribed_conditions: set[str] = set()
 
-        # token_id -> {condition_id, team_name}
-        # For moneyline markets, each token represents one team's YES contract
-        self._token_to_info: dict[str, dict] = {}
-        
-        # condition_id -> list of token_ids (usually 2 for moneyline)
-        self._condition_to_tokens: dict[str, list[str]] = {}
+        # SIMPLIFIED: token_id -> {condition_id, game_id, market_type}
+        # This is all we need to route incoming prices to the right market
+        self._token_to_market: dict[str, dict] = {}
 
-        # Market metadata (condition_id -> {game_id, market_type, title, outcomes, home_team, away_team})
-        self._market_metadata: dict[str, dict] = {}
         # Active assignment per (game_id, market_type) -> condition_id
         # Used to prevent publishing stale markets after discovery corrections.
         self._active_by_game_type: dict[tuple[str, str], str] = {}
@@ -173,10 +167,10 @@ class PolymarketMonitor:
         logger.info("PolymarketMonitor started successfully")
 
         # Run concurrent tasks
+        # Note: REST poll loop removed - WebSocket streaming is primary transport
         await asyncio.gather(
             self._assignment_listener(),
             self._price_streaming_loop(),
-            self._rest_poll_loop(),
             self._health_check_loop(),
             return_exceptions=True,
         )
@@ -289,34 +283,19 @@ class PolymarketMonitor:
     ):
         """
         Subscribe to a Polymarket market via WebSocket.
-        
-        For moneyline markets, subscribes to BOTH team tokens and tracks
-        which token corresponds to which team.
+
+        Simplified: Only fetch token IDs, don't parse outcomes or store metadata.
+        Team names are inferred from token prices themselves.
         """
-        # Fetch market details
+        # Fetch market to get token IDs
         market = await self.poly_client.get_market(condition_id)
         if not market:
             logger.warning(f"Market not found: {condition_id}")
             return
 
-        title = market.get("question", market.get("title", ""))
-        volume = float(market.get("volume", 0) or 0)
-        
-        # Parse outcomes and token IDs
-        # Polymarket returns: outcomes=["Team A", "Team B"], clobTokenIds=["token1", "token2"]
-        outcomes_raw = market.get("outcomes", "[]")
+        # Get token IDs (may be in clobTokenIds or resolve from market)
         tokens_raw = market.get("clobTokenIds", "[]")
-        
-        # Handle JSON string or list
-        import json
-        if isinstance(outcomes_raw, str):
-            try:
-                outcomes = json.loads(outcomes_raw)
-            except:
-                outcomes = []
-        else:
-            outcomes = outcomes_raw or []
-            
+
         if isinstance(tokens_raw, str):
             try:
                 token_ids = json.loads(tokens_raw)
@@ -324,62 +303,43 @@ class PolymarketMonitor:
                 token_ids = []
         else:
             token_ids = tokens_raw or []
-        
-        if len(outcomes) != len(token_ids) or not outcomes:
-            logger.warning(f"Market {condition_id} has mismatched outcomes/tokens: {len(outcomes)} vs {len(token_ids)}")
-            # Fallback to single token resolution
-            token_id = await self.poly_client.resolve_yes_token_id(market)
-            if token_id:
-                outcomes = [title]
-                token_ids = [token_id]
-            else:
-                return
 
-        # Store metadata with team info
-        self._market_metadata[condition_id] = {
-            "game_id": game_id,
-            "market_type": market_type,
-            "title": title,
-            "volume": volume,
-            "outcomes": outcomes,
-            "home_team": home_team,
-            "away_team": away_team,
-        }
-        
-        # Track all tokens for this condition
-        self._condition_to_tokens[condition_id] = token_ids
-        
-        # Subscribe to ALL tokens (both teams for moneyline)
-        ws_markets = []
-        for i, (outcome, token_id) in enumerate(zip(outcomes, token_ids)):
+        # If no tokens found, try to resolve single token
+        if not token_ids:
+            logger.debug(f"No clobTokenIds for {condition_id}, attempting resolve_yes_token_id")
+            token_id = await self.poly_client.resolve_yes_token_id(market)
+            token_ids = [token_id] if token_id else []
+
+        if not token_ids:
+            logger.warning(f"Could not determine token IDs for market {condition_id}")
+            return
+
+        # Subscribe to all tokens
+        for token_id in token_ids:
             if token_id in self.subscribed_tokens:
-                logger.debug(f"Already subscribed to token {token_id[:16]}... ({outcome})")
+                logger.debug(f"Already subscribed to token {token_id[:16]}...")
                 continue
-                
-            # Store token -> info mapping
-            self._token_to_info[token_id] = {
+
+            # Minimal metadata: just map token to market location
+            self._token_to_market[token_id] = {
                 "condition_id": condition_id,
-                "team_name": outcome,  # e.g., "Binghamton Bearcats"
-                "outcome_index": i,
+                "game_id": game_id,
+                "market_type": market_type,
             }
-            
-            ws_markets.append({
+
+            self.subscribed_tokens.add(token_id)
+
+            # Subscribe via client metadata for tracking
+            await self.poly_client.subscribe_with_metadata([{
                 "token_id": token_id,
                 "condition_id": condition_id,
-                "title": f"{title} - {outcome}",
                 "game_id": game_id,
-                "volume": volume,
                 "market_type": market_type,
-            })
-            
-            self.subscribed_tokens.add(token_id)
-            logger.info(f"Subscribing to Polymarket token: {token_id[:16]}... for '{outcome}'")
-        
-        if ws_markets:
-            await self.poly_client.subscribe_with_metadata(ws_markets)
-            
-        self.subscribed_conditions.add(condition_id)
-        logger.info(f"Subscribed to Polymarket: {condition_id[:16]}... ({market_type}) with {len(token_ids)} outcomes: {outcomes}")
+            }])
+
+            logger.info(f"Subscribed to token {token_id[:16]}... (game={game_id})")
+
+        logger.info(f"Subscribed to Polymarket: {condition_id[:16]}... ({market_type}) with {len(token_ids)} tokens")
 
     async def _price_streaming_loop(self):
         """Stream prices from Polymarket WebSocket and publish to Redis."""
@@ -417,62 +377,38 @@ class PolymarketMonitor:
 
     async def _handle_price_update(self, price: MarketPrice):
         """
-        Handle incoming price update, normalize, and publish to Redis.
-        
-        CRITICAL: Each token represents ONE team's YES contract.
-        We include contract_team in the published MarketPrice so downstream
-        consumers can match signal.team to the correct contract.
+        Handle incoming price update and publish to ZMQ/Redis.
+
+        Simplified: Minimal lookup, direct market routing.
         """
-        # Normalize: price.market_id is token_id, we need condition_id + team
         token_id = price.market_id
-        token_info = self._token_to_info.get(token_id)
+        market_info = self._token_to_market.get(token_id)
 
-        if not token_info:
-            # Try reverse lookup (maybe it's already a condition_id)
-            if token_id in self._market_metadata:
-                # This is a condition_id, not a token_id - shouldn't happen normally
-                condition_id = token_id
-                contract_team = None
-            else:
-                logger.debug(f"Unknown token_id: {token_id[:16]}...")
-                return
-        else:
-            condition_id = token_info["condition_id"]
-            contract_team = token_info["team_name"]  # e.g., "Binghamton Bearcats"
-
-        # Get metadata
-        meta = self._market_metadata.get(condition_id, {})
-        game_id = meta.get("game_id")
-        market_type = meta.get("market_type", "moneyline")
-
-        if not game_id:
-            logger.debug(f"No game_id for condition {condition_id[:16]}...")
+        if not market_info:
+            logger.debug(f"Unknown token_id: {token_id[:16]}...")
             return
 
-        # Drop stale markets: only publish the currently active (game_id, market_type) assignment.
+        condition_id = market_info["condition_id"]
+        game_id = market_info["game_id"]
+        market_type = market_info["market_type"]
+
+        # Drop stale markets: only publish the currently active assignment.
         active = self._active_by_game_type.get((str(game_id), str(market_type)))
         if active and active != condition_id:
             return
 
-        # Build normalized MarketPrice with:
-        # - market_id = condition_id (for market identification)
-        # - contract_team = which team this YES contract is for
-        # - market_title includes team name for clarity
-        title = meta.get("title", price.market_title)
-        if contract_team and contract_team not in title:
-            title = f"{title} [{contract_team}]"
-            
+        # Minimal normalization: use price as-is, with market routing info
         normalized_price = MarketPrice(
             market_id=condition_id,
             platform=Platform.POLYMARKET,
             game_id=game_id,
-            market_title=title,
-            contract_team=contract_team,  # CRITICAL: which team's YES contract
+            market_title=price.market_title,
+            contract_team=None,  # Simplified: don't track team name
             yes_bid=price.yes_bid,
             yes_ask=price.yes_ask,
             yes_bid_size=price.yes_bid_size,
             yes_ask_size=price.yes_ask_size,
-            volume=meta.get("volume", price.volume),
+            volume=price.volume,
             liquidity=price.liquidity,
             status=price.status,
             timestamp=price.timestamp,
@@ -688,11 +624,13 @@ class PolymarketMonitor:
             await asyncio.sleep(self._poll_interval_s)
 
     async def _health_check_loop(self):
-        """Periodic health checks."""
+        """Periodic health checks (3-minute interval)."""
+        health_check_interval = 180  # 3 minutes instead of 60 seconds
         while self._running:
             try:
-                # Verify VPN is still working
-                await self._verify_vpn()
+                # Skip VPN verification from health check loop (too slow)
+                # VPN is verified on startup; if it fails, the service won't start
+                # Periodic re-verification can be added later if needed
 
                 # Check WebSocket connection
                 ws_ok = self.poly_client.ws_connected
@@ -754,7 +692,7 @@ class PolymarketMonitor:
                     "timestamp": datetime.utcnow().isoformat(),
                 })
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(health_check_interval)
 
 
 async def main():

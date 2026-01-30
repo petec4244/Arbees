@@ -210,12 +210,29 @@ impl MultiMarketManager {
         }
 
         // Send command to shard
+        let target_price = event.metadata
+            .get("target_price")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
+        debug!(
+            "Event metadata for {}: {:?}",
+            event.event_id,
+            event.metadata
+        );
+        debug!(
+            "Extracted target_price for {}: {}",
+            event.event_id, target_price
+        );
+
         let command = serde_json::json!({
             "type": "add_event",
             "event_id": event.event_id,
             "market_type": event.market_type,
             "entity_a": event.entity_a,
             "entity_b": event.entity_b,
+            "target_price": target_price,
+            "target_date": event.scheduled_time.to_rfc3339(),
             "kalshi_market_id": kalshi_id,
             "polymarket_market_id": polymarket_id,
             "market_ids_by_type": market_ids_by_type,
@@ -303,20 +320,35 @@ impl MultiMarketManager {
 
         let mut assignments = self.assignments.write().await;
         let mut events_to_remove = Vec::new();
+        let mut missing_count = 0;
 
         for (event_id, assignment) in assignments.iter() {
             if assignment.shard_id == shard_id && !reported_events.contains(event_id) {
-                warn!(
-                    "Event {} missing from shard {} report, clearing assignment",
-                    event_id, shard_id
-                );
+                missing_count += 1;
                 events_to_remove.push(event_id.clone());
             }
+        }
+
+        // DISABLED: Zombie event removal logic
+        // This was too aggressive and removed events immediately after assignment
+        // TODO: Implement grace period (e.g., require 3 consecutive heartbeats with missing events)
+        // before removing, to account for race conditions between assignment and heartbeat reporting.
+
+        // Rate limit missing event warnings: only log every 1000
+        /*
+        if missing_count > 0 && missing_count % 1000 == 0 {
+            warn!(
+                "Missing {} events from shard {} report (total affected: {})",
+                missing_count % 1000,
+                shard_id,
+                events_to_remove.len()
+            );
         }
 
         for event_id in events_to_remove {
             assignments.remove(&event_id);
         }
+        */
     }
 
     /// Get statistics about current assignments

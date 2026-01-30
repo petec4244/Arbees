@@ -185,10 +185,14 @@ services:
     env_file:
       - .env
     environment:
+      # Shard identity - MUST match what orchestrator expects (default: shard-1)
+      SHARD_ID: "shard-1"
+      SHARD_TYPE: "sports"
+      # Heartbeat interval (5 seconds for fast shard discovery)
+      HEARTBEAT_INTERVAL_SECS: "5"
       # ZMQ configuration for low-latency messaging
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5558"
-      SHARD_TYPE: "sports"
       # Increase stack size to prevent overflow with deep async call stacks
       RUST_MIN_STACK: "8388608"
     expose:
@@ -274,8 +278,16 @@ services:
       CRYPTO_MODEL_TIME_DECAY: "true"
       CRYPTO_MODEL_MIN_CONFIDENCE: "0.60"
       # Monitoring
-      CRYPTO_POLL_INTERVAL_SECS: "30"
-      CRYPTO_PRICE_STALENESS_SECS: "60"
+      # Event-driven evaluation: Signals triggered immediately on price updates (default: true)
+      # Set to "false" to use traditional polling at fixed interval below
+      CRYPTO_EVENT_DRIVEN_EVALUATION: "true"
+      # Polling interval fallback (used when event-driven is disabled)
+      # With event-driven enabled, this is the backup periodic cycle interval
+      CRYPTO_POLL_INTERVAL_SECS: "5"
+      # Price staleness threshold (prices older than this are rejected)
+      # Reduced from 60s to 10s for crypto volatility
+      CRYPTO_PRICE_STALENESS_SECS: "10"
+      # Heartbeat interval (5 seconds for fast shard discovery)
       CRYPTO_HEARTBEAT_INTERVAL_SECS: "5"
     expose:
       - "5559"

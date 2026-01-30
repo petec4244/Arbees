@@ -203,6 +203,12 @@ impl ServiceRegistry {
                         state.assigned_games.remove(&game_id);
                     }
 
+                    // DISABLED: Zombie game detection
+                    // This was too aggressive and removed games immediately after assignment
+                    // due to race conditions between assignment and heartbeat reporting.
+                    // TODO: Implement grace period (require multiple heartbeats missing game)
+                    // before sending remove commands.
+                    /*
                     // Check for zombie games (shard is monitoring but shouldn't be)
                     let zombie_games: Vec<String> = reported_games
                         .difference(&state.assigned_games)
@@ -235,6 +241,7 @@ impl ServiceRegistry {
                         // Re-acquire lock for rest of processing
                         services = self.services.write().await;
                     }
+                    */
                 }
             }
         }

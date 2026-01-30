@@ -458,11 +458,16 @@ impl CryptoEventProvider {
             Some("greater") => market.floor_strike,
             Some("less") => market.cap_strike,
             Some("between") => market.floor_strike, // Use lower bound for between ranges
-            _ => {
-                // Fallback to parsing from title if no strike type
-                self.parse_price_target(&market.title).map(|(p, _)| p)
-            }
-        }?;
+            _ => None
+        }
+        .or_else(|| {
+            // Fallback 1: Try to extract from Kalshi ticker format (e.g., "KXDOGE-26JAN3017-B0.227")
+            extract_price_from_kalshi_ticker(&market.ticker)
+        })
+        .or_else(|| {
+            // Fallback 2: Parse from title if all else fails
+            self.parse_price_target(&market.title).map(|(p, _)| p)
+        })?;
 
         // Determine prediction type from strike_type
         let prediction_type = match market.strike_type.as_deref() {
@@ -797,6 +802,31 @@ fn extract_price_from_text(text: &str) -> Option<f64> {
                 // Likely a price, not a percentage
                 return Some(num);
             }
+        }
+    }
+
+    None
+}
+
+/// Extract price from Kalshi ticker format like "KXDOGE-26JAN3017-B0.227"
+/// Format: {ticker}-{date}-{strike_type}{price}
+/// Returns the price value (e.g., 0.227 from "B0.227")
+fn extract_price_from_kalshi_ticker(ticker: &str) -> Option<f64> {
+    // Format: "KXDOGE-26JAN3017-B0.227"
+    // Split by hyphen: ["KXDOGE", "26JAN3017", "B0.227"]
+    let parts: Vec<&str> = ticker.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let strike_part = parts[2]; // "B0.227"
+
+    // The strike part starts with a letter (B, T, L, etc.) and is followed by the price
+    // Extract everything after the first character (which is the strike type)
+    if strike_part.len() > 1 {
+        let price_str = &strike_part[1..]; // "0.227"
+        if let Ok(price) = price_str.parse::<f64>() {
+            return Some(price);
         }
     }
 
