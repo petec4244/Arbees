@@ -84,21 +84,21 @@ impl CryptoPriceListener {
             self.zmq_sub_endpoints
         );
 
-        // Create socket - handle creation errors gracefully
-        let mut socket = match SubSocket::new() {
-            s => s,
-        };
+        // Create socket
+        let mut socket = SubSocket::new();
 
         // Connect to all endpoints with error handling
         // Note: ZMQ will retry connection asynchronously, so this is best-effort
-        let mut connection_attempts = 0;
+        let mut successful_connections = 0;
+        let total_endpoints = self.zmq_sub_endpoints.len();
+
         for endpoint in &self.zmq_sub_endpoints {
-            connection_attempts += 1;
             // Try to connect, but don't fail if it doesn't work immediately
             // ZMQ handles reconnection in the background
             match tokio::time::timeout(Duration::from_secs(5), socket.connect(endpoint)).await {
                 Ok(Ok(_)) => {
                     info!("Price listener connected to {}", endpoint);
+                    successful_connections += 1;
                 }
                 Ok(Err(e)) => {
                     warn!("Failed to connect to {} (will retry in background): {}", endpoint, e);
@@ -109,8 +109,10 @@ impl CryptoPriceListener {
             }
         }
 
-        if connection_attempts == 0 {
+        if total_endpoints == 0 {
             warn!("No endpoints configured, listener will be inactive");
+        } else if successful_connections == 0 {
+            warn!("No successful connections established ({} endpoints); listener will wait for publishers to connect", total_endpoints);
         }
 
         // Subscribe to price topics from all sources

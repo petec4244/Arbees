@@ -126,12 +126,22 @@ impl CryptoShard {
         info!("Connected to Redis");
 
         // Create ZMQ publisher for execution requests
+        info!("Creating ZMQ PubSocket...");
         let mut execution_pub = PubSocket::new();
-        execution_pub.bind(&config.execution_pub_endpoint).await?;
-        info!(
-            "CryptoShard publishing ExecutionRequests to {}",
-            config.execution_pub_endpoint
-        );
+        info!("PubSocket created successfully");
+
+        info!("Binding PubSocket to {}", config.execution_pub_endpoint);
+        match execution_pub.bind(&config.execution_pub_endpoint).await {
+            Ok(_) => {
+                info!(
+                    "CryptoShard publishing ExecutionRequests to {}",
+                    config.execution_pub_endpoint
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to bind PubSocket to {}: {}", config.execution_pub_endpoint, e));
+            }
+        }
         let execution_pub = Some(Arc::new(Mutex::new(execution_pub)));
 
         // Create price listener
@@ -195,9 +205,16 @@ impl CryptoShard {
 
         // Spawn price listener as background task
         let price_listener = self.price_listener.clone();
+        let listener_shard_id = self.config.shard_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = price_listener.start().await {
-                error!("Price listener error: {}", e);
+            info!("[{}] Price listener task starting", listener_shard_id);
+            match price_listener.start().await {
+                Ok(_) => {
+                    info!("[{}] Price listener completed normally", listener_shard_id);
+                }
+                Err(e) => {
+                    error!("[{}] Price listener error: {}", listener_shard_id, e);
+                }
             }
         });
 
@@ -207,7 +224,9 @@ impl CryptoShard {
         let cmd_events = self.events.clone();
 
         tokio::spawn(async move {
-            Self::command_listener(cmd_shard_id, cmd_redis, cmd_events).await;
+            info!("[{}] Command listener task starting", cmd_shard_id);
+            Self::command_listener(cmd_shard_id.clone(), cmd_redis, cmd_events).await;
+            info!("[{}] Command listener task completed", cmd_shard_id);
         });
 
         // Spawn heartbeat loop for orchestrator service discovery
@@ -218,14 +237,16 @@ impl CryptoShard {
         let heartbeat_redis = self.redis.clone();
 
         tokio::spawn(async move {
+            info!("[{}] Heartbeat task starting", heartbeat_shard_id);
             Self::heartbeat_loop(
-                heartbeat_shard_id,
+                heartbeat_shard_id.clone(),
                 heartbeat_events,
                 heartbeat_stats,
                 heartbeat_interval,
                 heartbeat_redis,
             )
             .await;
+            info!("[{}] Heartbeat task completed", heartbeat_shard_id);
         });
 
         // Main monitoring loop

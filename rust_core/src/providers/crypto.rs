@@ -149,41 +149,37 @@ impl CryptoEventProvider {
         Ok(())
     }
 
-    /// Fetch crypto markets from Polymarket Gamma API
+    /// Fetch crypto markets from Polymarket Gamma API using /events endpoint with text search
     async fn fetch_polymarket_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
-        let url = "https://gamma-api.polymarket.com/markets?closed=false&limit=100";
+        // Search terms for crypto markets - use full names for better API-side filtering
+        const CRYPTO_SEARCH_TERMS: &[&str] = &[
+            "bitcoin",
+            "ethereum",
+            "solana",
+            "dogecoin",
+            "cardano",
+            "ripple",
+            "XRP",
+            "crypto",
+        ];
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .context("Failed to fetch Polymarket markets")?;
+        let mut all_markets: HashMap<String, CryptoMarket> = HashMap::new();
 
-        if !response.status().is_success() {
-            return Err(anyhow!("Polymarket API error: {}", response.status()));
+        for search_term in CRYPTO_SEARCH_TERMS {
+            match self.fetch_polymarket_events_for_query(search_term).await {
+                Ok(markets) => {
+                    for market in markets {
+                        // Dedupe by market_id
+                        all_markets.entry(market.market_id.clone()).or_insert(market);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to search Polymarket for '{}': {}", search_term, e);
+                }
+            }
         }
 
-        // Get raw text first for debugging
-        let text = response.text().await?;
-
-        let markets: Vec<PolymarketMarket> = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                // Log a snippet of the response for debugging
-                let snippet: String = text.chars().take(500).collect();
-                warn!("Polymarket JSON parse error: {}. Response snippet: {}", e, snippet);
-                return Err(anyhow!("JSON parse error: {}", e));
-            }
-        };
-
-        info!("Polymarket returned {} total markets", markets.len());
-
-        // Filter for crypto markets
-        let crypto_markets: Vec<CryptoMarket> = markets
-            .into_iter()
-            .filter_map(|m| self.parse_polymarket_crypto(&m))
-            .collect();
+        let crypto_markets: Vec<CryptoMarket> = all_markets.into_values().collect();
 
         if !crypto_markets.is_empty() {
             info!(
@@ -196,15 +192,86 @@ impl CryptoEventProvider {
         Ok(crypto_markets)
     }
 
-    /// Parse a Polymarket market into a CryptoMarket if it's crypto-related
-    fn parse_polymarket_crypto(&self, market: &PolymarketMarket) -> Option<CryptoMarket> {
+    /// Fetch events from Polymarket using /events endpoint with text search and pagination
+    async fn fetch_polymarket_events_for_query(&self, query: &str) -> Result<Vec<CryptoMarket>> {
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 5; // Limit to 500 events per query
+
+        let mut all_markets = Vec::new();
+        let mut offset = 0u32;
+
+        for _page in 0..MAX_PAGES {
+            let url = format!(
+                "https://gamma-api.polymarket.com/events?active=true&closed=false&limit={}&offset={}&_q={}",
+                PAGE_SIZE, offset, query
+            );
+
+            let response = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .context("Failed to fetch Polymarket events")?;
+
+            if !response.status().is_success() {
+                return Err(anyhow!("Polymarket API error: {}", response.status()));
+            }
+
+            let text = response.text().await?;
+            let events: Vec<PolymarketEvent> = match serde_json::from_str(&text) {
+                Ok(e) => e,
+                Err(e) => {
+                    let snippet: String = text.chars().take(500).collect();
+                    warn!("Polymarket events JSON parse error: {}. Snippet: {}", e, snippet);
+                    return Err(anyhow!("JSON parse error: {}", e));
+                }
+            };
+
+            let event_count = events.len();
+            debug!("Polymarket query '{}' offset {} returned {} events", query, offset, event_count);
+
+            // Extract markets from events
+            for event in events {
+                for market in event.markets.into_iter().flatten() {
+                    // Skip closed markets
+                    if market.closed.unwrap_or(false) {
+                        continue;
+                    }
+
+                    // Try to parse as crypto market
+                    if let Some(crypto_market) = self.parse_polymarket_market(&market, &event.title) {
+                        all_markets.push(crypto_market);
+                    }
+                }
+            }
+
+            // Stop if we got fewer than a full page (no more results)
+            if event_count < PAGE_SIZE as usize {
+                break;
+            }
+
+            offset += PAGE_SIZE;
+        }
+
+        Ok(all_markets)
+    }
+
+    /// Parse a Polymarket market from the /events response into a CryptoMarket
+    fn parse_polymarket_market(&self, market: &PolymarketMarketNested, event_title: &str) -> Option<CryptoMarket> {
+        // Use the market question, falling back to event title
+        let question = if market.question.is_empty() {
+            event_title.to_string()
+        } else {
+            market.question.clone()
+        };
+
         // Check if it's a crypto market using word-boundary matching
         let asset = TRACKED_ASSETS
             .iter()
-            .find(|&asset| contains_crypto_asset(&market.question, asset))?;
+            .find(|&asset| contains_crypto_asset(&question, asset))?;
 
         // Try to parse price target from question
-        let (target_price, prediction_type) = self.parse_price_target(&market.question)?;
+        let (target_price, prediction_type) = self.parse_price_target(&question)?;
 
         // Parse end date
         let target_date = market
@@ -221,12 +288,12 @@ impl CryptoEventProvider {
             target_price,
             target_date,
             prediction_type,
-            title: market.question.clone(),
+            title: question,
             description: market.description.clone(),
-            yes_price: market.outcome_prices.as_ref().and_then(|p| p.get(0).copied()),
+            yes_price: market.outcome_prices.as_ref().and_then(|p| p.first().copied()),
             no_price: market.outcome_prices.as_ref().and_then(|p| p.get(1).copied()),
-            volume: market.volume.map(|v| v as f64),
-            liquidity: market.liquidity.map(|l| l as f64),
+            volume: market.volume,
+            liquidity: market.liquidity,
             status: if market.closed.unwrap_or(false) {
                 EventStatus::Completed
             } else {
@@ -236,15 +303,113 @@ impl CryptoEventProvider {
         })
     }
 
-    /// Fetch crypto markets from Kalshi
+    /// Fetch crypto markets from Kalshi Trading API
+    ///
+    /// Uses trading-api.kalshi.com (not api.elections.kalshi.com which is elections-only).
+    /// Searches multiple crypto series tickers for short-term price prediction markets.
     async fn fetch_kalshi_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
-        // Kalshi uses different endpoints for different market types
-        // We'll search for crypto-related markets
-        let url = "https://api.elections.kalshi.com/trade-api/v2/markets?status=open&limit=200";
+        // Kalshi Trading API base URL (different from elections API)
+        const KALSHI_TRADING_API: &str = "https://trading-api.kalshi.com/trade-api/v2";
+
+        // Crypto series tickers to search - these are short-term price prediction markets
+        // Format: "Will Bitcoin be above $X at Y time?"
+        const CRYPTO_SERIES: &[&str] = &[
+            "KXBTC",       // Bitcoin price markets
+            "KXBTCD",      // Bitcoin daily
+            "KXBTCW",      // Bitcoin weekly
+            "KXETH",       // Ethereum price markets
+            "KXETHD",      // Ethereum daily
+            "KXSOL",       // Solana
+            "INXBTC",      // Intraday Bitcoin (15-min markets)
+            "INXETH",      // Intraday Ethereum
+            "BTCPRICE",    // Alternative Bitcoin ticker
+            "ETHPRICE",    // Alternative Ethereum ticker
+        ];
+
+        let mut all_markets: HashMap<String, CryptoMarket> = HashMap::new();
+
+        // Search each crypto series
+        for series in CRYPTO_SERIES {
+            match self.fetch_kalshi_series(KALSHI_TRADING_API, series).await {
+                Ok(markets) => {
+                    for market in markets {
+                        all_markets.entry(market.market_id.clone()).or_insert(market);
+                    }
+                }
+                Err(e) => {
+                    debug!("Kalshi series {} not found or error: {}", series, e);
+                }
+            }
+        }
+
+        // Also try a general search for any open crypto-related markets
+        match self.fetch_kalshi_general_crypto(KALSHI_TRADING_API).await {
+            Ok(markets) => {
+                for market in markets {
+                    all_markets.entry(market.market_id.clone()).or_insert(market);
+                }
+            }
+            Err(e) => {
+                debug!("Kalshi general crypto search failed: {}", e);
+            }
+        }
+
+        let crypto_markets: Vec<CryptoMarket> = all_markets.into_values().collect();
+
+        if !crypto_markets.is_empty() {
+            info!(
+                "Found {} crypto markets on Kalshi: {:?}",
+                crypto_markets.len(),
+                crypto_markets.iter().map(|m| &m.title).collect::<Vec<_>>()
+            );
+        } else {
+            info!("Found 0 crypto markets on Kalshi");
+        }
+
+        Ok(crypto_markets)
+    }
+
+    /// Fetch markets from a specific Kalshi series
+    async fn fetch_kalshi_series(&self, base_url: &str, series_ticker: &str) -> Result<Vec<CryptoMarket>> {
+        let url = format!(
+            "{}/markets?series_ticker={}&status=open&limit=100",
+            base_url, series_ticker
+        );
 
         let response = self
             .client
-            .get(url)
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch Kalshi series")?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Kalshi API error for series {}: {}", series_ticker, response.status()));
+        }
+
+        let resp: KalshiMarketsResponse = response.json().await?;
+
+        if !resp.markets.is_empty() {
+            debug!("Kalshi series {} returned {} markets", series_ticker, resp.markets.len());
+        }
+
+        let crypto_markets: Vec<CryptoMarket> = resp
+            .markets
+            .into_iter()
+            .filter_map(|m| self.parse_kalshi_crypto(&m))
+            .collect();
+
+        Ok(crypto_markets)
+    }
+
+    /// Fetch general crypto markets from Kalshi by scanning all open markets
+    async fn fetch_kalshi_general_crypto(&self, base_url: &str) -> Result<Vec<CryptoMarket>> {
+        // Fetch open markets and filter locally for crypto
+        let url = format!("{}/markets?status=open&limit=500", base_url);
+
+        let response = self
+            .client
+            .get(&url)
             .send()
             .await
             .context("Failed to fetch Kalshi markets")?;
@@ -254,26 +419,14 @@ impl CryptoEventProvider {
         }
 
         let resp: KalshiMarketsResponse = response.json().await?;
-        info!("Kalshi returned {} total markets", resp.markets.len());
+        debug!("Kalshi general search returned {} total markets", resp.markets.len());
 
-        // Log some sample titles to help debug crypto detection
-        let sample_titles: Vec<&str> = resp.markets.iter().take(5).map(|m| m.title.as_str()).collect();
-        info!("Kalshi sample titles: {:?}", sample_titles);
-
-        // Filter for crypto markets
+        // Filter for crypto markets by scanning titles
         let crypto_markets: Vec<CryptoMarket> = resp
             .markets
             .into_iter()
             .filter_map(|m| self.parse_kalshi_crypto(&m))
             .collect();
-
-        if !crypto_markets.is_empty() {
-            info!(
-                "Found {} crypto markets on Kalshi: {:?}",
-                crypto_markets.len(),
-                crypto_markets.iter().map(|m| &m.title).collect::<Vec<_>>()
-            );
-        }
 
         Ok(crypto_markets)
     }
@@ -759,6 +912,36 @@ mod string_or_number {
     }
 }
 
+/// Polymarket event from /events endpoint
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolymarketEvent {
+    #[allow(dead_code)]
+    id: String,
+    title: String,
+    #[serde(default)]
+    markets: Option<Vec<PolymarketMarketNested>>,
+}
+
+/// Polymarket market nested inside an event
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolymarketMarketNested {
+    condition_id: String,
+    #[serde(default)]
+    question: String,
+    description: Option<String>,
+    end_date: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize_outcome_prices")]
+    outcome_prices: Option<Vec<f64>>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    volume: Option<f64>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    liquidity: Option<f64>,
+    closed: Option<bool>,
+}
+
+/// Legacy: Polymarket market from /markets endpoint (kept for compatibility)
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PolymarketMarket {
