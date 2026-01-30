@@ -50,11 +50,18 @@ pub struct CryptoMarket {
     pub asset: String,    // "BTC", "ETH", etc.
     pub target_price: f64,
     pub target_date: DateTime<Utc>,
+    pub start_date: Option<DateTime<Utc>>, // When the market opened
     pub prediction_type: CryptoPredictionType,
     pub title: String,
     pub description: Option<String>,
-    pub yes_price: Option<f64>,
-    pub no_price: Option<f64>,
+    pub yes_price: Option<f64>,     // Current Up/Yes market price (bet price)
+    pub no_price: Option<f64>,      // Current Down/No market price (bet price)
+    pub yes_start_price: Option<f64>, // Opening Up/Yes market price
+    pub no_start_price: Option<f64>,  // Opening Down/No market price
+    /// Current crypto asset price (from spot market or oracle)
+    pub current_crypto_price: Option<f64>,
+    /// Reference price to beat (starting price when market opened)
+    pub reference_price: Option<f64>,
     pub volume: Option<f64>,
     pub liquidity: Option<f64>,
     pub status: EventStatus,
@@ -244,52 +251,70 @@ impl CryptoEventProvider {
         Ok(crypto_markets)
     }
 
-    /// Fetch a specific directional market from Polymarket using slug-based lookup
+    /// Fetch a specific directional market from Polymarket using slug-based lookup with timestamp
     ///
-    /// Directional markets (e.g., "btc-updown-15m") use the /markets?slug= endpoint
-    /// for direct lookup, not the text search /events endpoint.
+    /// Directional markets (e.g., "btc-updown-15m-1769805000") include a Unix timestamp
+    /// for the market's end date. We try multiple timestamp windows to find an active market.
     ///
-    /// Returns the first matching market for the given slug.
-    async fn fetch_polymarket_directional_market(&self, slug: &str) -> Result<CryptoMarket> {
+    /// Returns the first matching active (non-closed) market.
+    async fn fetch_polymarket_directional_market(&self, series: &str) -> Result<CryptoMarket> {
         const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
-        let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
+        // Calculate timestamp windows to try
+        // 15-minute markets expire every 15 minutes (900 seconds)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch Polymarket directional market")?;
+        // Try current 15-min slot and next few slots
+        let current_slot = (now / 900) * 900;
+        let timestamps_to_try = vec![
+            current_slot,
+            current_slot + 900,  // Next 15-min slot
+            current_slot + 1800, // Slot after that
+        ];
 
-        if !response.status().is_success() {
-            return Err(anyhow!("Polymarket API error for slug {}: {}", slug, response.status()));
+        // Try different timestamp windows
+        for timestamp in timestamps_to_try {
+            let slug = format!("{}-{}", series, timestamp);
+            let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
+
+            match self.client.get(&url).send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        continue;
+                    }
+
+                    if let Ok(text) = response.text().await {
+                        if let Ok(markets) = serde_json::from_str::<Vec<PolymarketMarketSimple>>(&text) {
+                            // Find the first active/non-closed market
+                            for market in markets {
+                                if market.closed.unwrap_or(false) {
+                                    continue;
+                                }
+
+                                // Parse as crypto market
+                                if let Some(crypto_market) = self.parse_polymarket_market_simple(&market) {
+                                    debug!("Found directional market for series '{}' ({}): {}",
+                                           series, timestamp, crypto_market.title);
+                                    return Ok(crypto_market);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Network error, try next timestamp
+                    continue;
+                }
+            }
         }
 
-        let text = response.text().await?;
-        let markets: Vec<PolymarketMarketSimple> = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                let snippet: String = text.chars().take(500).collect();
-                warn!("Polymarket directional market JSON parse error: {}. Snippet: {}", e, snippet);
-                return Err(anyhow!("JSON parse error: {}", e));
-            }
-        };
-
-        // Find the first active/non-closed market from the results
-        for market in markets {
-            if market.closed.unwrap_or(false) {
-                continue;
-            }
-
-            // Parse as crypto market
-            if let Some(crypto_market) = self.parse_polymarket_market_simple(&market) {
-                debug!("Found directional market for slug '{}': {}", slug, crypto_market.title);
-                return Ok(crypto_market);
-            }
-        }
-
-        Err(anyhow!("No valid crypto markets found for slug '{}'", slug))
+        Err(anyhow!(
+            "No active directional markets found for series '{}' in recent timestamp windows",
+            series
+        ))
     }
 
     /// Fetch events from Polymarket using /events endpoint with text search and pagination
@@ -397,11 +422,16 @@ impl CryptoEventProvider {
             asset: asset.to_string(),
             target_price,
             target_date,
+            start_date: None, // Price-target markets don't have a specific start time in /events response
             prediction_type,
             title: question,
             description: market.description.clone(),
             yes_price: market.outcome_prices.as_ref().and_then(|p| p.first().copied()),
             no_price: market.outcome_prices.as_ref().and_then(|p| p.get(1).copied()),
+            yes_start_price: None, // Don't have opening prices for price-target markets
+            no_start_price: None,
+            current_crypto_price: None, // Not available in price-target markets
+            reference_price: None,      // Not applicable for price-target markets
             volume: market.volume,
             liquidity: market.liquidity,
             status: if market.closed.unwrap_or(false) {
@@ -417,6 +447,8 @@ impl CryptoEventProvider {
     ///
     /// Similar to parse_polymarket_market() but uses PolymarketMarketSimple struct.
     /// Used for directional markets (Up/Down binary markets).
+    ///
+    /// Extracts both current and opening prices for price movement analysis.
     fn parse_polymarket_market_simple(&self, market: &PolymarketMarketSimple) -> Option<CryptoMarket> {
         let question = market.question.clone();
 
@@ -446,17 +478,37 @@ impl CryptoEventProvider {
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|| Utc::now() + chrono::Duration::days(365));
 
+        // Parse start date (when market opened)
+        let start_date = market
+            .start_date
+            .as_ref()
+            .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.with_timezone(&Utc));
+
+        // For directional markets with outcome_prices, those are current market betting prices
+        // Opening prices would typically be 0.5 for a new market (50/50 split)
+        // We use 0.5 as the starting price unless we have historical data
+        let current_yes = market.outcome_prices.as_ref().and_then(|p| p.first().copied());
+        let current_no = market.outcome_prices.as_ref().and_then(|p| p.get(1).copied());
+
         Some(CryptoMarket {
             market_id: format!("polymarket:{}", market.condition_id),
             platform: "polymarket".to_string(),
             asset: asset.to_string(),
             target_price,
             target_date,
+            start_date,
             prediction_type,
             title: question,
             description: market.description.clone(),
-            yes_price: market.outcome_prices.as_ref().and_then(|p| p.first().copied()),
-            no_price: market.outcome_prices.as_ref().and_then(|p| p.get(1).copied()),
+            yes_price: current_yes,
+            no_price: current_no,
+            yes_start_price: Some(0.5), // Default opening price for new market
+            no_start_price: Some(0.5),  // Markets typically start at 50/50
+            // For directional markets, we need to fetch current and reference crypto prices
+            // from the oracle source (Chainlink, etc.)
+            current_crypto_price: None, // TODO: Fetch from resolution_source (Chainlink API)
+            reference_price: None,      // TODO: Extract from market history or Oracle opening
             volume: market.volume,
             liquidity: market.liquidity,
             status: if market.closed.unwrap_or(false) {
@@ -664,6 +716,7 @@ impl CryptoEventProvider {
             asset: asset.to_string(),
             target_price,
             target_date,
+            start_date: None, // Kalshi API doesn't provide start date
             prediction_type,
             title: market.title.clone(),
             description: market.subtitle.clone(),
@@ -671,6 +724,10 @@ impl CryptoEventProvider {
             yes_price: market.yes_ask.map(|p| p as f64 / 100.0),
             // Use no_ask for no_price (what you'd pay to buy NO)
             no_price: market.no_ask.map(|p| p as f64 / 100.0),
+            yes_start_price: None, // Kalshi doesn't provide opening prices
+            no_start_price: None,
+            current_crypto_price: None, // Would need to fetch from external price source
+            reference_price: Some(target_price), // For Kalshi, the target price is the reference
             volume: market.volume.map(|v| v as f64),
             liquidity: market.open_interest.map(|o| o as f64),
             // Kalshi uses "active" for open/tradeable markets
@@ -1253,6 +1310,7 @@ struct PolymarketMarketSimple {
     condition_id: String,
     question: String,
     description: Option<String>,
+    start_date: Option<String>,
     end_date: Option<String>,
     #[serde(default, deserialize_with = "string_or_number::deserialize_outcome_prices")]
     outcome_prices: Option<Vec<f64>>,
@@ -1261,6 +1319,9 @@ struct PolymarketMarketSimple {
     #[serde(default, deserialize_with = "string_or_number::deserialize")]
     liquidity: Option<f64>,
     closed: Option<bool>,
+    /// Chainlink or other oracle providing resolution price
+    #[serde(default)]
+    resolution_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
