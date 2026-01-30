@@ -16,9 +16,10 @@ use arbees_rust_core::redis::bus::RedisBus;
 use arbees_rust_core::clients::kalshi::KalshiClient;
 use dotenv::dotenv;
 use futures_util::StreamExt;
+use redis::AsyncCommands;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -217,8 +218,13 @@ async fn main() -> Result<()> {
         }
     }));
 
+    // Store multi_market_manager for reuse
+    let mm_clone_discovery = multi_market_manager.clone();
+    let mm_clone_heartbeat = multi_market_manager.clone();
+    let mm_clone_startup = multi_market_manager.clone();
+
     // 8. Multi-Market Discovery Loop (for crypto, economics, politics)
-    if let Some(mm_manager) = multi_market_manager.clone() {
+    if let Some(mm_manager) = mm_clone_discovery {
         let mm_interval = config.multi_market_discovery_interval_secs;
         tasks.push(tokio::spawn(async move {
             info!(
@@ -233,7 +239,7 @@ async fn main() -> Result<()> {
     }
 
     // 9. Multi-Market Heartbeat Handler - with auto-reconnect
-    if let Some(mm_manager) = multi_market_manager {
+    if let Some(mm_manager) = mm_clone_heartbeat {
         let redis_bus_clone3 = redis_bus.clone();
         tasks.push(tokio::spawn(async move {
             info!("Multi-market manager listening for shard heartbeats (auto-reconnect enabled)...");
@@ -261,6 +267,111 @@ async fn main() -> Result<()> {
             system_monitor_clone.check_system_health().await;
             tokio::time::sleep(Duration::from_secs(monitor_interval)).await;
         }
+    }));
+
+    // 11. Startup State Request Handler - Service restart recovery
+    let gm_clone_startup = game_manager.clone();
+    let redis_bus_startup = redis_bus.clone();
+    tasks.push(tokio::spawn(async move {
+        info!("Startup state request handler initialized (auto-reconnect enabled)...");
+        let mut stream = redis_bus_startup
+            .subscribe_with_reconnect(vec!["orchestrator:startup_state_request".to_string()])
+            .into_message_stream();
+
+        while let Some(msg) = stream.next().await {
+            if let Ok(payload_str) = msg.get_payload::<String>() {
+                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+                    // Get monitor_type from request
+                    if let Some(monitor_type) = payload.get("monitor_type").and_then(|v| v.as_str()) {
+                        let response_channel = format!("orchestrator:startup_state_response:{}", monitor_type);
+
+                        // Collect assignments for the requesting monitor type
+                        let mut assignments_map = serde_json::Map::new();
+
+                        match monitor_type {
+                            "kalshi" => {
+                                // For Kalshi: send all multi-market assignments with kalshi_market_id
+                                if let Some(mm) = &mm_clone_startup {
+                                    let assignments_lock = mm.get_assignments();
+                                    let assignments = assignments_lock.read().await;
+                                    let kalshi_markets: Vec<_> = assignments
+                                        .values()
+                                        .filter(|a| a.kalshi_market_id.is_some())
+                                        .cloned()
+                                        .collect();
+
+                                    if !kalshi_markets.is_empty() {
+                                        debug!(
+                                            "Responding to Kalshi startup state request with {} markets",
+                                            kalshi_markets.len()
+                                        );
+                                        if let Ok(json_value) = serde_json::to_value(&kalshi_markets) {
+                                            assignments_map.insert("markets".to_string(), json_value);
+                                        }
+                                    }
+                                }
+                            }
+                            "polymarket" => {
+                                // For Polymarket: send all multi-market assignments with polymarket_market_id
+                                if let Some(mm) = &mm_clone_startup {
+                                    let assignments_lock = mm.get_assignments();
+                                    let assignments = assignments_lock.read().await;
+                                    let polymarket_markets: Vec<_> = assignments
+                                        .values()
+                                        .filter(|a| a.polymarket_market_id.is_some())
+                                        .cloned()
+                                        .collect();
+
+                                    if !polymarket_markets.is_empty() {
+                                        debug!(
+                                            "Responding to Polymarket startup state request with {} markets",
+                                            polymarket_markets.len()
+                                        );
+                                        if let Ok(json_value) = serde_json::to_value(&polymarket_markets) {
+                                            assignments_map.insert("markets".to_string(), json_value);
+                                        }
+                                    }
+                                }
+                            }
+                            "game_shard" => {
+                                // For game_shard: send sports market assignments
+                                let assignments_lock = gm_clone_startup.get_assignments();
+                                let assignments = assignments_lock.read().await;
+                                if !assignments.is_empty() {
+                                    debug!(
+                                        "Responding to game_shard startup state request with {} games",
+                                        assignments.len()
+                                    );
+                                    let games: Vec<_> = assignments.values().cloned().collect();
+                                    if let Ok(json_value) = serde_json::to_value(&games) {
+                                        assignments_map.insert("games".to_string(), json_value);
+                                    }
+                                }
+                            }
+                            _ => {
+                                debug!("Unknown monitor type for startup state request: {}", monitor_type);
+                            }
+                        }
+
+                        // Publish response
+                        if let Ok(response_json) = serde_json::to_string(&assignments_map) {
+                            let mut conn = match redis_bus_startup.get_connection().await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error!("Failed to get Redis connection for startup state response: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            if let Err(e) = conn.publish::<&str, &str, ()>(&response_channel, &response_json).await {
+                                error!("Failed to publish startup state response to {}: {}", response_channel, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        error!("Startup state request handler exited unexpectedly");
     }));
 
     // Wait for signal

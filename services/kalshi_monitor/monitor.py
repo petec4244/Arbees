@@ -268,6 +268,12 @@ class KalshiMonitor:
 
         logger.info("KalshiMonitor started successfully")
 
+        # REQUEST CURRENT ASSIGNMENTS FROM ORCHESTRATOR ON STARTUP
+        # This ensures that if the monitor was restarted, it recovers assignments
+        # without waiting for new discoveries (which could take minutes)
+        logger.info("Requesting current Kalshi market assignments from orchestrator...")
+        await self._request_startup_state()
+
         # Run concurrent tasks
         await asyncio.gather(
             self._assignment_listener(),
@@ -295,6 +301,49 @@ class KalshiMonitor:
         await self.redis.disconnect()
 
         logger.info(f"KalshiMonitor stopped. Published {self._prices_published} prices.")
+
+    async def _request_startup_state(self):
+        """Request current market assignments from orchestrator on startup.
+
+        This ensures monitors recover quickly after restart without waiting for
+        new market discoveries (which can take several minutes).
+        """
+        try:
+            # Request current state from orchestrator
+            request_channel = "orchestrator:startup_state_request"
+            response_channel = "orchestrator:startup_state_response:kalshi"
+
+            # Subscribe to response channel BEFORE making the request
+            # (otherwise we might miss the response)
+            responses_received = []
+
+            async def collect_response(data: dict):
+                responses_received.append(data)
+
+            await self.redis.subscribe(response_channel, collect_response)
+
+            # Send startup state request
+            await self.redis.publish(request_channel, {
+                "monitor_type": "kalshi",
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+            # Wait for response with 10-second timeout
+            start_time = asyncio.get_event_loop().time()
+            while not responses_received and asyncio.get_event_loop().time() - start_time < 10:
+                await asyncio.sleep(0.1)
+
+            if responses_received:
+                assignments = responses_received[0]
+                logger.info(f"Received {len(assignments.get('markets', []))} Kalshi market assignments from orchestrator")
+
+                # Process each assignment immediately
+                for assignment in assignments.get("markets", []):
+                    await self._handle_assignment(assignment)
+            else:
+                logger.warning("No startup state response from orchestrator (timeout after 10s)")
+        except Exception as e:
+            logger.warning(f"Failed to request startup state: {e} (will wait for assignment listener)")
 
     async def _assignment_listener(self):
         """Subscribe to market assignment messages from Orchestrator."""
