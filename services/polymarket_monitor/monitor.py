@@ -43,6 +43,50 @@ except ImportError:
     logger.warning("pyzmq not installed - ZMQ publishing disabled")
 
 
+def extract_asset_from_market_title(title: str) -> Optional[str]:
+    """
+    Extract crypto asset name from Polymarket market title.
+
+    Examples:
+        "Will Bitcoin reach $100,000 by end of 2026?" -> "BTC"
+        "Ethereum price above $3000 tomorrow?" -> "ETH"
+        "Solana (SOL) above $250?" -> "SOL"
+        "XRP ends 2026 above $5?" -> "XRP"
+
+    Known crypto assets: BTC, ETH, SOL, XRP, DOGE, AVAX, CARDANO, POLKADOT
+    """
+    if not title:
+        return None
+
+    title_upper = title.upper()
+
+    # Direct word matching for known assets
+    asset_keywords = {
+        "BITCOIN": "BTC",
+        "BTC": "BTC",
+        "ETHEREUM": "ETH",
+        "ETH": "ETH",
+        "SOLANA": "SOL",
+        "SOL": "SOL",
+        "XRP": "XRP",
+        "RIPPLE": "XRP",
+        "DOGE": "DOGE",
+        "DOGECOIN": "DOGE",
+        "CARDANO": "ADA",
+        "ADA": "ADA",
+        "POLKADOT": "DOT",
+        "DOT": "DOT",
+        "AVALANCHE": "AVAX",
+        "AVAX": "AVAX",
+    }
+
+    for keyword, asset in asset_keywords.items():
+        if keyword in title_upper:
+            return asset
+
+    return None
+
+
 class PolymarketMonitor:
     """
     Monitors Polymarket markets via VPN and publishes prices to Redis.
@@ -64,6 +108,10 @@ class PolymarketMonitor:
         # SIMPLIFIED: token_id -> {condition_id, game_id, market_type}
         # This is all we need to route incoming prices to the right market
         self._token_to_market: dict[str, dict] = {}
+
+        # Market metadata: condition_id -> {title, asset, game_id, market_type}
+        # Used to store asset and title information for crypto markets
+        self._market_metadata: dict[str, dict] = {}
 
         # Active assignment per (game_id, market_type) -> condition_id
         # Used to prevent publishing stale markets after discovery corrections.
@@ -384,11 +432,23 @@ class PolymarketMonitor:
 
         Gracefully skips markets that don't exist on CLOB (may be Gamma-only or not yet synced).
         """
-        # Fetch market to get token IDs
+        # Fetch market to get token IDs and metadata
         market = await self.poly_client.get_market(condition_id)
         if not market:
             logger.debug(f"Market not found on CLOB (may be Gamma-only or not yet synced): {condition_id}")
             return
+
+        # Extract market title and asset
+        market_title = market.get("question", market.get("title", ""))
+        asset = extract_asset_from_market_title(market_title) if market_type == "crypto" else None
+
+        # Store metadata for later use
+        self._market_metadata[condition_id] = {
+            "title": market_title,
+            "asset": asset,
+            "game_id": game_id,
+            "market_type": market_type,
+        }
 
         # Get token IDs (may be in clobTokenIds or resolve from market)
         tokens_raw = market.get("clobTokenIds", "[]")
@@ -509,13 +569,17 @@ class PolymarketMonitor:
         if active and active != condition_id:
             return
 
+        # Extract asset from metadata if available (for crypto markets)
+        meta = self._market_metadata.get(condition_id, {})
+        asset = meta.get("asset")
+
         # Minimal normalization: use price as-is, with market routing info
         normalized_price = MarketPrice(
             market_id=condition_id,
             platform=Platform.POLYMARKET,
             game_id=game_id,
             market_title=price.market_title,
-            contract_team=None,  # Simplified: don't track team name
+            contract_team=asset,  # For crypto markets, store the extracted asset (BTC, ETH, etc.)
             yes_bid=price.yes_bid,
             yes_ask=price.yes_ask,
             yes_bid_size=price.yes_bid_size,
@@ -615,7 +679,7 @@ class PolymarketMonitor:
                                 platform=Platform.POLYMARKET,
                                 game_id=game_id,
                                 market_title=meta.get("title", polled.market_title),
-                                contract_team=None,  # Unknown team
+                                contract_team=meta.get("asset"),  # Asset for crypto markets
                                 yes_bid=polled.yes_bid,
                                 yes_ask=polled.yes_ask,
                                 yes_bid_size=float(getattr(polled, "yes_bid_size", 0.0) or 0.0),
@@ -678,13 +742,17 @@ class PolymarketMonitor:
                         title = meta.get("title", "")
                         if outcome and outcome not in title:
                             title = f"{title} [{outcome}]"
-                        
+
+                        # For crypto markets, preserve asset; for sports, use outcome (team)
+                        market_type = meta.get("market_type", "moneyline")
+                        contract_team = meta.get("asset") if market_type == "crypto" else outcome
+
                         normalized = MarketPrice(
                             market_id=condition_id,
                             platform=Platform.POLYMARKET,
                             game_id=game_id,
                             market_title=title,
-                            contract_team=outcome,
+                            contract_team=contract_team,
                             yes_bid=yes_bid,
                             yes_ask=yes_ask,
                             yes_bid_size=0.0,

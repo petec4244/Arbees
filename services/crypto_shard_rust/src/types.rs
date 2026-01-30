@@ -59,7 +59,16 @@ pub enum Direction {
     Short,
 }
 
-/// ZMQ envelope wrapper
+/// ZMQ envelope wrapper for non-generic payloads (prices with two-step deserialization)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceZmqEnvelope {
+    pub seq: u64,
+    pub timestamp_ms: i64,
+    pub source: String,
+    pub payload: serde_json::Value,  // Non-generic for two-step parsing
+}
+
+/// ZMQ envelope wrapper (generic - for execution requests and other typed payloads)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZmqEnvelope<T> {
     pub seq: u64,

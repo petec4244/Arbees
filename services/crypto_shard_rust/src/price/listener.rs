@@ -5,7 +5,7 @@
 //! Measures end-to-end latency from monitor publication to processing.
 
 use crate::price::data::{CryptoPriceData, IncomingCryptoPrice};
-use crate::types::ZmqEnvelope;
+use crate::types::PriceZmqEnvelope;
 use anyhow::Result;
 use chrono::Utc;
 use log::{debug, error, info, warn};
@@ -205,31 +205,40 @@ impl CryptoPriceListener {
             debug!("[INSTRUMENTATION] Received message on topic: {}", topic);
         }
 
-        // Parse envelope
+        // Step 1: Parse envelope with Value payload
         let count_before = self.prices_received.load(Ordering::Relaxed);
-        let envelope: ZmqEnvelope<IncomingCryptoPrice> = match serde_json::from_slice(payload_bytes)
+        let envelope: PriceZmqEnvelope = match serde_json::from_slice(payload_bytes)
         {
             Ok(e) => e,
             Err(e) => {
-                // Log parse errors at INFO to diagnose issues
                 if count_before < 20 {
                     let json_str = String::from_utf8_lossy(payload_bytes);
-                    let limit = json_str.len().min(2000); // Show up to 2000 chars
-                    info!("[INSTRUMENTATION] Parse error on message #{}: topic='{}' ({}B)\n  Error: {}\n  JSON: {}{}",
+                    let limit = json_str.len().min(2000);
+                    info!("[INSTRUMENTATION] Envelope parse error on message #{}: topic='{}' ({}B)\n  Error: {}\n  JSON: {}{}",
                         count_before, topic, payload_bytes.len(), e,
                         &json_str[..limit],
                         if json_str.len() > 2000 { "... (truncated)" } else { "" }
                     );
-                } else if (topic.to_string().starts_with("prices.kalshi") || topic.to_string().starts_with("prices.poly")) && count_before % 200 == 0 {
-                    info!("[INSTRUMENTATION] Kalshi/Poly parse error (msg #{}): {}", count_before, e);
-                } else {
-                    debug!("Failed to parse incoming crypto price: {}", e);
+                } else if count_before % 200 == 0 {
+                    info!("[INSTRUMENTATION] Envelope parse error (msg #{}): {}", count_before, e);
                 }
                 return;
             }
         };
 
-        let incoming = envelope.payload;
+        // Step 2: Parse payload into IncomingCryptoPrice
+        let incoming: IncomingCryptoPrice = match serde_json::from_value(envelope.payload.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                if count_before < 20 {
+                    info!("[INSTRUMENTATION] Payload parse error on message #{}: topic='{}'\n  Error: {}\n  Envelope: {:?}",
+                        count_before, topic, e, envelope);
+                } else if count_before % 200 == 0 {
+                    info!("[INSTRUMENTATION] Payload parse error (msg #{}): {}", count_before, e);
+                }
+                return;
+            }
+        };
 
         // Log successful parse for first few Kalshi messages
         if topic.to_string().contains("kalshi") && count_before < 10 {

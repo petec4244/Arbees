@@ -115,11 +115,38 @@ def parse_kalshi_ticker(ticker: str) -> Optional[dict]:
 
 def extract_team_from_ticker(ticker: str) -> Optional[str]:
     """
-    Extract team abbreviation from Kalshi ticker format.
+    Extract team abbreviation or asset from Kalshi ticker format.
+
+    Handles both sports and crypto tickers:
+    - Sports: KXNHLGAME-26JAN27NSHBOS-BOS -> "BOS"
+    - Crypto: KXBTCMINY-27JAN01-80000.00 -> "BTC"
+
     Convenience wrapper around parse_kalshi_ticker.
     """
+    # First try sports parsing
     parsed = parse_kalshi_ticker(ticker)
-    return parsed["contract_team"] if parsed else None
+    if parsed:
+        return parsed["contract_team"]
+
+    # For crypto tickers, extract asset from prefix
+    # Format: KX{ASSET}... (e.g., KXBTC, KXETH, KXSOL, KXDOGE, KXXRP)
+    if ticker.startswith("KX"):
+        # Extract characters after "KX" up to the next digit or hyphen
+        prefix = ticker[2:]  # Remove "KX"
+        asset = ""
+        for char in prefix:
+            if char.isalpha():
+                asset += char
+            else:
+                break
+
+        # Validate it's a known crypto asset (3-4 uppercase letters)
+        if 3 <= len(asset) <= 4 and asset.isupper():
+            logger.debug(f"[INSTRUMENTATION] Extracted crypto asset '{asset}' from ticker '{ticker}'")
+            return asset
+
+    logger.warning(f"[INSTRUMENTATION] Could not extract team/asset from ticker: {ticker}")
+    return None
 
 
 def get_complementary_ticker(ticker: str) -> Optional[str]:
@@ -632,11 +659,19 @@ class KalshiMonitor:
         self._prices_published += 1
         self._last_price_time = datetime.utcnow()
 
-        logger.debug(
-            f"Published Kalshi price: {ticker[:12]}... team='{team_name}' "
-            f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
-            f"game={game_id} (zmq=yes, redis={self._redis_publish_prices})"
-        )
+        # Log first 20 prices to confirm asset extraction
+        if self._prices_published < 20:
+            logger.info(
+                f"[INSTRUMENTATION] Published Kalshi price: {ticker[:20]}... asset='{team_name}' "
+                f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
+                f"game={game_id}"
+            )
+        else:
+            logger.debug(
+                f"Published Kalshi price: {ticker[:12]}... team='{team_name}' "
+                f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
+                f"game={game_id} (zmq=yes, redis={self._redis_publish_prices})"
+            )
 
     async def _publish_zmq_price(self, ticker: str, game_id: str, price: MarketPrice):
         """Publish price to ZMQ PUB socket (primary hot path)."""
