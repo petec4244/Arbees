@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod chained_price;
+pub mod chainlink;
 pub mod coingecko;
 pub mod coinbase;
 pub mod crypto_price;
