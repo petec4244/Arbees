@@ -5,6 +5,7 @@
 //! (Coinbase → Binance → CoinGecko fallback chain).
 
 use super::{CryptoStateData, EventInfo, EventProvider, EventState, EventStatus, StateData};
+use crate::clients::chainlink::ChainlinkClient;
 use crate::clients::chained_price::ChainedPriceProvider;
 use crate::clients::crypto_price::CryptoPriceProvider;
 use crate::models::{CryptoPredictionType, MarketType};
@@ -30,6 +31,8 @@ pub struct CryptoEventProvider {
     client: Client,
     /// Price provider with fallback chain
     price_provider: Arc<dyn CryptoPriceProvider>,
+    /// Chainlink oracle client for directional market prices
+    chainlink_client: ChainlinkClient,
     /// Cache for discovered markets
     market_cache: Arc<RwLock<HashMap<String, CryptoMarket>>>,
     /// Last cache update time
@@ -125,6 +128,7 @@ impl CryptoEventProvider {
         Self {
             client,
             price_provider,
+            chainlink_client: ChainlinkClient::new(),
             market_cache: Arc::new(RwLock::new(HashMap::new())),
             last_update: Arc::new(RwLock::new(None)),
             cache_ttl_secs: 300, // 5 minute cache
@@ -141,6 +145,41 @@ impl CryptoEventProvider {
         match *last {
             None => true,
             Some(t) => Utc::now().signed_duration_since(t).num_seconds() > self.cache_ttl_secs,
+        }
+    }
+
+    /// Enrich a market with current prices from Chainlink (for directional markets)
+    ///
+    /// For directional markets, tries to fetch current spot price from oracle.
+    /// If resolution_source contains a Chainlink stream URL, fetches the price.
+    async fn enrich_with_prices(&self, market: &mut CryptoMarket) {
+        // Only enrich directional markets (those are the ones with oracle sources)
+        // Price-target markets don't need current spot prices for resolution
+        if market.platform != "polymarket" {
+            return;
+        }
+
+        // For Polymarket directional markets, we would have resolution_source
+        // In the future, integrate with actual market data to get reference_price
+        // For now, we can only fetch current prices
+
+        // Map asset to Chainlink stream ID
+        // Example: "SOL" -> "sol-usd"
+        let stream_id = format!("{}-usd", market.asset.to_lowercase());
+
+        match self.chainlink_client.get_price(&stream_id).await {
+            Ok(price_data) => {
+                market.current_crypto_price = Some(price_data.price);
+                debug!(
+                    "Enriched market {} with current price: ${} ({})",
+                    market.market_id, price_data.price, price_data.symbol
+                );
+            }
+            Err(e) => {
+                debug!("Failed to fetch price for {}: {}", market.asset, e);
+                // Don't fail market discovery if price fetching fails
+                // Arbitrage detection will handle missing prices
+            }
         }
     }
 
@@ -170,6 +209,12 @@ impl CryptoEventProvider {
             Err(e) => {
                 warn!("Failed to fetch Kalshi crypto markets: {}", e);
             }
+        }
+
+        // Enrich markets with current prices from oracle feeds
+        // This is non-blocking - if price fetching fails, we continue with what we have
+        for market in &mut all_markets {
+            self.enrich_with_prices(market).await;
         }
 
         // Update cache
