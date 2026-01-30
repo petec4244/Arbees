@@ -228,7 +228,10 @@ services:
       SHARD_TYPE: "crypto"
       CRYPTO_SHARD_ID: "crypto_1"
       # ZMQ price subscriptions: Spot prices primary, Kalshi secondary (optional if not running)
-      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://crypto-spot-monitor:5560"
+      # Subscribe to Kalshi and spot prices
+      # Note: polymarket_monitor is behind VPN network and unreachable via hostname
+      # To add polymarket, create a separate service on arbees-network that bridges from VPN
+      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://crypto-spot-monitor:5560"
       CRYPTO_EXECUTION_PUB_ENDPOINT: "tcp://0.0.0.0:5559"
       # Risk management
       CRYPTO_MIN_EDGE_PCT: "3.0"
