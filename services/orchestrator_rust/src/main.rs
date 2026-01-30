@@ -284,6 +284,7 @@ async fn main() -> Result<()> {
                     // Get monitor_type from request
                     if let Some(monitor_type) = payload.get("monitor_type").and_then(|v| v.as_str()) {
                         let response_channel = format!("orchestrator:startup_state_response:{}", monitor_type);
+                        info!("Received startup state request from monitor: {}", monitor_type);
 
                         // Collect assignments for the requesting monitor type
                         let mut assignments_map = serde_json::Map::new();
@@ -300,15 +301,15 @@ async fn main() -> Result<()> {
                                         .cloned()
                                         .collect();
 
-                                    if !kalshi_markets.is_empty() {
-                                        debug!(
-                                            "Responding to Kalshi startup state request with {} markets",
-                                            kalshi_markets.len()
-                                        );
-                                        if let Ok(json_value) = serde_json::to_value(&kalshi_markets) {
-                                            assignments_map.insert("markets".to_string(), json_value);
-                                        }
+                                    info!(
+                                        "Responding to Kalshi startup state request with {} markets",
+                                        kalshi_markets.len()
+                                    );
+                                    if let Ok(json_value) = serde_json::to_value(&kalshi_markets) {
+                                        assignments_map.insert("markets".to_string(), json_value);
                                     }
+                                } else {
+                                    info!("Multi-market manager not available for Kalshi request");
                                 }
                             }
                             "polymarket" => {
@@ -322,15 +323,15 @@ async fn main() -> Result<()> {
                                         .cloned()
                                         .collect();
 
-                                    if !polymarket_markets.is_empty() {
-                                        debug!(
-                                            "Responding to Polymarket startup state request with {} markets",
-                                            polymarket_markets.len()
-                                        );
-                                        if let Ok(json_value) = serde_json::to_value(&polymarket_markets) {
-                                            assignments_map.insert("markets".to_string(), json_value);
-                                        }
+                                    info!(
+                                        "Responding to Polymarket startup state request with {} markets",
+                                        polymarket_markets.len()
+                                    );
+                                    if let Ok(json_value) = serde_json::to_value(&polymarket_markets) {
+                                        assignments_map.insert("markets".to_string(), json_value);
                                     }
+                                } else {
+                                    info!("Multi-market manager not available for Polymarket request");
                                 }
                             }
                             "game_shard" => {
@@ -363,9 +364,19 @@ async fn main() -> Result<()> {
                                 }
                             };
 
-                            if let Err(e) = conn.publish::<&str, &str, ()>(&response_channel, &response_json).await {
-                                error!("Failed to publish startup state response to {}: {}", response_channel, e);
+                            match conn.publish::<&str, &str, ()>(&response_channel, &response_json).await {
+                                Ok(_) => {
+                                    info!(
+                                        "Published startup state response to channel: {}",
+                                        response_channel
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("Failed to publish startup state response to {}: {}", response_channel, e);
+                                }
                             }
+                        } else {
+                            error!("Failed to serialize startup state response for {}", monitor_type);
                         }
                     }
                 }
