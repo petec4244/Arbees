@@ -235,8 +235,13 @@ class KalshiMonitor:
         try:
             self._zmq_context = zmq.asyncio.Context()
             self._zmq_pub = self._zmq_context.socket(zmq.PUB)
+            # Configure socket for high-throughput price publishing
+            # Increase send buffer (HWM) to 100k messages to handle Kalshi price flood
+            self._zmq_pub.setsockopt(zmq.SNDHWM, 100000)
+            # Enable linger on disconnect to ensure last messages are sent
+            self._zmq_pub.setsockopt(zmq.LINGER, 1000)
             self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
-            logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port} (primary hot path)")
+            logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port} (HWM=100k, primary hot path)")
         except Exception as e:
             logger.error(f"Failed to initialize ZMQ: {e}")
             raise RuntimeError(f"ZMQ initialization failed: {e}")
