@@ -558,9 +558,9 @@ impl CryptoShard {
             let price_staleness = Duration::from_secs(self.config.price_staleness_secs);
             if asset_prices.iter().all(|p| p.is_stale(price_staleness)) {
                 let warning_count = self.stats.stale_price_warnings.fetch_add(1, Ordering::Relaxed);
-                // Rate limit: only log every 100 stale price events
-                if warning_count % 100 == 0 {
-                    warn!("Stale prices for event {} (logged {} stale price events)", event_id, warning_count + 1);
+                // Rate limit: only log every 1000 stale price events (debug level to reduce noise)
+                if warning_count % 1000 == 0 {
+                    debug!("Stale prices for event {} (logged {} stale price events)", event_id, warning_count + 1);
                 }
                 continue;
             }
