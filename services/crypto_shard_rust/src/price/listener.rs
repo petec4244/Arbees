@@ -254,15 +254,16 @@ impl CryptoPriceListener {
 
         // ALWAYS log for first 5 messages regardless of source
         if count < 5 {
-            info!("[INSTRUMENTATION] ✓ Stored price #{}: asset={} platform={} bid={:.4} ask={:.4} (topic={})",
-                count, price_data.asset, price_data.platform, price_data.yes_bid, price_data.yes_ask, topic);
+            info!("[INSTRUMENTATION] ✓ Price #{}: {} | {} (${:.4}/${:.4}) from {}",
+                count, price_data.asset, price_data.platform, price_data.yes_bid, price_data.yes_ask,
+                topic.split('.').nth(1).unwrap_or("unknown"));
         }
 
-        // Log every 100 prices to track flow
+        // Log every 100 prices to track flow (shows aggregated prices by asset)
         if count % 100 == 0 {
             info!(
-                "[INSTRUMENTATION] Received {} prices total. Latest: {}|{} bid={:.4} ask={:.4} (topic={})",
-                count, price_data.asset, price_data.platform, price_data.yes_bid, price_data.yes_ask, topic
+                "[INSTRUMENTATION] Received {} prices total. Latest: {} | {} (${:.4}/${:.4})",
+                count, price_data.asset, price_data.platform, price_data.yes_bid, price_data.yes_ask
             );
         }
 
