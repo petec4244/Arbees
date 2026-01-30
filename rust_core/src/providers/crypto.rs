@@ -149,7 +149,11 @@ impl CryptoEventProvider {
         Ok(())
     }
 
-    /// Fetch crypto markets from Polymarket Gamma API using /events endpoint with text search
+    /// Fetch crypto markets from Polymarket Gamma API
+    ///
+    /// Uses two approaches:
+    /// 1. Text search for price-target markets (e.g., "will BTC reach $100k")
+    /// 2. Direct slug lookup for directional markets (e.g., "btc-updown-15m")
     async fn fetch_polymarket_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
         // Search terms for crypto markets - use full names for better API-side filtering
         const CRYPTO_SEARCH_TERMS: &[&str] = &[
@@ -163,8 +167,30 @@ impl CryptoEventProvider {
             "crypto",
         ];
 
+        // Known recurring directional market series (15-minute, hourly, 4-hour)
+        // These are high-velocity binary markets perfect for crypto arbitrage
+        // Discovered by examining: https://github.com/peterpeterparker/Polymarket-Kalshi-Arbitrage-bot
+        const DIRECTIONAL_SERIES: &[&str] = &[
+            // 15-minute markets (highest velocity)
+            "btc-updown-15m",
+            "eth-updown-15m",
+            "sol-updown-15m",
+            "xrp-updown-15m",
+            // Hourly markets
+            "btc-up-or-down-hourly",
+            "eth-up-or-down-hourly",
+            "solana-up-or-down-hourly",
+            "xrp-up-or-down-hourly",
+            // 4-hour markets (optional - slower)
+            "btc-updown-4h",
+            "eth-updown-4h",
+            "sol-updown-4h",
+            "xrp-updown-4h",
+        ];
+
         let mut all_markets: HashMap<String, CryptoMarket> = HashMap::new();
 
+        // First, search for price-target markets using text search
         for search_term in CRYPTO_SEARCH_TERMS {
             match self.fetch_polymarket_events_for_query(search_term).await {
                 Ok(markets) => {
@@ -179,6 +205,32 @@ impl CryptoEventProvider {
             }
         }
 
+        // Then, fetch directional markets using slug-based lookup
+        // (these don't appear in text search results - must use /markets?slug= endpoint)
+        let mut directional_found = 0;
+        for series in DIRECTIONAL_SERIES {
+            match self.fetch_polymarket_directional_market(series).await {
+                Ok(market) => {
+                    directional_found += 1;
+                    // Dedupe by market_id
+                    all_markets.entry(market.market_id.clone()).or_insert(market);
+                }
+                Err(_e) => {
+                    // Directional markets not found - they may not exist on Polymarket
+                    // or may have different naming conventions
+                }
+            }
+        }
+
+        if directional_found == 0 {
+            debug!(
+                "No Polymarket directional markets found via slug lookup (tried {} series)",
+                DIRECTIONAL_SERIES.len()
+            );
+        } else {
+            info!("Found {} directional (Up/Down) markets on Polymarket", directional_found);
+        }
+
         let crypto_markets: Vec<CryptoMarket> = all_markets.into_values().collect();
 
         if !crypto_markets.is_empty() {
@@ -190,6 +242,54 @@ impl CryptoEventProvider {
         }
 
         Ok(crypto_markets)
+    }
+
+    /// Fetch a specific directional market from Polymarket using slug-based lookup
+    ///
+    /// Directional markets (e.g., "btc-updown-15m") use the /markets?slug= endpoint
+    /// for direct lookup, not the text search /events endpoint.
+    ///
+    /// Returns the first matching market for the given slug.
+    async fn fetch_polymarket_directional_market(&self, slug: &str) -> Result<CryptoMarket> {
+        const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
+
+        let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch Polymarket directional market")?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Polymarket API error for slug {}: {}", slug, response.status()));
+        }
+
+        let text = response.text().await?;
+        let markets: Vec<PolymarketMarketSimple> = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                let snippet: String = text.chars().take(500).collect();
+                warn!("Polymarket directional market JSON parse error: {}. Snippet: {}", e, snippet);
+                return Err(anyhow!("JSON parse error: {}", e));
+            }
+        };
+
+        // Find the first active/non-closed market from the results
+        for market in markets {
+            if market.closed.unwrap_or(false) {
+                continue;
+            }
+
+            // Parse as crypto market
+            if let Some(crypto_market) = self.parse_polymarket_market_simple(&market) {
+                debug!("Found directional market for slug '{}': {}", slug, crypto_market.title);
+                return Ok(crypto_market);
+            }
+        }
+
+        Err(anyhow!("No valid crypto markets found for slug '{}'", slug))
     }
 
     /// Fetch events from Polymarket using /events endpoint with text search and pagination
@@ -270,8 +370,73 @@ impl CryptoEventProvider {
             .iter()
             .find(|&asset| contains_crypto_asset(&question, asset))?;
 
-        // Try to parse price target from question
-        let (target_price, prediction_type) = self.parse_price_target(&question)?;
+        // Check if this is a directional market (Up or Down) without explicit price target
+        let is_directional = is_polymarket_directional(&question);
+
+        // Try to parse price target from question (for price-target markets)
+        // For directional markets, use a default target price (50% midpoint)
+        let (target_price, prediction_type) = if is_directional {
+            // Directional markets don't have explicit price targets
+            // Use a placeholder (0.0) and mark as directional
+            (10000.0, CryptoPredictionType::PriceTarget) // Placeholder - actual comparison is binary Up/Down
+        } else {
+            self.parse_price_target(&question)?
+        };
+
+        // Parse end date
+        let target_date = market
+            .end_date
+            .as_ref()
+            .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::days(365));
+
+        Some(CryptoMarket {
+            market_id: format!("polymarket:{}", market.condition_id),
+            platform: "polymarket".to_string(),
+            asset: asset.to_string(),
+            target_price,
+            target_date,
+            prediction_type,
+            title: question,
+            description: market.description.clone(),
+            yes_price: market.outcome_prices.as_ref().and_then(|p| p.first().copied()),
+            no_price: market.outcome_prices.as_ref().and_then(|p| p.get(1).copied()),
+            volume: market.volume,
+            liquidity: market.liquidity,
+            status: if market.closed.unwrap_or(false) {
+                EventStatus::Completed
+            } else {
+                EventStatus::Live
+            },
+            discovered_at: Utc::now(),
+        })
+    }
+
+    /// Parse a Polymarket market from the /markets?slug= endpoint (directional markets)
+    ///
+    /// Similar to parse_polymarket_market() but uses PolymarketMarketSimple struct.
+    /// Used for directional markets (Up/Down binary markets).
+    fn parse_polymarket_market_simple(&self, market: &PolymarketMarketSimple) -> Option<CryptoMarket> {
+        let question = market.question.clone();
+
+        // Check if it's a crypto market using word-boundary matching
+        let asset = TRACKED_ASSETS
+            .iter()
+            .find(|&asset| contains_crypto_asset(&question, asset))?;
+
+        // Check if this is a directional market (Up or Down) without explicit price target
+        let is_directional = is_polymarket_directional(&question);
+
+        // Try to parse price target from question (for price-target markets)
+        // For directional markets, use a default target price (50% midpoint)
+        let (target_price, prediction_type) = if is_directional {
+            // Directional markets don't have explicit price targets
+            // Use a placeholder (0.0) and mark as directional
+            (10000.0, CryptoPredictionType::PriceTarget) // Placeholder - actual comparison is binary Up/Down
+        } else {
+            self.parse_price_target(&question)?
+        };
 
         // Parse end date
         let target_date = market
@@ -445,6 +610,13 @@ impl CryptoEventProvider {
 
     /// Parse a Kalshi market into a CryptoMarket if it's crypto-related
     fn parse_kalshi_crypto(&self, market: &KalshiMarket) -> Option<CryptoMarket> {
+        // FILTER: Only accept 15-minute intraday markets (INXBTC, INXETH)
+        // We focus on the fastest markets for highest velocity arbitrage
+        if !is_intraday_market(&market.ticker) {
+            debug!("Filtered non-intraday market: {} ({})", market.ticker, market.title);
+            return None;
+        }
+
         // Check if it's a crypto market using word-boundary matching
         let asset = TRACKED_ASSETS
             .iter()
@@ -833,6 +1005,57 @@ fn extract_price_from_kalshi_ticker(ticker: &str) -> Option<f64> {
     None
 }
 
+/// Check if a Kalshi market is a 15-minute intraday market.
+/// We ONLY trade these fast markets for crypto arbitrage.
+/// Intraday markets expire every 15 minutes, providing high-velocity arbitrage opportunities.
+///
+/// Configuration:
+/// - CRYPTO_ALLOW_ALL_TIMEFRAMES=false (default): Only INXBTC/INXETH
+/// - CRYPTO_ALLOW_ALL_TIMEFRAMES=true: Include all Kalshi crypto series
+fn is_intraday_market(ticker: &str) -> bool {
+    // Check if we're allowing all timeframes
+    let allow_all = std::env::var("CRYPTO_ALLOW_ALL_TIMEFRAMES")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if allow_all {
+        // If enabled, accept all crypto markets (no filtering)
+        return true;
+    }
+
+    // Default: Only 15-minute intraday markets
+    ticker.starts_with("INXBTC") || ticker.starts_with("INXETH")
+}
+
+/// Check if a Polymarket market is a directional (Up/Down) market.
+/// Directional markets are simple binary outcome markets predicting price movement direction.
+/// Examples:
+/// - "Bitcoin Up or Down 15m" (15-minute price direction)
+/// - "Ethereum Up or Down Hourly" (1-hour price direction)
+/// - "SOL Up or Down 4h" (4-hour price direction)
+///
+/// These markets have high velocity and real liquidity, perfect for crypto arbitrage.
+fn is_polymarket_directional(title: &str) -> bool {
+    let t = title.to_lowercase();
+
+    // Check for directional market patterns
+    let has_direction = t.contains("up or down") ||
+                       t.contains("up/down") ||
+                       t.contains("updown");
+
+    // Check for timeframe indicators (15m, hourly, 4h, etc.)
+    let has_timeframe = t.contains("15m") ||
+                       t.contains("15-min") ||
+                       t.contains("15 min") ||
+                       t.contains("hourly") ||
+                       t.contains("hour") ||
+                       t.contains("4h") ||
+                       t.contains("4-hour") ||
+                       t.contains("4 hour");
+
+    has_direction && has_timeframe
+}
+
 /// Check if text contains asset as a whole word (not part of another word)
 /// This prevents "Kenneth" from matching "ETH"
 fn contains_crypto_asset(text: &str, asset: &str) -> bool {
@@ -1023,6 +1246,23 @@ struct PolymarketMarket {
     closed: Option<bool>,
 }
 
+/// Polymarket market returned from /markets?slug= endpoint (directional markets)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolymarketMarketSimple {
+    condition_id: String,
+    question: String,
+    description: Option<String>,
+    end_date: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize_outcome_prices")]
+    outcome_prices: Option<Vec<f64>>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    volume: Option<f64>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    liquidity: Option<f64>,
+    closed: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct KalshiMarketsResponse {
     markets: Vec<KalshiMarket>,
@@ -1084,6 +1324,25 @@ mod tests {
         let provider = CryptoEventProvider::new();
         assert_eq!(provider.provider_name(), "CryptoEventProvider");
         assert!(!provider.supported_market_types().is_empty());
+    }
+
+    #[test]
+    fn test_intraday_filtering_kalshi() {
+        // Should accept intraday markets (INXBTC, INXETH)
+        assert!(is_intraday_market("INXBTC-30JAN25-1530"), "Should keep INXBTC");
+        assert!(is_intraday_market("INXBTC"), "Should keep INXBTC prefix");
+        assert!(is_intraday_market("INXETH-30JAN25-1545"), "Should keep INXETH");
+        assert!(is_intraday_market("INXETH"), "Should keep INXETH prefix");
+
+        // Should reject daily/weekly markets
+        assert!(!is_intraday_market("KXBTC-30JAN25"), "Should filter KXBTC daily");
+        assert!(!is_intraday_market("KXBTCD"), "Should filter KXBTCD daily");
+        assert!(!is_intraday_market("KXBTCW-FEB25"), "Should filter weekly");
+        assert!(!is_intraday_market("KXETH-30JAN25"), "Should filter daily ETH");
+        assert!(!is_intraday_market("KXSOL"), "Should filter SOL daily");
+        assert!(!is_intraday_market("KXDOGE"), "Should filter DOGE daily");
+        assert!(!is_intraday_market("KXBTCMAXY"), "Should filter yearly max");
+        assert!(!is_intraday_market("BTCPRICE"), "Should filter alternative ticker");
     }
 
     #[test]
