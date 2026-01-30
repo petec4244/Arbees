@@ -214,14 +214,14 @@ impl CryptoPriceListener {
                 // Log parse errors at INFO to diagnose issues
                 if count_before < 20 {
                     let json_str = String::from_utf8_lossy(payload_bytes);
-                    info!("[INSTRUMENTATION] Parse error on message #{}: topic='{}'\n  Error: {}\n  JSON (first 1000 chars): {}",
-                        count_before, topic, e,
-                        if json_str.len() > 1000 { &json_str[..1000] } else { &json_str }
+                    let limit = json_str.len().min(2000); // Show up to 2000 chars
+                    info!("[INSTRUMENTATION] Parse error on message #{}: topic='{}' ({}B)\n  Error: {}\n  JSON: {}{}",
+                        count_before, topic, payload_bytes.len(), e,
+                        &json_str[..limit],
+                        if json_str.len() > 2000 { "... (truncated)" } else { "" }
                     );
-                } else if topic.to_string().starts_with("prices.kalshi") || topic.to_string().starts_with("prices.poly") {
-                    if count_before % 100 == 0 {
-                        info!("[INSTRUMENTATION] Kalshi/Poly parse error (msg #{}): {}", count_before, e);
-                    }
+                } else if (topic.to_string().starts_with("prices.kalshi") || topic.to_string().starts_with("prices.poly")) && count_before % 200 == 0 {
+                    info!("[INSTRUMENTATION] Kalshi/Poly parse error (msg #{}): {}", count_before, e);
                 } else {
                     debug!("Failed to parse incoming crypto price: {}", e);
                 }
@@ -233,7 +233,8 @@ impl CryptoPriceListener {
 
         // Log successful parse for first few Kalshi messages
         if topic.to_string().contains("kalshi") && count_before < 10 {
-            info!("[INSTRUMENTATION] ✓ Parsed Kalshi message #{}: asset={} platform={}", count_before, incoming.asset, incoming.platform);
+            let asset_display = incoming.asset.as_deref().unwrap_or("UNKNOWN");
+            info!("[INSTRUMENTATION] ✓ Parsed Kalshi message #{}: asset={} platform={}", count_before, asset_display, incoming.platform);
         }
 
         // Calculate latency

@@ -38,8 +38,8 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingCryptoPrice {
     pub market_id: String,
-    pub platform: String,      // "kalshi" | "polymarket"
-    pub asset: String,          // "BTC", "ETH", etc.
+    pub platform: String,       // "kalshi" | "polymarket"
+    pub asset: Option<String>,  // "BTC", "ETH", etc. - may be null, extracted from market_id if so
     pub yes_bid: f64,           // Bid price (0-1)
     pub yes_ask: f64,           // Ask price (0-1)
     pub mid_price: Option<f64>, // Calculated if not provided
@@ -48,6 +48,42 @@ pub struct IncomingCryptoPrice {
     pub liquidity: Option<f64>, // Total available liquidity
     #[serde(deserialize_with = "deserialize_timestamp")]
     pub timestamp: DateTime<Utc>,
+}
+
+impl IncomingCryptoPrice {
+    /// Extract asset from market_id if not explicitly provided
+    pub fn resolve_asset(&self) -> String {
+        if let Some(asset) = &self.asset {
+            return asset.clone();
+        }
+
+        // Extract asset from market_id
+        // Kalshi format: "KXBTC-..." or "KXETH..." → extract "BTC" or "ETH"
+        // Polymarket format: condition ID (hex) → not extractable, use "UNKNOWN"
+        let market_id = &self.market_id;
+
+        if market_id.starts_with("KX") && market_id.len() > 2 {
+            // Kalshi: KXBTC, KXETH, KXDOGE, etc.
+            let rest = &market_id[2..]; // Skip "KX"
+            // Extract asset name before first dash or special char
+            if let Some(pos) = rest.find(|c: char| !c.is_alphabetic()) {
+                rest[..pos].to_uppercase()
+            } else {
+                rest.to_uppercase()
+            }
+        } else if market_id.starts_with("INX") {
+            // Kalshi intraday: INXBTC, INXETH, etc.
+            let rest = &market_id[3..]; // Skip "INX"
+            if let Some(pos) = rest.find(|c: char| !c.is_alphabetic()) {
+                rest[..pos].to_uppercase()
+            } else {
+                rest.to_uppercase()
+            }
+        } else {
+            // Polymarket or unknown - can't extract
+            "UNKNOWN".to_string()
+        }
+    }
 }
 
 /// Processed crypto price data (stored in memory)
@@ -103,10 +139,12 @@ impl From<IncomingCryptoPrice> for CryptoPriceData {
             .mid_price
             .unwrap_or_else(|| (incoming.yes_bid + incoming.yes_ask) / 2.0);
 
+        let asset = incoming.resolve_asset(); // Extract from market_id if null
+
         Self {
             market_id: incoming.market_id,
             platform: incoming.platform,
-            asset: incoming.asset,
+            asset,
             yes_bid: incoming.yes_bid,
             yes_ask: incoming.yes_ask,
             mid_price,
@@ -132,7 +170,7 @@ mod tests {
         let incoming = IncomingCryptoPrice {
             market_id: "btc_100k".to_string(),
             platform: "kalshi".to_string(),
-            asset: "BTC".to_string(),
+            asset: Some("BTC".to_string()),
             yes_bid: 0.45,
             yes_ask: 0.47,
             mid_price: None,
@@ -154,7 +192,7 @@ mod tests {
         let incoming = IncomingCryptoPrice {
             market_id: "eth".to_string(),
             platform: "polymarket".to_string(),
-            asset: "ETH".to_string(),
+            asset: Some("ETH".to_string()),
             yes_bid: 0.30,
             yes_ask: 0.32,
             mid_price: Some(0.315),
@@ -166,6 +204,44 @@ mod tests {
 
         let price: CryptoPriceData = incoming.into();
         assert_eq!(price.mid_price, 0.315);
+    }
+
+    #[test]
+    fn test_resolve_asset_from_kalshi_market_id() {
+        // Test Kalshi market format (KXBTC, KXETH, etc.)
+        let incoming = IncomingCryptoPrice {
+            market_id: "KXBTC-26JAN3017-T94249.99".to_string(),
+            platform: "kalshi".to_string(),
+            asset: None, // Asset is null, should be extracted
+            yes_bid: 0.45,
+            yes_ask: 0.47,
+            mid_price: None,
+            yes_bid_size: None,
+            yes_ask_size: None,
+            liquidity: None,
+            timestamp: Utc::now(),
+        };
+
+        assert_eq!(incoming.resolve_asset(), "BTC");
+    }
+
+    #[test]
+    fn test_resolve_asset_from_intraday_market_id() {
+        // Test Kalshi intraday format (INXBTC, INXETH, etc.)
+        let incoming = IncomingCryptoPrice {
+            market_id: "INXBTC-27JAN01-6000.00".to_string(),
+            platform: "kalshi".to_string(),
+            asset: None, // Asset is null, should be extracted
+            yes_bid: 0.45,
+            yes_ask: 0.47,
+            mid_price: None,
+            yes_bid_size: None,
+            yes_ask_size: None,
+            liquidity: None,
+            timestamp: Utc::now(),
+        };
+
+        assert_eq!(incoming.resolve_asset(), "BTC");
     }
 
     #[test]
