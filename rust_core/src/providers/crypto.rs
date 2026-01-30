@@ -303,23 +303,35 @@ impl CryptoEventProvider {
         })
     }
 
-    /// Fetch crypto markets from Kalshi Trading API
+    /// Fetch crypto markets from Kalshi API
     ///
-    /// Uses trading-api.kalshi.com (not api.elections.kalshi.com which is elections-only).
+    /// Uses api.elections.kalshi.com (Kalshi consolidated to a single API).
     /// Searches multiple crypto series tickers for short-term price prediction markets.
     async fn fetch_kalshi_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
-        // Kalshi Trading API base URL (different from elections API)
-        const KALSHI_TRADING_API: &str = "https://trading-api.kalshi.com/trade-api/v2";
+        // Kalshi API base URL (consolidated - includes crypto, elections, etc.)
+        const KALSHI_API: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
-        // Crypto series tickers to search - these are short-term price prediction markets
-        // Format: "Will Bitcoin be above $X at Y time?"
+        // Crypto series tickers to search - from kalshi.com/category/crypto/btc
+        // These include short-term (daily) and longer-term price prediction markets
         const CRYPTO_SERIES: &[&str] = &[
-            "KXBTC",       // Bitcoin price markets
-            "KXBTCD",      // Bitcoin daily
+            // Bitcoin short-term/daily markets (high frequency)
+            "KXBTC",       // Bitcoin price range today at 12pm EST
+            "KXBTCD",      // Bitcoin price today at 11am EST
             "KXBTCW",      // Bitcoin weekly
-            "KXETH",       // Ethereum price markets
+
+            // Bitcoin milestone/target markets
+            "KXBTCMAXY",   // How high will Bitcoin get this year (yearly max)
+            "KXBTCMINY",   // How low will Bitcoin fall this year (yearly min)
+            "KXBTCMAX150", // When will Bitcoin hit $150k
+            "KXBTC2025100",// Will Bitcoin cross $100k again this year
+            // Ethereum markets (likely similar naming)
+            "KXETH",       // Ethereum price range
             "KXETHD",      // Ethereum daily
+            "KXETHMAXY",   // Ethereum yearly max
+            // Other crypto
             "KXSOL",       // Solana
+            "KXDOGE",      // Dogecoin
+
             "INXBTC",      // Intraday Bitcoin (15-min markets)
             "INXETH",      // Intraday Ethereum
             "BTCPRICE",    // Alternative Bitcoin ticker
@@ -330,7 +342,7 @@ impl CryptoEventProvider {
 
         // Search each crypto series
         for series in CRYPTO_SERIES {
-            match self.fetch_kalshi_series(KALSHI_TRADING_API, series).await {
+            match self.fetch_kalshi_series(KALSHI_API, series).await {
                 Ok(markets) => {
                     for market in markets {
                         all_markets.entry(market.market_id.clone()).or_insert(market);
@@ -343,7 +355,7 @@ impl CryptoEventProvider {
         }
 
         // Also try a general search for any open crypto-related markets
-        match self.fetch_kalshi_general_crypto(KALSHI_TRADING_API).await {
+        match self.fetch_kalshi_general_crypto(KALSHI_API).await {
             Ok(markets) => {
                 for market in markets {
                     all_markets.entry(market.market_id.clone()).or_insert(market);
@@ -438,8 +450,28 @@ impl CryptoEventProvider {
             .iter()
             .find(|&asset| contains_crypto_asset(&market.title, asset))?;
 
-        // Try to parse price target
-        let (target_price, prediction_type) = self.parse_price_target(&market.title)?;
+        // Extract target price from floor_strike/cap_strike fields (more reliable than parsing title)
+        // - "greater" type: target is floor_strike (price must be above this)
+        // - "less" type: target is cap_strike (price must be below this)
+        // - "between" type: use floor_strike as the lower bound
+        let target_price = match market.strike_type.as_deref() {
+            Some("greater") => market.floor_strike,
+            Some("less") => market.cap_strike,
+            Some("between") => market.floor_strike, // Use lower bound for between ranges
+            _ => {
+                // Fallback to parsing from title if no strike type
+                self.parse_price_target(&market.title).map(|(p, _)| p)
+            }
+        }?;
+
+        // Determine prediction type from strike_type
+        let prediction_type = match market.strike_type.as_deref() {
+            Some("greater") | Some("less") | Some("between") => CryptoPredictionType::PriceTarget,
+            _ => self
+                .parse_price_target(&market.title)
+                .map(|(_, t)| t)
+                .unwrap_or(CryptoPredictionType::PriceTarget),
+        };
 
         // Parse end date
         let target_date = market
@@ -458,13 +490,16 @@ impl CryptoEventProvider {
             prediction_type,
             title: market.title.clone(),
             description: market.subtitle.clone(),
-            yes_price: market.yes_bid.map(|p| p as f64 / 100.0),
-            no_price: market.no_bid.map(|p| p as f64 / 100.0),
+            // Use yes_ask for yes_price (what you'd pay to buy YES)
+            yes_price: market.yes_ask.map(|p| p as f64 / 100.0),
+            // Use no_ask for no_price (what you'd pay to buy NO)
+            no_price: market.no_ask.map(|p| p as f64 / 100.0),
             volume: market.volume.map(|v| v as f64),
             liquidity: market.open_interest.map(|o| o as f64),
+            // Kalshi uses "active" for open/tradeable markets
             status: match market.status.as_str() {
-                "open" => EventStatus::Live,
-                "closed" => EventStatus::Completed,
+                "active" | "open" => EventStatus::Live,
+                "closed" | "settled" => EventStatus::Completed,
                 _ => EventStatus::Scheduled,
             },
             discovered_at: Utc::now(),
@@ -972,8 +1007,16 @@ struct KalshiMarket {
     status: String,
     yes_bid: Option<i32>,
     no_bid: Option<i32>,
+    yes_ask: Option<i32>,
+    no_ask: Option<i32>,
     volume: Option<i64>,
     open_interest: Option<i64>,
+    /// Price floor for "greater than" or "between" markets
+    floor_strike: Option<f64>,
+    /// Price cap for "less than" or "between" markets
+    cap_strike: Option<f64>,
+    /// Type of strike: "greater", "less", "between"
+    strike_type: Option<String>,
 }
 
 #[cfg(test)]

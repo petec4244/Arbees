@@ -379,6 +379,11 @@ impl GameManager {
 
             info!("Assigned game {} to shard {}", game.game_id, shard.shard_id);
 
+            // Track assignment in service registry to prevent zombie detection
+            self.shard_manager
+                .track_assignment(&shard.shard_id, &game.game_id)
+                .await;
+
             let mut assign_lock = self.assignments.write().await;
             assign_lock.insert(game.game_id.clone(), assignment);
         } else {

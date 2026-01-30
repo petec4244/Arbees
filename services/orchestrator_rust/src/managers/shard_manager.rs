@@ -123,6 +123,14 @@ impl ShardManager {
         self.service_registry.check_health().await;
     }
 
+    /// Track a game/event assignment to a shard
+    /// This prevents zombie detection from removing legitimately assigned games
+    pub async fn track_assignment(&self, shard_id: &str, game_id: &str) {
+        self.service_registry
+            .track_assignment(shard_id, game_id)
+            .await;
+    }
+
     /// Get snapshot of all shards for monitoring/debugging
     pub async fn get_shards_snapshot(&self) -> Vec<ShardInfo> {
         let shards = self.service_registry.get_healthy_shards().await;

@@ -1,8 +1,38 @@
 //! Crypto price data structures
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::time::Duration;
+
+/// Custom deserializer for timestamps that can be either:
+/// - Unix milliseconds (integer)
+/// - RFC 3339 formatted string
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, Deserialize as _};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TimestampValue {
+        Millis(i64),
+        String(String),
+    }
+
+    match TimestampValue::deserialize(deserializer)? {
+        TimestampValue::Millis(ms) => {
+            let secs = ms / 1000;
+            let nsecs = ((ms % 1000) * 1_000_000) as u32;
+            Ok(DateTime::<Utc>::from_timestamp(secs, nsecs).unwrap_or_else(|| Utc::now()))
+        }
+        TimestampValue::String(s) => {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(de::Error::custom)
+        }
+    }
+}
 
 /// Incoming price from price monitors (published via ZMQ)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +46,7 @@ pub struct IncomingCryptoPrice {
     pub yes_bid_size: Option<f64>, // Bid liquidity
     pub yes_ask_size: Option<f64>, // Ask liquidity
     pub liquidity: Option<f64>, // Total available liquidity
+    #[serde(deserialize_with = "deserialize_timestamp")]
     pub timestamp: DateTime<Utc>,
 }
 
