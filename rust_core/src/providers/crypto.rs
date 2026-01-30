@@ -43,6 +43,11 @@ pub struct CryptoEventProvider {
 }
 
 /// Represents a crypto prediction market
+///
+/// Optimized for arbitrage detection with focus on fields needed for:
+/// - Price mismatch detection across platforms
+/// - Liquidity/slippage assessment
+/// - Profitability calculations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CryptoMarket {
     pub market_id: String,
@@ -54,16 +59,45 @@ pub struct CryptoMarket {
     pub prediction_type: CryptoPredictionType,
     pub title: String,
     pub description: Option<String>,
-    pub yes_price: Option<f64>,     // Current Up/Yes market price (bet price)
-    pub no_price: Option<f64>,      // Current Down/No market price (bet price)
-    pub yes_start_price: Option<f64>, // Opening Up/Yes market price
-    pub no_start_price: Option<f64>,  // Opening Down/No market price
-    /// Current crypto asset price (from spot market or oracle)
+
+    // === PRICE DATA (for arbitrage detection) ===
+    /// Current Up/Yes market price (what you'd pay to buy UP)
+    pub yes_price: Option<f64>,
+    /// Current Down/No market price (what you'd pay to buy DOWN)
+    pub no_price: Option<f64>,
+    /// Opening Up/Yes market price
+    pub yes_start_price: Option<f64>,
+    /// Opening Down/No market price
+    pub no_start_price: Option<f64>,
+    /// Current crypto asset price from spot market or oracle (e.g., SOL at $117.44)
     pub current_crypto_price: Option<f64>,
-    /// Reference price to beat (starting price when market opened)
+    /// Reference price to beat (starting price when market opened, e.g., SOL at $117.77)
     pub reference_price: Option<f64>,
+
+    // === LIQUIDITY & EXECUTION (for slippage calculation) ===
+    /// Best bid price (highest price someone will pay to sell UP)
+    pub best_bid_yes: Option<f64>,
+    /// Best ask price (lowest price someone will take to buy UP)
+    pub best_ask_yes: Option<f64>,
+    /// Best bid price for DOWN
+    pub best_bid_no: Option<f64>,
+    /// Best ask price for DOWN
+    pub best_ask_no: Option<f64>,
+    /// Total volume traded
     pub volume: Option<f64>,
+    /// Total liquidity in market (AMM or order book)
     pub liquidity: Option<f64>,
+    /// Bid-ask spread percentage (for execution cost estimation)
+    pub spread_bps: Option<f64>,
+    /// Whether market is accepting new orders
+    pub accepting_orders: Option<bool>,
+
+    // === FEES (for profitability calculation) ===
+    /// Maker fee in basis points (Polymarket)
+    pub maker_fee_bps: Option<u32>,
+    /// Taker fee in basis points (Polymarket)
+    pub taker_fee_bps: Option<u32>,
+
     pub status: EventStatus,
     pub discovered_at: DateTime<Utc>,
 }
@@ -432,8 +466,16 @@ impl CryptoEventProvider {
             no_start_price: None,
             current_crypto_price: None, // Not available in price-target markets
             reference_price: None,      // Not applicable for price-target markets
+            best_bid_yes: None,
+            best_ask_yes: None,
+            best_bid_no: None,
+            best_ask_no: None,
             volume: market.volume,
             liquidity: market.liquidity,
+            spread_bps: None,
+            accepting_orders: None,
+            maker_fee_bps: None,
+            taker_fee_bps: None,
             status: if market.closed.unwrap_or(false) {
                 EventStatus::Completed
             } else {
@@ -491,6 +533,13 @@ impl CryptoEventProvider {
         let current_yes = market.outcome_prices.as_ref().and_then(|p| p.first().copied());
         let current_no = market.outcome_prices.as_ref().and_then(|p| p.get(1).copied());
 
+        // Calculate bid-ask spread in basis points
+        let spread_bps = if let (Some(bid), Some(ask)) = (market.best_bid, market.best_ask) {
+            Some((((ask - bid) / bid) * 10000.0).round())
+        } else {
+            market.spread.map(|s| (s * 10000.0).round())
+        };
+
         Some(CryptoMarket {
             market_id: format!("polymarket:{}", market.condition_id),
             platform: "polymarket".to_string(),
@@ -501,16 +550,29 @@ impl CryptoEventProvider {
             prediction_type,
             title: question,
             description: market.description.clone(),
+
+            // Price data
             yes_price: current_yes,
             no_price: current_no,
             yes_start_price: Some(0.5), // Default opening price for new market
             no_start_price: Some(0.5),  // Markets typically start at 50/50
-            // For directional markets, we need to fetch current and reference crypto prices
-            // from the oracle source (Chainlink, etc.)
             current_crypto_price: None, // TODO: Fetch from resolution_source (Chainlink API)
             reference_price: None,      // TODO: Extract from market history or Oracle opening
+
+            // Liquidity & execution data
+            best_bid_yes: market.best_bid,
+            best_ask_yes: market.best_ask,
+            best_bid_no: None,          // TODO: Extract from outcomes array if available
+            best_ask_no: None,          // TODO: Extract from outcomes array if available
             volume: market.volume,
             liquidity: market.liquidity,
+            spread_bps,
+            accepting_orders: market.accepting_orders,
+
+            // Fee data
+            maker_fee_bps: market.maker_base_fee,
+            taker_fee_bps: market.taker_base_fee,
+
             status: if market.closed.unwrap_or(false) {
                 EventStatus::Completed
             } else {
@@ -728,8 +790,25 @@ impl CryptoEventProvider {
             no_start_price: None,
             current_crypto_price: None, // Would need to fetch from external price source
             reference_price: Some(target_price), // For Kalshi, the target price is the reference
+            // Kalshi bid/ask data
+            best_bid_yes: market.yes_bid.map(|p| p as f64 / 100.0),
+            best_ask_yes: market.yes_ask.map(|p| p as f64 / 100.0),
+            best_bid_no: market.no_bid.map(|p| p as f64 / 100.0),
+            best_ask_no: market.no_ask.map(|p| p as f64 / 100.0),
             volume: market.volume.map(|v| v as f64),
             liquidity: market.open_interest.map(|o| o as f64),
+            // Calculate spread from bid/ask
+            spread_bps: if let (Some(bid), Some(ask)) = (market.yes_bid, market.yes_ask) {
+                let bid_f = bid as f64 / 100.0;
+                let ask_f = ask as f64 / 100.0;
+                Some((((ask_f - bid_f) / bid_f) * 10000.0).round())
+            } else {
+                None
+            },
+            accepting_orders: Some(market.status == "active" || market.status == "open"),
+            // Kalshi fees are implicit in bid/ask, not explicitly provided
+            maker_fee_bps: None,
+            taker_fee_bps: None,
             // Kalshi uses "active" for open/tradeable markets
             status: match market.status.as_str() {
                 "active" | "open" => EventStatus::Live,
@@ -1322,6 +1401,24 @@ struct PolymarketMarketSimple {
     /// Chainlink or other oracle providing resolution price
     #[serde(default)]
     resolution_source: Option<String>,
+    /// Best bid price for outcome 0 (Up)
+    #[serde(default)]
+    best_bid: Option<f64>,
+    /// Best ask price for outcome 0 (Up)
+    #[serde(default)]
+    best_ask: Option<f64>,
+    /// Whether market is accepting new orders
+    #[serde(default)]
+    accepting_orders: Option<bool>,
+    /// Bid-ask spread
+    #[serde(default)]
+    spread: Option<f64>,
+    /// Maker fee in basis points
+    #[serde(default)]
+    maker_base_fee: Option<u32>,
+    /// Taker fee in basis points
+    #[serde(default)]
+    taker_base_fee: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
