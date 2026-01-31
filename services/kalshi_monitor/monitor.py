@@ -692,7 +692,7 @@ class KalshiMonitor:
                     "yes_bid_size": price.yes_bid_size,
                     "yes_ask_size": price.yes_ask_size,
                     "liquidity": price.liquidity,
-                    "timestamp": price.timestamp.isoformat() if price.timestamp else None,
+                    "timestamp": (price.timestamp.isoformat() + "Z") if price.timestamp else None,
                 },
             }
             self._zmq_seq += 1
