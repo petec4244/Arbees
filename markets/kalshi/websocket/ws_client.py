@@ -40,9 +40,13 @@ class KalshiWebSocketClient:
     
     # Default URL (overridden by config)
     WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-    PING_INTERVAL = 30  # seconds
-    RECONNECT_DELAY_BASE = 1.0  # seconds
-    RECONNECT_DELAY_MAX = 60.0  # seconds
+
+    # Legacy constants (now configured via environment, kept for reference)
+    # PING_INTERVAL: 30s (KALSHI_WS_PING_INTERVAL)
+    # PING_TIMEOUT: 10s (KALSHI_WS_PING_TIMEOUT)
+    # RECONNECT_BASE: 5s (KALSHI_WS_RECONNECT_BASE)
+    # RECONNECT_MAX: 120s (KALSHI_WS_RECONNECT_MAX)
+    # STALE_TIMEOUT: 60s (KALSHI_WS_STALE_TIMEOUT)
     
     def __init__(
         self,
@@ -103,13 +107,34 @@ class KalshiWebSocketClient:
         self._subscribed_markets: Set[str] = set()
         self._running = False
         self._reconnect_count = 0
-        
+        self._reconnect_in_progress = False
+
+        # Load WebSocket configuration
+        from markets.kalshi.config import (
+            get_kalshi_ws_ping_interval,
+            get_kalshi_ws_ping_timeout,
+            get_kalshi_ws_reconnect_base,
+            get_kalshi_ws_reconnect_max,
+            get_kalshi_ws_stale_timeout,
+        )
+
+        self._ping_interval = get_kalshi_ws_ping_interval()
+        self._ping_timeout = get_kalshi_ws_ping_timeout()
+        self._reconnect_base = get_kalshi_ws_reconnect_base()
+        self._reconnect_max = get_kalshi_ws_reconnect_max()
+        self._stale_timeout = get_kalshi_ws_stale_timeout()
+
+        # Connection health tracking
+        self._last_message_time: Optional[float] = None
+        self._messages_received = 0
+
         # Message queue for async iteration
         self._message_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-        
+
         # Tasks
         self._receive_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
     
     @property
     def subscribed_markets(self) -> Set[str]:
@@ -199,18 +224,27 @@ class KalshiWebSocketClient:
             self._ws = await websockets.connect(
                 self._ws_url,
                 additional_headers=auth_headers,
-                ping_interval=None,  # We handle ping ourselves
+                ping_interval=self._ping_interval,
+                ping_timeout=self._ping_timeout,
+                close_timeout=10,
             )
-            
+
             self._running = True
             self._reconnect_count = 0
-            
+            self._last_message_time = time.monotonic()
+            self._messages_received = 0
+
             # Start background tasks
             self._receive_task = asyncio.create_task(self._receive_loop())
             self._ping_task = asyncio.create_task(self._ping_loop())
-            
-            logger.info("Connected to Kalshi WebSocket")
-            
+            self._health_task = asyncio.create_task(self._health_monitor_loop())
+
+            logger.info(
+                f"Connected to Kalshi WebSocket "
+                f"(ping_interval={self._ping_interval}s, ping_timeout={self._ping_timeout}s, "
+                f"stale_timeout={self._stale_timeout}s)"
+            )
+
             # Re-subscribe to markets after reconnect
             if self._subscribed_markets:
                 await self._resubscribe_all()
@@ -223,22 +257,20 @@ class KalshiWebSocketClient:
         """Disconnect from Kalshi WebSocket."""
         logger.info("Disconnecting from Kalshi WebSocket")
         self._running = False
-        
+
         # Cancel tasks
-        if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
-        
-        if self._ping_task:
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except asyncio.CancelledError:
-                pass
-        
+        for task in [self._receive_task, self._ping_task, self._health_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        self._receive_task = None
+        self._ping_task = None
+        self._health_task = None
+
         # Close connection
         if self._ws:
             try:
@@ -250,7 +282,7 @@ class KalshiWebSocketClient:
                         await self._ws.close()
             except Exception as e:
                 logger.warning(f"Error closing Kalshi WebSocket: {e}")
-        
+
         self._ws = None
         logger.info("Disconnected from Kalshi WebSocket")
     
@@ -351,91 +383,165 @@ class KalshiWebSocketClient:
             async for message in self._ws:
                 if not self._running:
                     break
-                
+
+                # Track message receipt for health monitoring
+                self._last_message_time = time.monotonic()
+                self._messages_received += 1
+
                 try:
                     data = json.loads(message)
-                    
+
                     # Handle different message types
                     # Kalshi uses 'type' for top-level message type, or 'msg_type' in wrapped format
                     msg_type = data.get("type") or data.get("msg_type")
-                    
+
                     if msg_type in ("orderbook_delta", "orderbook_snapshot"):
                         # Price update - add to queue
                         try:
                             self._message_queue.put_nowait(data)
                         except asyncio.QueueFull:
                             logger.warning("Message queue full, dropping price update")
-                    
+
                     elif msg_type == "pong":
                         # Pong response to our ping
                         logger.debug("Received pong from Kalshi")
-                    
+
                     elif msg_type == "error":
                         logger.error(f"Kalshi WebSocket error: {data}")
-                    
+
                     elif msg_type == "subscribed":
                         logger.debug(f"Subscription confirmed: {data.get('channel')}")
-                    
+
                     elif msg_type is None:
                         # Unknown format - log for debugging
                         logger.debug(f"Kalshi WS message without type: {str(data)[:200]}")
-                    
+
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid JSON from Kalshi WebSocket: {message}")
                 except Exception as e:
                     logger.error(f"Error processing WebSocket message: {e}")
-        
+
         except websockets.exceptions.ConnectionClosed:
             logger.warning("Kalshi WebSocket connection closed")
-            if self._running:
+            if self._running and not self._reconnect_in_progress:
                 asyncio.create_task(self._handle_reconnect())
         except Exception as e:
             logger.error(f"Error in Kalshi WebSocket receive loop: {e}")
-            if self._running:
+            if self._running and not self._reconnect_in_progress:
                 asyncio.create_task(self._handle_reconnect())
     
     async def _ping_loop(self) -> None:
-        """Background task to send periodic pings."""
+        """Background task to send periodic pings (backup - websockets library handles this too)."""
         while self._running:
             try:
-                await asyncio.sleep(self.PING_INTERVAL)
-                
+                await asyncio.sleep(self._ping_interval)
+
                 if self.is_connected:
                     # Use WebSocket ping control frame (avoid Kalshi "Unknown command")
-                    await self._ws.ping()
-                    logger.debug("Sent ping to Kalshi")
-            
+                    try:
+                        await self._ws.ping()
+                        logger.debug("Sent ping to Kalshi")
+                    except Exception as ping_err:
+                        logger.warning(f"Ping failed: {ping_err}")
+
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Error in ping loop: {e}")
+
+    async def _health_monitor_loop(self) -> None:
+        """
+        Background task to monitor connection health.
+
+        Detects stale connections (no messages received for stale_timeout seconds)
+        and triggers reconnection.
+        """
+        check_interval = min(self._stale_timeout / 2, 15.0)
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+
+                if not self._running:
+                    break
+
+                # Only check staleness if we have subscriptions
+                if not self._subscribed_markets:
+                    continue
+
+                # Check for stale connection
+                if self._last_message_time is not None:
+                    elapsed = time.monotonic() - self._last_message_time
+                    if elapsed > self._stale_timeout:
+                        logger.warning(
+                            f"Kalshi WebSocket stale: no messages for {elapsed:.1f}s "
+                            f"(threshold={self._stale_timeout}s, subscriptions={len(self._subscribed_markets)})"
+                        )
+                        if self._running and not self._reconnect_in_progress:
+                            asyncio.create_task(self._handle_reconnect())
+                    elif elapsed > self._stale_timeout / 2:
+                        logger.debug(
+                            f"Kalshi WS health: last message {elapsed:.1f}s ago "
+                            f"(msgs={self._messages_received})"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in health monitor loop: {e}")
     
     async def _handle_reconnect(self) -> None:
         """Handle WebSocket reconnection with exponential backoff."""
-        if not self._running:
+        if not self._running or self._reconnect_in_progress:
             return
-        
-        self._reconnect_count += 1
-        delay = min(
-            self.RECONNECT_DELAY_BASE * (2 ** self._reconnect_count),
-            self.RECONNECT_DELAY_MAX
-        )
-        
-        logger.info(f"Reconnecting to Kalshi WebSocket in {delay:.1f}s (attempt {self._reconnect_count})")
-        await asyncio.sleep(delay)
-        
+
+        self._reconnect_in_progress = True
         try:
-            # Close old connection
-            if self._ws:
+            # Cancel existing tasks before reconnect
+            for task in [self._receive_task, self._ping_task, self._health_task]:
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+
+            while self._running:
+                self._reconnect_count += 1
+
+                # Exponential backoff: 5s → 10s → 20s → 40s → 80s → 120s (capped)
+                delay = min(
+                    self._reconnect_base * (2 ** max(self._reconnect_count - 1, 0)),
+                    self._reconnect_max
+                )
+
+                logger.info(
+                    f"Reconnecting to Kalshi WebSocket in {delay:.1f}s "
+                    f"(attempt {self._reconnect_count}, base={self._reconnect_base}s, max={self._reconnect_max}s)"
+                )
+                await asyncio.sleep(delay)
+
                 try:
-                    await self._ws.close()
-                except:
-                    pass
-            
-            # Reconnect
-            await self.connect()
-            
-        except Exception as e:
-            logger.error(f"Reconnect failed: {e}")
-            # Will try again on next disconnect
+                    # Close old connection
+                    if self._ws:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+                        self._ws = None
+
+                    # Reconnect (this restarts receive/ping/health tasks)
+                    await self.connect()
+                    logger.info(
+                        f"Kalshi WS reconnected "
+                        f"(attempts={self._reconnect_count}, subscriptions={len(self._subscribed_markets)})"
+                    )
+                    return
+
+                except Exception as e:
+                    logger.error(f"Kalshi reconnect attempt {self._reconnect_count} failed: {e}")
+        finally:
+            self._reconnect_in_progress = False
     
     async def _resubscribe_all(self) -> None:
         """Re-subscribe to all markets after reconnect."""

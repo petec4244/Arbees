@@ -5,20 +5,24 @@
 //!
 //! Rate limits: 1200 requests/minute (IP-based)
 
-use super::crypto_price::{CryptoPrice, CryptoPriceProvider, ProviderStatus, VolatilityResult};
+use super::crypto_price::{
+    default_calculate_volatility, CryptoPrice, CryptoPriceProvider, ProviderStatus, VolatilityResult,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-const BASE_URL: &str = "https://api.binance.com/api/v3";
+const BASE_URL: &str = "https://api.binance.us/api/v3";
 const CACHE_TTL_SECS: i64 = 30;
 const RATE_LIMIT_PER_MINUTE: u64 = 1200;
 
@@ -125,69 +129,74 @@ impl CryptoPriceProvider for BinanceClient {
         Self::to_trading_pair(symbol)
     }
 
-    async fn get_price(&self, coin_id: &str) -> Result<CryptoPrice> {
-        let symbol = coin_id.to_uppercase();
+    fn get_price<'a>(
+        &'a self,
+        coin_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CryptoPrice>> + Send + 'a>> {
+        Box::pin(async move {
+            let symbol = coin_id.to_uppercase();
 
-        // Check cache
-        if let Some(cached) = self.get_cached(&symbol).await {
-            return Ok(cached);
-        }
-
-        // Check rate limit
-        if !self.check_rate_limit().await {
-            return Err(anyhow!("Binance rate limit exceeded"));
-        }
-
-        let trading_pair = Self::to_trading_pair(&symbol);
-        let url = format!("{}/ticker/24hr?symbol={}", BASE_URL, trading_pair);
-
-        debug!("Fetching {} from Binance", trading_pair);
-
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch from Binance")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-
-            if status.as_u16() == 429 {
-                *self.status.write().unwrap() = ProviderStatus::RateLimited;
-            } else {
-                *self.status.write().unwrap() = ProviderStatus::Error;
+            // Check cache
+            if let Some(cached) = self.get_cached(&symbol).await {
+                return Ok(cached);
             }
 
-            return Err(anyhow!("Binance API error: {} - {}", status, body));
-        }
+            // Check rate limit
+            if !self.check_rate_limit().await {
+                return Err(anyhow!("Binance rate limit exceeded"));
+            }
 
-        let ticker: Binance24hrTicker = response
-            .json()
-            .await
-            .context("Failed to parse Binance response")?;
+            let trading_pair = Self::to_trading_pair(&symbol);
+            let url = format!("{}/ticker/24hr?symbol={}", BASE_URL, trading_pair);
 
-        // Update status to healthy on success
-        *self.status.write().unwrap() = ProviderStatus::Healthy;
+            debug!("Fetching {} from Binance", trading_pair);
 
-        let price = CryptoPrice {
-            id: trading_pair.clone(),
-            symbol: symbol.clone(),
-            name: symbol.clone(), // Binance doesn't provide full names
-            current_price: ticker.last_price.parse().unwrap_or(0.0),
-            high_24h: ticker.high_price.parse().unwrap_or(0.0),
-            low_24h: ticker.low_price.parse().unwrap_or(0.0),
-            price_change_24h: ticker.price_change.parse().unwrap_or(0.0),
-            price_change_percentage_24h: ticker.price_change_percent.parse().unwrap_or(0.0),
-            volume_24h: ticker.quote_volume.parse().unwrap_or(0.0),
-            market_cap: None, // Binance doesn't provide market cap
-            last_updated: Utc::now(),
-            source: "Binance".to_string(),
-        };
+            let response = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .context("Failed to fetch from Binance")?;
 
-        self.update_cache(&symbol, price.clone()).await;
-        Ok(price)
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+
+                if status.as_u16() == 429 {
+                    *self.status.write().unwrap() = ProviderStatus::RateLimited;
+                } else {
+                    *self.status.write().unwrap() = ProviderStatus::Error;
+                }
+
+                return Err(anyhow!("Binance API error: {} - {}", status, body));
+            }
+
+            let ticker: Binance24hrTicker = response
+                .json()
+                .await
+                .context("Failed to parse Binance response")?;
+
+            // Update status to healthy on success
+            *self.status.write().unwrap() = ProviderStatus::Healthy;
+
+            let price = CryptoPrice {
+                id: trading_pair.clone(),
+                symbol: symbol.clone(),
+                name: symbol.clone(), // Binance doesn't provide full names
+                current_price: ticker.last_price.parse().unwrap_or(0.0),
+                high_24h: ticker.high_price.parse().unwrap_or(0.0),
+                low_24h: ticker.low_price.parse().unwrap_or(0.0),
+                price_change_24h: ticker.price_change.parse().unwrap_or(0.0),
+                price_change_percentage_24h: ticker.price_change_percent.parse().unwrap_or(0.0),
+                volume_24h: ticker.quote_volume.parse().unwrap_or(0.0),
+                market_cap: None, // Binance doesn't provide market cap
+                last_updated: Utc::now(),
+                source: "Binance".to_string(),
+            };
+
+            self.update_cache(&symbol, price.clone()).await;
+            Ok(price)
+        })
     }
 
     async fn get_prices(&self, coin_ids: &[&str]) -> Result<Vec<CryptoPrice>> {
@@ -271,9 +280,12 @@ impl CryptoPriceProvider for BinanceClient {
         Ok(prices)
     }
 
-    async fn calculate_volatility(&self, coin_id: &str, days: u32) -> Result<VolatilityResult> {
-        // Use default implementation from trait
-        <Self as CryptoPriceProvider>::calculate_volatility(self, coin_id, days).await
+    fn calculate_volatility<'a>(
+        &'a self,
+        coin_id: &'a str,
+        days: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<VolatilityResult>> + Send + 'a>> {
+        default_calculate_volatility(self, coin_id, days)
     }
 }
 

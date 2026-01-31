@@ -28,10 +28,13 @@ impl ShardManager {
         }
     }
 
-    /// Get the best shard for assignment (any type)
-    /// Filters by: GameShard/CryptoShard type, Healthy status, Circuit Closed, Has Capacity
+    /// Get the best shard for assignment (GameShard only)
+    /// Filters by: GameShard type, Healthy status, Circuit Closed, Has Capacity
     pub async fn get_best_shard(&self) -> Option<ShardInfo> {
-        let healthy_shards = self.service_registry.get_healthy_shards().await;
+        let healthy_shards = self
+            .service_registry
+            .get_healthy_shards_by_type(ServiceType::GameShard)
+            .await;
         self.select_best_from_shards(healthy_shards)
     }
 
@@ -121,6 +124,14 @@ impl ShardManager {
     /// Check health of all services (delegated to ServiceRegistry)
     pub async fn check_health(&self) {
         self.service_registry.check_health().await;
+    }
+
+    /// Track a game/event assignment to a shard
+    /// This prevents zombie detection from removing legitimately assigned games
+    pub async fn track_assignment(&self, shard_id: &str, game_id: &str) {
+        self.service_registry
+            .track_assignment(shard_id, game_id)
+            .await;
     }
 
     /// Get snapshot of all shards for monitoring/debugging

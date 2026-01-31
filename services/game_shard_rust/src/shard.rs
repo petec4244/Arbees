@@ -1,21 +1,17 @@
 use anyhow::Result;
-use arbees_rust_core::atomic_orderbook::kalshi_fee_cents;
-use arbees_rust_core::circuit_breaker::{ApiCircuitBreaker, ApiCircuitBreakerConfig};
+use arbees_rust_core::circuit_breaker::ApiCircuitBreaker;
 use arbees_rust_core::clients::espn::{EspnClient, Game as EspnGame};
 use arbees_rust_core::models::{
-    channels, FootballState, GameState, MarketType, Platform, SignalDirection, SignalType, Sport,
-    SportSpecificState, TradingSignal, TransportMode,
+    FootballState, GameState, MarketType, Platform, SignalDirection, Sport,
+    SportSpecificState,
 };
 use arbees_rust_core::ProbabilityModelRegistry;
 use arbees_rust_core::providers::EventProviderRegistry;
 use arbees_rust_core::redis::bus::RedisBus;
-use arbees_rust_core::simd::{check_arbs_simd, calculate_profit_cents, decode_arb_mask, ARB_POLY_YES_KALSHI_NO, ARB_KALSHI_YES_POLY_NO};
-use arbees_rust_core::utils::matching::match_team_in_text;
-use arbees_rust_core::win_prob::calculate_win_probability;
+use arbees_rust_core::win_prob::{batch_calculate_win_probs, calculate_win_probability};
 use chrono::Utc;
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -26,118 +22,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
-use zeromq::{Socket, SocketRecv, SocketSend, PubSocket, SubSocket, ZmqMessage};
+use zeromq::{Socket, SocketRecv, SubSocket, PubSocket};
 
-/// ZMQ message envelope format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ZmqEnvelope {
-    seq: u64,
-    timestamp_ms: i64,
-    source: Option<String>,
-    payload: serde_json::Value,
-}
+// Import from internal modules
+use crate::types::{GameContext, GameEntry, PriceListenerStats, PriceListenerStatsSnapshot, ShardCommand, ZmqEnvelope};
+use crate::config::{GameMonitorConfig, load_espn_circuit_breaker_config, load_database_url, load_zmq_sub_endpoints, load_zmq_pub_port};
+use crate::price::data::{MarketPriceData, IncomingMarketPrice};
+use crate::signals::edge::compute_team_net_edge;
+use crate::signals::arbitrage;
+use crate::signals::model_edge;
+use crate::signals::latency;
+use crate::monitoring::espn::{parse_sport, is_overtime, format_time_remaining, check_cross_platform_arb, espn_sport_league};
+use crate::price::matching::{find_team_prices, select_best_platform_for_team};
+use crate::price::listener::PriceListener;
 
-/// Default minimum edge percentage to generate a signal (can be overridden via MIN_EDGE_PCT env var)
-/// Data shows: 5-10% edge = 36% win rate, 15%+ edge = 87.5% win rate
-const DEFAULT_MIN_EDGE_PCT: f64 = 15.0;
-/// Maximum probability to buy (avoid buying near-certain outcomes)
-const MAX_BUY_PROB: f64 = 0.95;
-/// Minimum probability to buy (avoid buying very unlikely outcomes)
-const MIN_BUY_PROB: f64 = 0.05;
-/// Polymarket fee rate (2% per side)
-const POLYMARKET_FEE_RATE: f64 = 0.02;
+// Type definitions moved to types.rs
+// Configuration constants moved to config.rs
 
-/// Fee per contract (in $) for entering/exiting at a given price.
-/// For $1 face-value contracts, fee dollars are equivalent to "probability points".
-fn fee_for_price(platform: Platform, price: f64) -> f64 {
-    let price = price.clamp(0.0, 1.0);
-    let price_cents = (price * 100.0).round() as u16;
-    match platform {
-        Platform::Kalshi | Platform::Paper => kalshi_fee_cents(price_cents) as f64 / 100.0,
-        Platform::Polymarket => price * POLYMARKET_FEE_RATE,
-    }
-}
-
-/// Compute the *tradeable* (executable) net edge for a team on a given platform.
-///
-/// - If model thinks YES is underpriced: BUY YES at `yes_ask`.
-/// - If model thinks YES is overpriced: BUY NO at `no_ask = 1 - yes_bid` (represented as SELL on the team).
-///
-/// Returns (direction, signal_type, net_edge_pct, gross_edge_pct_abs, market_yes_mid).
-fn compute_team_net_edge(
-    model_yes_prob: f64,
-    price: &MarketPriceData,
-    platform: Platform,
-) -> (SignalDirection, SignalType, f64, f64, f64) {
-    let model_yes_prob = model_yes_prob.clamp(0.0, 1.0);
-    let market_yes_mid = price.mid_price.clamp(0.0, 1.0);
-    let gross_edge_pct_abs = ((model_yes_prob - market_yes_mid).abs()) * 100.0;
-
-    if model_yes_prob >= market_yes_mid {
-        // BUY YES at ask
-        let entry = price.yes_ask.clamp(0.0, 1.0);
-        let entry_fee = fee_for_price(platform, entry);
-        let exit_fee = fee_for_price(platform, model_yes_prob);
-        let net_edge_pct = (model_yes_prob - entry - entry_fee - exit_fee) * 100.0;
-        (
-            SignalDirection::Buy,
-            SignalType::ModelEdgeYes,
-            net_edge_pct,
-            gross_edge_pct_abs,
-            market_yes_mid,
-        )
-    } else {
-        // BUY NO at no_ask = 1 - yes_bid
-        let model_no_prob = (1.0 - model_yes_prob).clamp(0.0, 1.0);
-        let no_ask = (1.0 - price.yes_bid).clamp(0.0, 1.0);
-        let entry_fee = fee_for_price(platform, no_ask);
-        let exit_fee = fee_for_price(platform, model_no_prob);
-        let net_edge_pct = (model_no_prob - no_ask - entry_fee - exit_fee) * 100.0;
-        (
-            SignalDirection::Sell,
-            SignalType::ModelEdgeNo,
-            net_edge_pct,
-            gross_edge_pct_abs,
-            market_yes_mid,
-        )
-    }
-}
-
-/// Statistics for monitoring price message processing health
-#[derive(Debug, Default)]
-pub struct PriceListenerStats {
-    /// Total price messages received
-    pub messages_received: std::sync::atomic::AtomicU64,
-    /// Messages successfully parsed and processed
-    pub messages_processed: std::sync::atomic::AtomicU64,
-    /// Messages that failed to parse (msgpack or JSON)
-    pub parse_failures: std::sync::atomic::AtomicU64,
-    /// Messages skipped due to no liquidity
-    pub no_liquidity_skipped: std::sync::atomic::AtomicU64,
-    /// Messages skipped due to missing contract_team
-    pub no_team_skipped: std::sync::atomic::AtomicU64,
-}
-
-impl PriceListenerStats {
-    pub fn snapshot(&self) -> PriceListenerStatsSnapshot {
-        PriceListenerStatsSnapshot {
-            messages_received: self.messages_received.load(std::sync::atomic::Ordering::Relaxed),
-            messages_processed: self.messages_processed.load(std::sync::atomic::Ordering::Relaxed),
-            parse_failures: self.parse_failures.load(std::sync::atomic::Ordering::Relaxed),
-            no_liquidity_skipped: self.no_liquidity_skipped.load(std::sync::atomic::Ordering::Relaxed),
-            no_team_skipped: self.no_team_skipped.load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PriceListenerStatsSnapshot {
-    pub messages_received: u64,
-    pub messages_processed: u64,
-    pub parse_failures: u64,
-    pub no_liquidity_skipped: u64,
-    pub no_team_skipped: u64,
-}
 
 #[derive(Clone)]
 pub struct GameShard {
@@ -157,8 +58,6 @@ pub struct GameShard {
     price_stats: Arc<PriceListenerStats>,
     /// Circuit breaker for ESPN API calls
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
-    /// Transport mode configuration
-    transport_mode: TransportMode,
     /// ZMQ PUB socket for signals (wrapped in Arc<Mutex> for sharing)
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     /// ZMQ sequence number for message ordering
@@ -173,80 +72,12 @@ pub struct GameShard {
     started_at: chrono::DateTime<Utc>,
     /// Probability model registry for edge calculation (multi-market support)
     probability_registry: Arc<ProbabilityModelRegistry>,
+    /// Event provider registry for fetching event state (shared across all events)
+    event_provider_registry: Arc<EventProviderRegistry>,
 }
 
-/// Market price data for a specific contract
-#[derive(Debug, Clone)]
-pub struct MarketPriceData {
-    pub market_id: String,
-    pub platform: String,
-    pub contract_team: String,
-    pub yes_bid: f64,
-    pub yes_ask: f64,
-    pub mid_price: f64,
-    pub timestamp: chrono::DateTime<Utc>,
-    /// Liquidity available at the yes bid (contracts available to sell)
-    pub yes_bid_size: Option<f64>,
-    /// Liquidity available at the yes ask (contracts available to buy)
-    pub yes_ask_size: Option<f64>,
-    /// Total liquidity in the market (if reported)
-    pub total_liquidity: Option<f64>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GameContext {
-    pub game_id: String,
-    pub sport: String,                   // Keep for backward compatibility
-    pub market_type: Option<MarketType>, // Universal market type
-    pub entity_a: Option<String>,        // Generic entity A (home_team for sports)
-    pub entity_b: Option<String>,        // Generic entity B (away_team for sports)
-    pub polymarket_id: Option<String>,
-    pub kalshi_id: Option<String>,
-}
 
-struct GameEntry {
-    context: GameContext,
-    task: tokio::task::JoinHandle<()>,
-    /// Last calculated home win probability
-    last_home_win_prob: Arc<RwLock<Option<f64>>>,
-    /// Opening market line for home team (first price we see, used as team strength prior)
-    opening_home_prob: Arc<RwLock<Option<f64>>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShardCommand {
-    #[serde(rename = "type")]
-    command_type: String,
-    game_id: Option<String>,
-    event_id: Option<String>,           // Universal event ID (for non-sports markets)
-    sport: Option<String>,
-    market_type: Option<MarketType>,    // Universal market type (sport, crypto, economics, politics)
-    entity_a: Option<String>,           // Generic entity A (home_team for sports)
-    entity_b: Option<String>,           // Generic entity B (away_team for sports)
-    kalshi_market_id: Option<String>,
-    polymarket_market_id: Option<String>,
-    metadata: Option<serde_json::Value>, // Additional market-specific metadata
-}
-
-/// Incoming market price message from polymarket_monitor
-#[derive(Debug, Deserialize)]
-struct IncomingMarketPrice {
-    market_id: String,
-    platform: String,
-    game_id: String,
-    contract_team: Option<String>,
-    yes_bid: f64,
-    yes_ask: f64,
-    mid_price: Option<f64>,
-    implied_probability: Option<f64>,
-    timestamp: Option<String>,
-    /// Liquidity at the yes bid (contracts available to sell)
-    yes_bid_size: Option<f64>,
-    /// Liquidity at the yes ask (contracts available to buy)
-    yes_ask_size: Option<f64>,
-    /// Total market liquidity (optional)
-    liquidity: Option<f64>,
-}
 
 impl GameShard {
     pub async fn new(shard_id: String) -> Result<Self> {
@@ -254,51 +85,20 @@ impl GameShard {
         let espn = EspnClient::new();
 
         // Create database pool
-        let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://arbees:arbees@localhost:5432/arbees".to_string());
+        let database_url = load_database_url();
         let db_pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&database_url)
             .await?;
         info!("Connected to database");
 
-        let poll_interval = Duration::from_secs_f64(
-            env::var("POLL_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(1.0),
-        );
-        let heartbeat_interval = Duration::from_secs(
-            env::var("HEARTBEAT_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(10),
-        );
-        let max_games = env::var("MAX_GAMES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(20);
-        let min_edge_pct = env::var("MIN_EDGE_PCT")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(DEFAULT_MIN_EDGE_PCT);
+        // Load configuration
+        let config = GameMonitorConfig::from_env();
 
         // ESPN API circuit breaker configuration
         let espn_circuit_breaker = Arc::new(ApiCircuitBreaker::new(
             "espn_api",
-            ApiCircuitBreakerConfig {
-                failure_threshold: env::var("ESPN_CB_FAILURE_THRESHOLD")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(5),
-                recovery_timeout: std::time::Duration::from_secs(
-                    env::var("ESPN_CB_RECOVERY_TIMEOUT_SECS")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(30),
-                ),
-                success_threshold: 2,
-            },
+            load_espn_circuit_breaker_config(),
         ));
         info!(
             "ESPN circuit breaker configured: failure_threshold={}, recovery_timeout={}s",
@@ -306,20 +106,8 @@ impl GameShard {
             30 // Can't easily get config back, log default
         );
 
-        // Transport mode configuration
-        let transport_mode = TransportMode::from_env();
-
-        let zmq_sub_endpoints: Vec<String> = env::var("ZMQ_SUB_ENDPOINTS")
-            .unwrap_or_else(|_| "tcp://kalshi_monitor:5555,tcp://polymarket_monitor:5556".to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let zmq_pub_port = env::var("ZMQ_PUB_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5558u16);
+        let zmq_sub_endpoints = load_zmq_sub_endpoints();
+        let zmq_pub_port = load_zmq_pub_port();
 
         // Generate process identity for restart detection
         let process_id = Uuid::new_v4().to_string();
@@ -328,6 +116,14 @@ impl GameShard {
         // Initialize probability model registry for multi-market support
         let probability_registry = Arc::new(ProbabilityModelRegistry::new());
 
+        // Initialize event provider registry once (shared across all events)
+        // This creates HTTP clients for ESPN, CoinGecko, Binance, Coinbase, etc.
+        let event_provider_registry = Arc::new(EventProviderRegistry::with_defaults());
+        info!(
+            "Event provider registry initialized with {} providers",
+            event_provider_registry.list_providers().len()
+        );
+
         Ok(Self {
             shard_id,
             redis,
@@ -335,13 +131,12 @@ impl GameShard {
             db_pool,
             games: Arc::new(Mutex::new(HashMap::new())),
             market_prices: Arc::new(RwLock::new(HashMap::new())),
-            poll_interval,
-            heartbeat_interval,
-            max_games,
-            min_edge_pct,
+            poll_interval: config.poll_interval,
+            heartbeat_interval: config.heartbeat_interval,
+            max_games: config.max_games,
+            min_edge_pct: config.min_edge_pct,
             price_stats: Arc::new(PriceListenerStats::default()),
             espn_circuit_breaker,
-            transport_mode,
             zmq_pub: None, // Initialized in start()
             zmq_seq: Arc::new(AtomicU64::new(0)),
             zmq_sub_endpoints,
@@ -349,6 +144,7 @@ impl GameShard {
             process_id,
             started_at,
             probability_registry,
+            event_provider_registry,
         })
     }
 
@@ -361,17 +157,15 @@ impl GameShard {
         info!("Starting GameShard {}", self.shard_id);
 
         // Initialize ZMQ PUB socket for signals if enabled
-        if self.transport_mode.use_zmq() {
-            info!("ZMQ publishing enabled (transport_mode={:?}) - initializing sockets", self.transport_mode);
-            match Self::init_zmq_pub(self.zmq_pub_port).await {
-                Ok(pub_socket) => {
-                    self.zmq_pub = Some(Arc::new(Mutex::new(pub_socket)));
-                    info!("ZMQ PUB socket bound to port {}", self.zmq_pub_port);
-                }
-                Err(e) => {
-                    error!("Failed to initialize ZMQ PUB socket: {}", e);
-                    // Continue without ZMQ PUB
-                }
+        // ZMQ publishing (always enabled - ZMQ-only transport mode)
+        match Self::init_zmq_pub(self.zmq_pub_port).await {
+            Ok(pub_socket) => {
+                self.zmq_pub = Some(Arc::new(Mutex::new(pub_socket)));
+                info!("ZMQ PUB socket bound to port {}", self.zmq_pub_port);
+            }
+            Err(e) => {
+                error!("Failed to initialize ZMQ PUB socket: {}", e);
+                // Continue without ZMQ PUB
             }
         }
 
@@ -391,25 +185,20 @@ impl GameShard {
             }
         });
 
-        // Market price listener - ZMQ if enabled, Redis as fallback
-        if self.transport_mode.use_zmq() && !self.zmq_sub_endpoints.is_empty() {
-            // ZMQ price listener (primary for low latency)
-            let zmq_shard = self.clone();
+        // Unified ZMQ price listener (primary, low-latency)
+        if !self.zmq_sub_endpoints.is_empty() {
+            let listener = PriceListener::new(
+                self.zmq_sub_endpoints.clone(),
+                self.market_prices.clone(),
+                self.price_stats.clone(),
+            );
             tokio::spawn(async move {
-                if let Err(e) = zmq_shard.zmq_price_listener_loop().await {
-                    error!("ZMQ price listener loop exited: {}", e);
+                if let Err(e) = listener.start().await {
+                    error!("Unified ZMQ price listener exited: {}", e);
                 }
             });
-            info!("Started ZMQ price listener for endpoints: {:?}", self.zmq_sub_endpoints);
+            info!("Started unified ZMQ price listener for endpoints: {:?}", self.zmq_sub_endpoints);
         }
-
-        // Redis price listener (always run for backward compatibility)
-        let price_shard = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = price_shard.price_listener_loop().await {
-                error!("Redis price listener loop exited: {}", e);
-            }
-        });
 
         Ok(())
     }
@@ -462,7 +251,6 @@ impl GameShard {
         let zmq_pub = self.zmq_pub.clone();
         let zmq_seq = self.zmq_seq.clone();
 
-        let transport_mode = self.transport_mode;
         let task = tokio::spawn(async move {
             monitor_game(
                 redis,
@@ -477,7 +265,6 @@ impl GameShard {
                 espn_cb,
                 zmq_pub,
                 zmq_seq,
-                transport_mode,
             )
             .await;
         });
@@ -496,92 +283,6 @@ impl GameShard {
     }
 
     /// Add a universal event (crypto, economics, politics) to be monitored
-    pub async fn add_event(
-        &self,
-        event_id: String,
-        market_type: MarketType,
-        entity_a: String,
-        entity_b: Option<String>,
-        polymarket_id: Option<String>,
-        kalshi_id: Option<String>,
-    ) -> Result<()> {
-        info!(
-            "Adding event: {} ({:?}) entity_a={}, entity_b={:?}",
-            event_id,
-            market_type.type_name(),
-            entity_a,
-            entity_b
-        );
-
-        let mut games = self.games.lock().await;
-        if games.contains_key(&event_id) {
-            warn!("Event already tracked: {}", event_id);
-            return Ok(());
-        }
-
-        let context = GameContext {
-            game_id: event_id.clone(),
-            sport: market_type.type_name().to_string(),
-            market_type: Some(market_type.clone()),
-            entity_a: Some(entity_a.clone()),
-            entity_b: entity_b.clone(),
-            polymarket_id,
-            kalshi_id,
-        };
-
-        // Create provider and probability registries
-        let provider_registry = Arc::new(EventProviderRegistry::with_defaults());
-
-        // Create config from environment
-        let config = crate::event_monitor::EventMonitorConfig::from_env();
-
-        // Clone shared state for the monitoring task
-        let redis = self.redis.clone();
-        let db_pool = self.db_pool.clone();
-        let market_prices = self.market_prices.clone();
-        let zmq_pub = self.zmq_pub.clone();
-        let zmq_seq = self.zmq_seq.clone();
-        let transport_mode = self.transport_mode;
-        let probability_registry = self.probability_registry.clone();
-        let eid = event_id.clone();
-        let mt = market_type.clone();
-        let ea = entity_a.clone();
-        let eb = entity_b.clone();
-
-        // Spawn the monitoring task
-        let last_prob = Arc::new(RwLock::new(None));
-        let task = tokio::spawn(async move {
-            crate::event_monitor::monitor_event(
-                redis,
-                db_pool,
-                eid,
-                mt,
-                ea,
-                eb,
-                config,
-                provider_registry,
-                probability_registry,
-                market_prices,
-                zmq_pub,
-                zmq_seq,
-                transport_mode,
-            )
-            .await;
-        });
-
-        games.insert(
-            context.game_id.clone(),
-            GameEntry {
-                context,
-                task,
-                last_home_win_prob: last_prob,
-                opening_home_prob: Arc::new(RwLock::new(None)),
-            },
-        );
-
-        Ok(())
-    }
-
     pub async fn remove_game(&self, game_id: String) -> Result<()> {
         info!("Removing game: {}", game_id);
         let mut games = self.games.lock().await;
@@ -660,8 +361,8 @@ impl GameShard {
                             event_id, market_type, command.kalshi_market_id, command.polymarket_market_id
                         );
 
+                        // Sports-only handling (crypto/economics/politics handled by crypto_shard_rust)
                         if market_type.is_sport() {
-                            // Sports: use legacy monitor_game for backward compatibility
                             let sport = market_type.as_sport()
                                 .map(|s| format!("{:?}", s).to_lowercase())
                                 .unwrap_or_else(|| "nba".to_string());
@@ -674,25 +375,10 @@ impl GameShard {
                                 )
                                 .await
                             {
-                                error!("Failed to add_event (sport): {}", e);
+                                error!("Failed to add_game: {}", e);
                             }
                         } else {
-                            // Non-sports: use new monitor_event
-                            let entity_a = command.entity_a.clone().unwrap_or_else(|| event_id.clone());
-                            let entity_b = command.entity_b.clone();
-                            if let Err(e) = self
-                                .add_event(
-                                    event_id,
-                                    market_type,
-                                    entity_a,
-                                    entity_b,
-                                    command.polymarket_market_id,
-                                    command.kalshi_market_id,
-                                )
-                                .await
-                            {
-                                error!("Failed to add_event (non-sport): {}", e);
-                            }
+                            warn!("Non-sports events (crypto/economics/politics) should use crypto_shard_rust, not game_shard");
                         }
                     } else {
                         warn!("add_event command missing event_id or market_type");
@@ -705,203 +391,6 @@ impl GameShard {
         }
 
         Ok(())
-    }
-
-    /// Listen for market price updates from polymarket_monitor
-    async fn price_listener_loop(&self) -> Result<()> {
-        // Subscribe to game:*:price pattern
-        let mut pubsub = self.redis.psubscribe("game:*:price").await?;
-        info!("Subscribed to game:*:price pattern");
-
-        // Track last time we logged stats for periodic reporting
-        let mut last_stats_log = Instant::now();
-        let stats_log_interval = Duration::from_secs(60);
-
-        let mut stream = pubsub.on_message();
-        while let Some(msg) = stream.next().await {
-            // Increment received counter
-            self.price_stats.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            let channel: String = match msg.get_channel::<String>() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            // Extract game_id from channel: game:{game_id}:price
-            let game_id = channel
-                .strip_prefix("game:")
-                .and_then(|s| s.strip_suffix(":price"))
-                .map(|s| s.to_string());
-
-            let game_id = match game_id {
-                Some(gid) => gid,
-                None => continue,
-            };
-
-            let payload: Vec<u8> = match msg.get_payload::<Vec<u8>>() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Try to parse as msgpack first, then JSON
-            let price: IncomingMarketPrice = match rmp_serde::from_slice(&payload) {
-                Ok(p) => p,
-                Err(msgpack_err) => match serde_json::from_slice(&payload) {
-                    Ok(p) => p,
-                    Err(json_err) => {
-                        // P0-5: Track and log parsing failures properly
-                        let failure_count = self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed) + 1;
-
-                        // Log at warn level for visibility, but rate-limit to avoid spam
-                        if failure_count <= 10 || failure_count % 100 == 0 {
-                            warn!(
-                                "Failed to parse price message (failure #{}) for game {}: msgpack={}, json={}",
-                                failure_count, game_id, msgpack_err, json_err
-                            );
-                        }
-
-                        // Log payload preview for debugging (first 100 bytes)
-                        if failure_count <= 5 {
-                            let preview: String = payload.iter()
-                                .take(100)
-                                .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
-                                .collect();
-                            debug!("Failed payload preview: {}", preview);
-                        }
-                        continue;
-                    }
-                },
-            };
-
-            // Use shared price processing logic
-            self.process_incoming_price(price).await;
-
-            // Periodically log stats for monitoring
-            if last_stats_log.elapsed() >= stats_log_interval {
-                let stats = self.price_stats.snapshot();
-                info!(
-                    "Price listener stats: received={}, processed={}, parse_failures={}, no_liquidity={}, no_team={}",
-                    stats.messages_received, stats.messages_processed, stats.parse_failures,
-                    stats.no_liquidity_skipped, stats.no_team_skipped
-                );
-
-                // Alert if parse failure rate is high (>5%)
-                if stats.messages_received > 100 {
-                    let failure_rate = stats.parse_failures as f64 / stats.messages_received as f64;
-                    if failure_rate > 0.05 {
-                        error!(
-                            "HIGH PARSE FAILURE RATE: {:.1}% of price messages failing to parse!",
-                            failure_rate * 100.0
-                        );
-                    }
-                }
-
-                last_stats_log = Instant::now();
-            }
-        }
-
-        Ok(())
-    }
-
-    /// ZMQ-based price listener for low-latency price updates
-    async fn zmq_price_listener_loop(&self) -> Result<()> {
-        info!("Starting ZMQ price listener loop...");
-
-        // Create ZMQ SUB socket
-        let mut socket = SubSocket::new();
-
-        // Connect to all endpoints
-        for endpoint in &self.zmq_sub_endpoints {
-            match socket.connect(endpoint).await {
-                Ok(_) => info!("ZMQ connected to {}", endpoint),
-                Err(e) => {
-                    warn!("Failed to connect to ZMQ endpoint {}: {}", endpoint, e);
-                }
-            }
-        }
-
-        // Subscribe to price topics
-        socket.subscribe("prices.").await?;
-        info!("ZMQ subscribed to prices.*");
-
-        // Track last stats log time
-        let mut last_stats_log = Instant::now();
-        let stats_log_interval = Duration::from_secs(60);
-        let mut zmq_messages_received: u64 = 0;
-
-        loop {
-            // Receive with timeout
-            let recv_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                socket.recv(),
-            ).await;
-
-            match recv_result {
-                Ok(Ok(msg)) => {
-                    zmq_messages_received += 1;
-
-                    // ZMQ multipart: [topic, payload]
-                    let parts: Vec<_> = msg.iter().collect();
-                    if parts.len() < 2 {
-                        continue;
-                    }
-
-                    let topic = String::from_utf8_lossy(parts[0].as_ref());
-                    let payload_bytes = parts[1].as_ref();
-
-                    // Parse envelope
-                    let envelope: ZmqEnvelope = match serde_json::from_slice(payload_bytes) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed);
-                            debug!("Failed to parse ZMQ price message: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Extract price data from payload
-                    let price: IncomingMarketPrice = match serde_json::from_value(envelope.payload) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            self.price_stats.parse_failures.fetch_add(1, Ordering::Relaxed);
-                            debug!("Failed to parse ZMQ price payload: {}", e);
-                            continue;
-                        }
-                    };
-
-                    // Process the price (same logic as Redis path)
-                    self.process_incoming_price(price).await;
-
-                    // Log ZMQ latency periodically
-                    if zmq_messages_received % 1000 == 0 {
-                        let now_ms = Utc::now().timestamp_millis();
-                        let latency_ms = now_ms - envelope.timestamp_ms;
-                        debug!("ZMQ price #{}: latency={}ms topic={}", zmq_messages_received, latency_ms, topic);
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("ZMQ receive error: {}. Reconnecting...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    // Reconnect
-                    for endpoint in &self.zmq_sub_endpoints {
-                        let _ = socket.connect(endpoint).await;
-                    }
-                }
-                Err(_) => {
-                    // Timeout - normal for low-traffic periods
-                    debug!("No ZMQ price message in 30s");
-                }
-            }
-
-            // Periodic stats logging
-            if last_stats_log.elapsed() >= stats_log_interval {
-                info!(
-                    "ZMQ price listener: received={} messages",
-                    zmq_messages_received
-                );
-                last_stats_log = Instant::now();
-            }
-        }
     }
 
     /// Process an incoming price message (shared between Redis and ZMQ paths)
@@ -1031,7 +520,6 @@ async fn monitor_game(
     espn_circuit_breaker: Arc<ApiCircuitBreaker>,
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: Arc<AtomicU64>,
-    transport_mode: TransportMode,
 ) {
     let sport_enum = match parse_sport(&sport) {
         Some(s) => s,
@@ -1068,7 +556,9 @@ async fn monitor_game(
 
     loop {
         // Fetch game state from ESPN (with circuit breaker protection)
-        if let Some((game, state)) = fetch_game_state(&espn, &game_id, &sport, &espn_circuit_breaker).await {
+        if let Some((game, state, home_win_prob)) =
+            fetch_game_state(&espn, &game_id, &sport, &espn_circuit_breaker).await
+        {
             // Check game state staleness - critical for preventing trades on old data
             let state_age_secs = (Utc::now() - state.fetched_at).num_seconds();
             if state_age_secs > game_state_staleness_secs {
@@ -1089,9 +579,6 @@ async fn monitor_game(
                 info!("Game state for {} is fresh again after {} stale warnings", game_id, stale_state_warnings);
                 stale_state_warnings = 0;
             }
-
-            // Calculate win probability
-            let home_win_prob = calculate_win_probability(&state, true);
 
             // Detect score changes for latency-based signals
             let home_scored = prev_home_score.map_or(false, |p| game.home_score > p);
@@ -1215,8 +702,8 @@ async fn monitor_game(
                         None => true,
                     };
                     if should_emit_arb {
-                        if emit_arb_signal(
-                            &redis, &game_id, sport_enum, &game.home_team,
+                        if arbitrage::detect_and_emit(
+                            &game_id, sport_enum, &game.home_team,
                             arb_mask, profit, home_kalshi.unwrap(), home_poly.unwrap(),
                             &zmq_pub, &zmq_seq
                         ).await {
@@ -1255,8 +742,8 @@ async fn monitor_game(
                                     price.yes_ask * 100.0,
                                     home_win_prob * 100.0
                                 );
-                                if emit_latency_signal(
-                                    &redis, &game_id, sport_enum, &game.home_team,
+                                if latency::detect_and_emit(
+                                    &game_id, sport_enum, &game.home_team,
                                     SignalDirection::Buy, price, platform, home_win_prob,
                                     &zmq_pub, &zmq_seq
                                 ).await {
@@ -1281,8 +768,8 @@ async fn monitor_game(
                                     price.yes_ask * 100.0,
                                     (1.0 - home_win_prob) * 100.0
                                 );
-                                if emit_latency_signal(
-                                    &redis, &game_id, sport_enum, &game.away_team,
+                                if latency::detect_and_emit(
+                                    &game_id, sport_enum, &game.away_team,
                                     SignalDirection::Buy, price, platform, 1.0 - home_win_prob,
                                     &zmq_pub, &zmq_seq
                                 ).await {
@@ -1379,19 +866,16 @@ async fn monitor_game(
                                     .unwrap_or_else(|| "N/A".to_string())
                             );
 
-                            if check_and_emit_signal(
-                                &redis,
+                            if model_edge::detect_and_emit(
                                 &game_id,
                                 sport_enum,
                                 team,
                                 prob,
                                 price,
                                 platform,
-                                old_p,
                                 min_edge_pct,
                                 &zmq_pub,
                                 &zmq_seq,
-                                transport_mode,
                             )
                             .await
                             {
@@ -1416,255 +900,53 @@ async fn monitor_game(
     }
 }
 
-/// Find all platform prices for a team (returns up to one price per platform)
-/// Filters out stale prices based on max_age_secs.
-fn find_team_prices<'a>(
-    prices: &'a HashMap<String, MarketPriceData>,
-    team: &str,
-    sport: Sport,
-    max_age_secs: i64,
-) -> (Option<&'a MarketPriceData>, Option<&'a MarketPriceData>) {
-    // Use the shared matcher instead of substring matching (prevents LA/Louisiana/etc collisions).
-    let mut best_kalshi: Option<(&MarketPriceData, f64)> = None;
-    let mut best_poly: Option<(&MarketPriceData, f64)> = None;
-    let now = Utc::now();
+// Signal emission functions moved to signals/ modules:
+// - signals/emission.rs: Core ZMQ publishing
+// - signals/model_edge.rs: check_and_emit_signal -> model_edge::detect_and_emit
+// - signals/arbitrage.rs: emit_arb_signal -> arbitrage::detect_and_emit
+// - signals/latency.rs: emit_latency_signal -> latency::detect_and_emit
 
-    for (_key, price) in prices {
-        // Skip stale prices
-        let age_secs = (now - price.timestamp).num_seconds();
-        if age_secs > max_age_secs {
-            continue;
-        }
-
-        let platform = price.platform.to_lowercase();
-        let result = match_team_in_text(team, &price.contract_team, sport.as_str());
-        if !result.is_match() {
-            continue;
-        }
-
-        let score = result.score;
-        if platform.contains("kalshi") {
-            if best_kalshi.map(|(_, s)| s).unwrap_or(0.0) < score {
-                best_kalshi = Some((price, score));
-            }
-        } else if platform.contains("polymarket") {
-            if best_poly.map(|(_, s)| s).unwrap_or(0.0) < score {
-                best_poly = Some((price, score));
-            }
-        }
-    }
-
-    (best_kalshi.map(|(p, _)| p), best_poly.map(|(p, _)| p))
-}
-
-/// Select the best platform for a *tradeable* model-edge signal on a team.
-/// Uses executable entry prices + fees (YES ask for BUY, NO ask for SELL).
-fn select_best_platform_for_team<'a>(
-    model_yes_prob: f64,
-    kalshi_price: Option<&'a MarketPriceData>,
-    poly_price: Option<&'a MarketPriceData>,
-) -> Option<(&'a MarketPriceData, Platform, f64)> {
-    let mut best: Option<(&MarketPriceData, Platform, f64)> = None;
-
-    if let Some(k) = kalshi_price {
-        let (_dir, _ty, net_edge_pct, _gross_abs, _mid) =
-            compute_team_net_edge(model_yes_prob, k, Platform::Kalshi);
-        best = Some((k, Platform::Kalshi, net_edge_pct));
-    }
-
-    if let Some(p) = poly_price {
-        let (_dir, _ty, net_edge_pct, _gross_abs, _mid) =
-            compute_team_net_edge(model_yes_prob, p, Platform::Polymarket);
-        match best {
-            Some((_, _, best_edge)) if best_edge >= net_edge_pct => {}
-            _ => best = Some((p, Platform::Polymarket, net_edge_pct)),
-        }
-    }
-
-    best
-}
-
-/// Publish a signal via ZMQ for low-latency consumers
-async fn publish_signal_zmq_fn(
-    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
-    zmq_seq: &Arc<AtomicU64>,
-    signal: &TradingSignal,
-) {
-    if let Some(ref pub_socket) = zmq_pub {
-        let topic = format!("signals.trade.{}", signal.signal_id);
-        let seq = zmq_seq.fetch_add(1, Ordering::Relaxed);
-
-        let envelope = ZmqEnvelope {
-            seq,
-            timestamp_ms: Utc::now().timestamp_millis(),
-            source: Some("game_shard".to_string()),
-            payload: serde_json::to_value(signal).unwrap_or_default(),
-        };
-
-        let payload = match serde_json::to_vec(&envelope) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Failed to serialize ZMQ signal envelope: {}", e);
-                return;
-            }
-        };
-
-        let mut socket = pub_socket.lock().await;
-        let mut msg = ZmqMessage::from(topic.as_bytes().to_vec());
-        msg.push_back(payload.into());
-        if let Err(e) = socket.send(msg).await {
-            warn!("Failed to publish signal via ZMQ: {}", e);
-        } else {
-            debug!("Published signal {} via ZMQ (seq={})", signal.signal_id, seq);
-        }
-    }
-}
-
-/// Returns true if a signal was emitted, false otherwise
-async fn check_and_emit_signal(
-    redis: &RedisBus,
-    game_id: &str,
-    sport: Sport,
-    team: &str,
-    model_prob: f64,
-    market_price: &MarketPriceData,
-    selected_platform: Platform,
-    _old_prob: Option<f64>,
-    min_edge_pct: f64,
-    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
-    zmq_seq: &Arc<AtomicU64>,
-    transport_mode: TransportMode,
-) -> bool {
-    let (direction, signal_type, net_edge_pct, gross_edge_pct_abs, market_yes_mid) =
-        compute_team_net_edge(model_prob, market_price, selected_platform);
-
-    if net_edge_pct < min_edge_pct {
-        debug!(
-            "Skipping {} - gross {:.1}%, net {:.1}% < {:.1}% threshold ({:?})",
-            team, gross_edge_pct_abs, net_edge_pct, min_edge_pct, selected_platform
-        );
-        return false;
-    }
-
-    // Probability bounds (symmetric: avoid trading near-certain outcomes)
-    match direction {
-        SignalDirection::Buy => {
-            if model_prob > MAX_BUY_PROB {
-                debug!(
-                    "Skipping BUY YES for {} - prob too high: {:.1}%",
-                    team,
-                    model_prob * 100.0
-                );
-                return false;
-            }
-        }
-        SignalDirection::Sell => {
-            if model_prob < MIN_BUY_PROB {
-                debug!(
-                    "Skipping BUY NO for {} - prob too low (NO too high): {:.1}%",
-                    team,
-                    model_prob * 100.0
-                );
-                return false;
-            }
-        }
-        SignalDirection::Hold => return false,
-    }
-
-    // Executable entry/exit prices for better logging + UI
-    let (buy_price, sell_price, liquidity_available) = match direction {
-        SignalDirection::Buy => (
-            market_price.yes_ask,
-            market_price.yes_bid,
-            market_price
-                .yes_ask_size
-                .or(market_price.total_liquidity)
-                .unwrap_or(100.0),
-        ),
-        SignalDirection::Sell => {
-            let no_ask = (1.0 - market_price.yes_bid).clamp(0.0, 1.0);
-            let no_bid = (1.0 - market_price.yes_ask).clamp(0.0, 1.0);
-            (
-                no_ask,
-                no_bid,
-                market_price
-                    .yes_bid_size
-                    .or(market_price.total_liquidity)
-                    .unwrap_or(100.0),
-            )
-        }
-        SignalDirection::Hold => (market_price.mid_price, market_price.mid_price, 0.0),
+fn build_game_state(game: &EspnGame, sport_enum: Sport) -> GameState {
+    let sport_specific = match sport_enum {
+        Sport::NFL | Sport::NCAAF => SportSpecificState::Football(FootballState {
+            down: game.down,
+            yards_to_go: game.yards_to_go,
+            yard_line: game.yard_line,
+            is_redzone: game.is_redzone,
+            timeouts_home: 3, // Default to full timeouts (ESPN doesn't always provide)
+            timeouts_away: 3,
+        }),
+        Sport::NBA | Sport::NCAAB => SportSpecificState::Basketball(Default::default()),
+        Sport::NHL => SportSpecificState::Hockey(Default::default()),
+        Sport::MLB => SportSpecificState::Baseball(Default::default()),
+        Sport::MLS | Sport::Soccer => SportSpecificState::Soccer(Default::default()),
+        Sport::Tennis | Sport::MMA => SportSpecificState::Other,
     };
 
-    // Create signal with the selected platform
-    // Use fee-adjusted edge for the signal's edge_pct field
-    let signal = TradingSignal {
-        signal_id: Uuid::new_v4().to_string(),
-        signal_type,
-        game_id: game_id.to_string(),
-        sport,
-        team: team.to_string(),
-        direction,
-        model_prob,
-        market_prob: Some(market_yes_mid),
-        edge_pct: net_edge_pct, // Fee-adjusted, executable edge
-        confidence: (net_edge_pct / 10.0).min(1.0), // Confidence based on net edge
-        platform_buy: Some(selected_platform),
-        platform_sell: None,
-        buy_price: Some(buy_price),
-        sell_price: Some(sell_price),
-        liquidity_available,
-        reason: format!(
-            "Model YES: {:.1}% vs Market YES: {:.1}% = {:.1}% gross / {:.1}% net ({:?})",
-            model_prob * 100.0,
-            market_yes_mid * 100.0,
-            gross_edge_pct_abs,
-            net_edge_pct,
-            selected_platform
-        ),
-        created_at: Utc::now(),
-        // Increased from 30s to 60s for better signal processing time
-        expires_at: Some(Utc::now() + chrono::Duration::seconds(60)),
-        play_id: None,
-        // Universal fields (backward compat - use game_id/team for sports)
-        event_id: None,
-        market_type: None,
-        entity: None,
-    };
-
-    // Format direction as "to win" / "to lose" for clarity
-    let direction_str = match direction {
-        SignalDirection::Buy => "to win",
-        SignalDirection::Sell => "to lose",
-        SignalDirection::Hold => "hold",
-    };
-    info!(
-        "SIGNAL: {} {} - model_yes={:.1}% market_yes={:.1}% gross={:.1}% net={:.1}% ({:?})",
-        team,
-        direction_str,
-        model_prob * 100.0,
-        market_yes_mid * 100.0,
-        gross_edge_pct_abs,
-        net_edge_pct,
-        selected_platform
-    );
-
-    // Publish signal based on transport mode
-    let mut success = true;
-
-    if transport_mode.use_zmq() {
-        publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
+    GameState {
+        // Universal fields (new - Phase 1-5)
+        event_id: game.id.clone(),
+        market_type: Some(MarketType::sport(sport_enum)),
+        entity_a: Some(game.home_team.clone()),
+        entity_b: Some(game.away_team.clone()),
+        event_start: None,
+        event_end: None,
+        resolution_criteria: None,
+        // Legacy fields
+        game_id: game.id.clone(),
+        sport: sport_enum,
+        home_team: game.home_team.clone(),
+        away_team: game.away_team.clone(),
+        home_score: game.home_score,
+        away_score: game.away_score,
+        period: game.period,
+        time_remaining_seconds: game.time_remaining_seconds,
+        possession: game.possession.clone(),
+        fetched_at: Utc::now(), // Track when this state was fetched
+        pregame_home_prob: None,
+        sport_specific,
+        market_specific: None,
     }
-
-    if transport_mode.use_redis() {
-        let redis_result = redis.publish(channels::SIGNALS_NEW, &signal).await;
-        if let Err(e) = &redis_result {
-            error!("Failed to publish signal via Redis: {}", e);
-            success = false;
-        }
-    }
-
-    success
 }
 
 async fn fetch_game_state(
@@ -1672,7 +954,7 @@ async fn fetch_game_state(
     game_id: &str,
     sport: &str,
     espn_circuit_breaker: &ApiCircuitBreaker,
-) -> Option<(EspnGame, GameState)> {
+) -> Option<(EspnGame, GameState, f64)> {
     let (espn_sport, espn_league) = espn_sport_league(sport)?;
 
     // Check circuit breaker before making ESPN API call
@@ -1700,608 +982,48 @@ async fn fetch_game_state(
         }
     };
 
-    let game = games.into_iter().find(|g| g.id == game_id)?;
-
     let sport_enum = parse_sport(sport)?;
+    let batch_enabled = env::var("BATCH_PROBABILITY")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(true);
 
-    // Build sport-specific state based on sport type
-    let sport_specific = match sport_enum {
-        Sport::NFL | Sport::NCAAF => SportSpecificState::Football(FootballState {
-            down: game.down,
-            yards_to_go: game.yards_to_go,
-            yard_line: game.yard_line,
-            is_redzone: game.is_redzone,
-            timeouts_home: 3, // Default to full timeouts (ESPN doesn't always provide)
-            timeouts_away: 3,
-        }),
-        Sport::NBA | Sport::NCAAB => SportSpecificState::Basketball(Default::default()),
-        Sport::NHL => SportSpecificState::Hockey(Default::default()),
-        Sport::MLB => SportSpecificState::Baseball(Default::default()),
-        Sport::MLS | Sport::Soccer => SportSpecificState::Soccer(Default::default()),
-        Sport::Tennis | Sport::MMA => SportSpecificState::Other,
-    };
+    if batch_enabled && games.len() > 1 {
+        let states: Vec<GameState> = games.iter().map(|g| build_game_state(g, sport_enum)).collect();
+        let start = Instant::now();
+        let probs = batch_calculate_win_probs(&states, true);
+        let elapsed = start.elapsed();
+        if elapsed > Duration::from_millis(50) {
+            info!(
+                "Batch win_prob calc: {} games in {:?}",
+                states.len(),
+                elapsed
+            );
+        }
 
-    let state = GameState {
-        // Universal fields (new - Phase 1-5)
-        event_id: game.id.clone(),
-        market_type: Some(MarketType::sport(sport_enum)),
-        entity_a: Some(game.home_team.clone()),
-        entity_b: Some(game.away_team.clone()),
-        event_start: None,
-        event_end: None,
-        resolution_criteria: None,
-        // Legacy fields
-        game_id: game.id.clone(),
-        sport: sport_enum,
-        home_team: game.home_team.clone(),
-        away_team: game.away_team.clone(),
-        home_score: game.home_score,
-        away_score: game.away_score,
-        period: game.period,
-        time_remaining_seconds: game.time_remaining_seconds,
-        possession: game.possession.clone(),
-        fetched_at: Utc::now(), // Track when this state was fetched
-        pregame_home_prob: None,
-        sport_specific,
-        market_specific: None,
-    };
-
-    Some((game, state))
-}
-
-fn parse_sport(sport: &str) -> Option<Sport> {
-    match sport.to_lowercase().as_str() {
-        "nfl" => Some(Sport::NFL),
-        "ncaaf" => Some(Sport::NCAAF),
-        "nba" => Some(Sport::NBA),
-        "ncaab" => Some(Sport::NCAAB),
-        "nhl" => Some(Sport::NHL),
-        "mlb" => Some(Sport::MLB),
-        "mls" => Some(Sport::MLS),
-        "soccer" => Some(Sport::Soccer),
-        "tennis" => Some(Sport::Tennis),
-        "mma" => Some(Sport::MMA),
-        _ => None,
-    }
-}
-
-/// Check if a game is in overtime based on sport and period
-/// Returns true if the game has exceeded regular periods/innings
-fn is_overtime(sport: Sport, period: u8) -> bool {
-    match sport {
-        Sport::NHL => period > 3,       // Regular NHL: 3 periods
-        Sport::NBA => period > 4,       // Regular NBA: 4 quarters
-        Sport::NFL => period > 4,       // Regular NFL: 4 quarters
-        Sport::NCAAF => period > 4,     // Regular NCAAF: 4 quarters
-        Sport::NCAAB => period > 2,     // Regular NCAAB: 2 halves
-        Sport::MLB => period > 9,       // Regular MLB: 9 innings
-        Sport::MLS | Sport::Soccer => period > 2, // Regular soccer: 2 halves
-        Sport::Tennis => false,         // Tennis doesn't have overtime
-        Sport::MMA => false,            // MMA doesn't have overtime
-    }
-}
-
-fn espn_sport_league(sport: &str) -> Option<(&'static str, &'static str)> {
-    match sport.to_lowercase().as_str() {
-        "nfl" => Some(("football", "nfl")),
-        "ncaaf" => Some(("football", "college-football")),
-        "nba" => Some(("basketball", "nba")),
-        "ncaab" => Some(("basketball", "mens-college-basketball")),
-        "nhl" => Some(("hockey", "nhl")),
-        "mlb" => Some(("baseball", "mlb")),
-        "mls" => Some(("soccer", "usa.1")),
-        "soccer" => Some(("soccer", "eng.1")),
-        _ => None,
-    }
-}
-
-/// Format seconds into a time remaining string like "12:34" or "5:00"
-fn format_time_remaining(seconds: u32) -> String {
-    let mins = seconds / 60;
-    let secs = seconds % 60;
-    format!("{}:{:02}", mins, secs)
-}
-
-/// Check for cross-platform arbitrage opportunities using SIMD scanner.
-///
-/// Returns Some((arb_mask, profit_cents)) if an arb is found, None otherwise.
-///
-/// Arbitrage exists when:
-/// - Kalshi YES + Poly NO < 100¢ (or vice versa)
-/// - This means buying both sides guarantees profit
-fn check_cross_platform_arb(
-    kalshi_price: Option<&MarketPriceData>,
-    poly_price: Option<&MarketPriceData>,
-    min_profit_cents: i16,
-) -> Option<(u8, i16)> {
-    let (kalshi, poly) = match (kalshi_price, poly_price) {
-        (Some(k), Some(p)) => (k, p),
-        _ => return None, // Need both platforms for cross-platform arb
-    };
-
-    // Convert prices to cents (0-100 scale)
-    let k_yes = (kalshi.yes_ask * 100.0).round() as u16;
-    let k_no = ((1.0 - kalshi.yes_bid) * 100.0).round() as u16; // NO ask = 1 - YES bid
-    let p_yes = (poly.yes_ask * 100.0).round() as u16;
-    let p_no = ((1.0 - poly.yes_bid) * 100.0).round() as u16;
-
-    // Use SIMD scanner to check for arbs (threshold 100 = $1.00)
-    let arb_mask = check_arbs_simd(k_yes, k_no, p_yes, p_no, 100);
-
-    if arb_mask == 0 {
-        return None;
-    }
-
-    // Calculate profit for cross-platform arbs only
-    let cross_platform_mask = arb_mask & (ARB_POLY_YES_KALSHI_NO | ARB_KALSHI_YES_POLY_NO);
-
-    if cross_platform_mask == 0 {
-        return None;
-    }
-
-    // Find the most profitable cross-platform arb
-    let mut best_profit = 0i16;
-    let mut best_mask = 0u8;
-
-    if arb_mask & ARB_POLY_YES_KALSHI_NO != 0 {
-        let profit = calculate_profit_cents(k_yes, k_no, p_yes, p_no, ARB_POLY_YES_KALSHI_NO);
-        if profit > best_profit {
-            best_profit = profit;
-            best_mask = ARB_POLY_YES_KALSHI_NO;
+        if let Some(index) = games.iter().position(|g| g.id == game_id) {
+            let game = games[index].clone();
+            let state = states[index].clone();
+            let home_win_prob = probs.get(index).copied().unwrap_or(0.5);
+            return Some((game, state, home_win_prob));
         }
     }
 
-    if arb_mask & ARB_KALSHI_YES_POLY_NO != 0 {
-        let profit = calculate_profit_cents(k_yes, k_no, p_yes, p_no, ARB_KALSHI_YES_POLY_NO);
-        if profit > best_profit {
-            best_profit = profit;
-            best_mask = ARB_KALSHI_YES_POLY_NO;
-        }
-    }
-
-    if best_profit >= min_profit_cents {
-        Some((best_mask, best_profit))
-    } else {
-        None
-    }
+    let game = games.into_iter().find(|g| g.id == game_id)?;
+    let state = build_game_state(&game, sport_enum);
+    let home_win_prob = calculate_win_probability(&state, true);
+    Some((game, state, home_win_prob))
 }
 
-/// Emit a cross-platform arbitrage signal
-async fn emit_arb_signal(
-    redis: &RedisBus,
-    game_id: &str,
-    sport: Sport,
-    team: &str,
-    arb_mask: u8,
-    profit_cents: i16,
-    kalshi_price: &MarketPriceData,
-    poly_price: &MarketPriceData,
-    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
-    zmq_seq: &Arc<AtomicU64>,
-) -> bool {
-    let arb_types = decode_arb_mask(arb_mask);
-    let arb_type_str = arb_types.first().unwrap_or(&"Unknown");
 
-    let (buy_platform, sell_platform) = if arb_mask == ARB_POLY_YES_KALSHI_NO {
-        (Platform::Polymarket, Platform::Kalshi)
-    } else {
-        (Platform::Kalshi, Platform::Polymarket)
-    };
-
-    // For ARB signals, use the buy-side YES price as market_prob
-    // This ensures signal_processor doesn't reject for "no_market"
-    let buy_yes_price = if arb_mask == ARB_POLY_YES_KALSHI_NO {
-        poly_price.yes_ask
-    } else {
-        kalshi_price.yes_ask
-    };
-
-    let signal = TradingSignal {
-        signal_id: Uuid::new_v4().to_string(),
-        signal_type: SignalType::CrossMarketArb,
-        game_id: game_id.to_string(),
-        sport,
-        team: team.to_string(),
-        direction: SignalDirection::Buy,
-        model_prob: buy_yes_price, // Use buy price for risk calculations
-        market_prob: Some(buy_yes_price),
-        edge_pct: profit_cents as f64,
-        confidence: 1.0,
-        platform_buy: Some(buy_platform),
-        platform_sell: Some(sell_platform),
-        buy_price: Some(if arb_mask == ARB_POLY_YES_KALSHI_NO {
-            poly_price.yes_ask
-        } else {
-            kalshi_price.yes_ask
-        }),
-        sell_price: Some(if arb_mask == ARB_POLY_YES_KALSHI_NO {
-            1.0 - kalshi_price.yes_bid
-        } else {
-            1.0 - poly_price.yes_bid
-        }),
-        liquidity_available: kalshi_price.yes_ask_size.unwrap_or(100.0).min(
-            poly_price.yes_ask_size.unwrap_or(100.0)
-        ),
-        reason: format!(
-            "ARB: {} - profit={:.0}¢ (buy {:?} YES + {:?} NO)",
-            arb_type_str, profit_cents, buy_platform, sell_platform
-        ),
-        created_at: Utc::now(),
-        expires_at: Some(Utc::now() + chrono::Duration::seconds(10)),
-        play_id: None,
-        // Universal fields (backward compat - use game_id/team for sports)
-        event_id: None,
-        market_type: None,
-        entity: None,
-    };
-
-    info!(
-        "ARB SIGNAL: {} {} - profit={}¢ ({:?} YES + {:?} NO)",
-        team, arb_type_str, profit_cents, buy_platform, sell_platform
-    );
-
-    // Publish via ZMQ for low-latency consumers
-    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
-
-    // Publish via Redis (backward compatibility)
-    match redis.publish(channels::SIGNALS_NEW, &signal).await {
-        Ok(_) => true,
-        Err(e) => {
-            error!("Failed to publish arb signal via Redis: {}", e);
-            false
-        }
-    }
-}
-
-/// Emit a latency-based signal when a team scores.
-/// We detect the score change before the market adjusts and bet on the expected price movement.
-async fn emit_latency_signal(
-    redis: &RedisBus,
-    game_id: &str,
-    sport: Sport,
-    team: &str,
-    direction: SignalDirection,
-    market_price: &MarketPriceData,
-    platform: Platform,
-    model_prob: f64,
-    zmq_pub: &Option<Arc<Mutex<PubSocket>>>,
-    zmq_seq: &Arc<AtomicU64>,
-) -> bool {
-    // For a BUY signal, we expect the price to go UP after the score
-    // Edge is the expected price movement (model prob - current market price)
-    let current_price = match direction {
-        SignalDirection::Buy => market_price.yes_ask,
-        SignalDirection::Sell => 1.0 - market_price.yes_bid,
-        SignalDirection::Hold => return false,
-    };
-    let expected_move = (model_prob - current_price).abs() * 100.0;
-
-    let signal = TradingSignal {
-        signal_id: Uuid::new_v4().to_string(),
-        signal_type: SignalType::ScoringPlay,
-        game_id: game_id.to_string(),
-        sport,
-        team: team.to_string(),
-        direction,
-        model_prob,
-        market_prob: Some(current_price),
-        edge_pct: expected_move, // Expected price movement as edge
-        confidence: 0.9, // High confidence for latency plays
-        platform_buy: Some(platform),
-        platform_sell: None,
-        buy_price: Some(current_price),
-        sell_price: None,
-        liquidity_available: market_price.yes_ask_size.or(market_price.total_liquidity).unwrap_or(100.0),
-        reason: format!(
-            "LATENCY: Score detected! Current={:.1}% → Expected={:.1}% (move={:.1}%)",
-            current_price * 100.0,
-            model_prob * 100.0,
-            expected_move
-        ),
-        created_at: Utc::now(),
-        expires_at: Some(Utc::now() + chrono::Duration::seconds(60)), // 1 minute expiry
-        play_id: None,
-        // Universal fields (backward compat - use game_id/team for sports)
-        event_id: None,
-        market_type: None,
-        entity: None,
-    };
-
-    // Publish via ZMQ for low-latency consumers
-    publish_signal_zmq_fn(zmq_pub, zmq_seq, &signal).await;
-
-    // Publish via Redis (backward compatibility)
-    match redis.publish(channels::SIGNALS_NEW, &signal).await {
-        Ok(_) => true,
-        Err(e) => {
-            error!("Failed to publish latency signal via Redis: {}", e);
-            false
-        }
-    }
-}
 
 // ============================================================================
 // Unit Tests
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ========================================================================
-    // compute_team_net_edge tests
-    // ========================================================================
-
-    fn make_price(yes_bid: f64, yes_ask: f64) -> MarketPriceData {
-        MarketPriceData {
-            market_id: "test".to_string(),
-            platform: "kalshi".to_string(),
-            contract_team: "Test Team".to_string(),
-            yes_bid,
-            yes_ask,
-            mid_price: (yes_bid + yes_ask) / 2.0,
-            timestamp: Utc::now(),
-            yes_bid_size: Some(1000.0),
-            yes_ask_size: Some(1000.0),
-            total_liquidity: Some(2000.0),
-        }
-    }
-
-    #[test]
-    fn test_compute_net_edge_buy_yes() {
-        // Model thinks 60% YES, market at 50% mid (bid=48, ask=52)
-        let price = make_price(0.48, 0.52);
-        let (direction, signal_type, net_edge, gross_edge, market_mid) =
-            compute_team_net_edge(0.60, &price, Platform::Kalshi);
-
-        assert_eq!(direction, SignalDirection::Buy);
-        assert_eq!(signal_type, SignalType::ModelEdgeYes);
-        assert!((gross_edge - 10.0).abs() < 0.1); // 60% - 50% = 10% gross
-        assert!(net_edge < gross_edge); // Net should be less due to fees
-        assert!(net_edge > 0.0); // Should still be positive
-        assert!((market_mid - 0.50).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_compute_net_edge_buy_no() {
-        // Model thinks 40% YES (60% NO), market at 50% mid
-        let price = make_price(0.48, 0.52);
-        let (direction, signal_type, net_edge, gross_edge, market_mid) =
-            compute_team_net_edge(0.40, &price, Platform::Kalshi);
-
-        assert_eq!(direction, SignalDirection::Sell);
-        assert_eq!(signal_type, SignalType::ModelEdgeNo);
-        assert!((gross_edge - 10.0).abs() < 0.1); // |40% - 50%| = 10% gross
-        assert!(net_edge < gross_edge); // Net should be less due to fees
-        assert!((market_mid - 0.50).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_compute_net_edge_platform_fees_differ() {
-        let price = make_price(0.48, 0.52);
-
-        let (_, _, kalshi_net, _, _) = compute_team_net_edge(0.60, &price, Platform::Kalshi);
-        let (_, _, poly_net, _, _) = compute_team_net_edge(0.60, &price, Platform::Polymarket);
-
-        // Both should have positive gross edge (model 60% vs market ~50%)
-        // Net edges will differ based on fee structure
-        // At mid-range prices, Polymarket's 2% per-side fee may be higher than Kalshi's tiered fees
-        // The important thing is both calculations work and produce reasonable values
-        assert!(kalshi_net > -20.0 && kalshi_net < 20.0); // Reasonable range
-        assert!(poly_net > -20.0 && poly_net < 20.0); // Reasonable range
-
-        // Both should be less than the gross edge of ~10%
-        assert!(kalshi_net < 10.0);
-        assert!(poly_net < 10.0);
-    }
-
-    #[test]
-    fn test_compute_net_edge_no_edge() {
-        // Model matches market exactly
-        let price = make_price(0.48, 0.52);
-        let (direction, _, net_edge, gross_edge, _) =
-            compute_team_net_edge(0.50, &price, Platform::Kalshi);
-
-        assert_eq!(direction, SignalDirection::Buy); // Slight bias to buy when equal
-        assert!(gross_edge.abs() < 0.1); // Near zero gross edge
-        assert!(net_edge < 0.0); // Negative after fees (no real edge)
-    }
-
-    // ========================================================================
-    // is_overtime tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_overtime_nhl() {
-        assert!(!is_overtime(Sport::NHL, 1));
-        assert!(!is_overtime(Sport::NHL, 2));
-        assert!(!is_overtime(Sport::NHL, 3));
-        assert!(is_overtime(Sport::NHL, 4)); // OT
-        assert!(is_overtime(Sport::NHL, 5)); // 2OT
-    }
-
-    #[test]
-    fn test_is_overtime_nba() {
-        assert!(!is_overtime(Sport::NBA, 1));
-        assert!(!is_overtime(Sport::NBA, 4));
-        assert!(is_overtime(Sport::NBA, 5)); // OT
-    }
-
-    #[test]
-    fn test_is_overtime_nfl() {
-        assert!(!is_overtime(Sport::NFL, 1));
-        assert!(!is_overtime(Sport::NFL, 4));
-        assert!(is_overtime(Sport::NFL, 5)); // OT
-    }
-
-    #[test]
-    fn test_is_overtime_ncaab() {
-        assert!(!is_overtime(Sport::NCAAB, 1));
-        assert!(!is_overtime(Sport::NCAAB, 2));
-        assert!(is_overtime(Sport::NCAAB, 3)); // OT (college has 2 halves)
-    }
-
-    #[test]
-    fn test_is_overtime_mlb() {
-        assert!(!is_overtime(Sport::MLB, 1));
-        assert!(!is_overtime(Sport::MLB, 9));
-        assert!(is_overtime(Sport::MLB, 10)); // Extra innings
-    }
-
-    #[test]
-    fn test_is_overtime_soccer() {
-        assert!(!is_overtime(Sport::Soccer, 1));
-        assert!(!is_overtime(Sport::Soccer, 2));
-        assert!(is_overtime(Sport::Soccer, 3)); // Extra time
-    }
-
-    // ========================================================================
-    // format_time_remaining tests
-    // ========================================================================
-
-    #[test]
-    fn test_format_time_remaining() {
-        assert_eq!(format_time_remaining(0), "0:00");
-        assert_eq!(format_time_remaining(30), "0:30");
-        assert_eq!(format_time_remaining(60), "1:00");
-        assert_eq!(format_time_remaining(90), "1:30");
-        assert_eq!(format_time_remaining(720), "12:00"); // 12 minutes
-        assert_eq!(format_time_remaining(754), "12:34");
-    }
-
-    // ========================================================================
-    // parse_sport tests
-    // ========================================================================
-
-    #[test]
-    fn test_parse_sport_valid() {
-        assert_eq!(parse_sport("nfl"), Some(Sport::NFL));
-        assert_eq!(parse_sport("NFL"), Some(Sport::NFL));
-        assert_eq!(parse_sport("nba"), Some(Sport::NBA));
-        assert_eq!(parse_sport("nhl"), Some(Sport::NHL));
-        assert_eq!(parse_sport("mlb"), Some(Sport::MLB));
-        assert_eq!(parse_sport("ncaaf"), Some(Sport::NCAAF));
-        assert_eq!(parse_sport("ncaab"), Some(Sport::NCAAB));
-        assert_eq!(parse_sport("mls"), Some(Sport::MLS));
-        assert_eq!(parse_sport("soccer"), Some(Sport::Soccer));
-    }
-
-    #[test]
-    fn test_parse_sport_invalid() {
-        assert_eq!(parse_sport("invalid"), None);
-        assert_eq!(parse_sport(""), None);
-        assert_eq!(parse_sport("cricket"), None);
-    }
-
-    // ========================================================================
-    // espn_sport_league tests
-    // ========================================================================
-
-    #[test]
-    fn test_espn_sport_league_mapping() {
-        assert_eq!(espn_sport_league("nfl"), Some(("football", "nfl")));
-        assert_eq!(espn_sport_league("ncaaf"), Some(("football", "college-football")));
-        assert_eq!(espn_sport_league("nba"), Some(("basketball", "nba")));
-        assert_eq!(espn_sport_league("ncaab"), Some(("basketball", "mens-college-basketball")));
-        assert_eq!(espn_sport_league("nhl"), Some(("hockey", "nhl")));
-        assert_eq!(espn_sport_league("mlb"), Some(("baseball", "mlb")));
-        assert_eq!(espn_sport_league("mls"), Some(("soccer", "usa.1")));
-        assert_eq!(espn_sport_league("soccer"), Some(("soccer", "eng.1")));
-    }
-
-    #[test]
-    fn test_espn_sport_league_invalid() {
-        assert_eq!(espn_sport_league("invalid"), None);
-        assert_eq!(espn_sport_league("tennis"), None);
-    }
-
-    // ========================================================================
-    // check_cross_platform_arb tests
-    // ========================================================================
-
-    #[test]
-    fn test_check_arb_no_arb() {
-        // Efficient market: no arbitrage
-        let kalshi = make_price(0.48, 0.52);
-        let poly = make_price(0.47, 0.53);
-
-        let result = check_cross_platform_arb(Some(&kalshi), Some(&poly), 1);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_check_arb_missing_platform() {
-        let kalshi = make_price(0.48, 0.52);
-
-        // Need both platforms for cross-platform arb
-        assert!(check_cross_platform_arb(Some(&kalshi), None, 1).is_none());
-        assert!(check_cross_platform_arb(None, Some(&kalshi), 1).is_none());
-        assert!(check_cross_platform_arb(None, None, 1).is_none());
-    }
-
-    #[test]
-    fn test_check_arb_found() {
-        // Arb opportunity: Kalshi YES 48¢ + Poly NO 48¢ = 96¢ < 100¢
-        // Kalshi: bid=50, ask=48 (YES at 48¢)
-        // Poly: bid=54, ask=56 (NO = 1-bid = 46¢, but we need ask)
-        // Actually need: Kalshi ask + (1 - Poly bid) < 100
-        // 48 + (100 - 54) = 48 + 46 = 94 < 100 ✓
-
-        let kalshi = make_price(0.50, 0.48); // YES ask = 48¢
-        let poly = make_price(0.54, 0.56);   // NO ask = 1 - 0.54 = 46¢
-
-        let result = check_cross_platform_arb(Some(&kalshi), Some(&poly), 1);
-        assert!(result.is_some());
-
-        let (mask, profit) = result.unwrap();
-        assert!(profit > 0);
-        assert!(mask != 0);
-    }
-
-    // ========================================================================
-    // MarketPriceData tests
-    // ========================================================================
-
-    #[test]
-    fn test_market_price_data_mid_calculation() {
-        let price = make_price(0.40, 0.60);
-        assert!((price.mid_price - 0.50).abs() < 0.01);
-
-        let price2 = make_price(0.30, 0.35);
-        assert!((price2.mid_price - 0.325).abs() < 0.01);
-    }
-
-    // ========================================================================
-    // fee_for_price tests
-    // ========================================================================
-
-    #[test]
-    fn test_fee_for_price_kalshi() {
-        // Kalshi fees are tiered based on price
-        let fee_low = fee_for_price(Platform::Kalshi, 0.10);
-        let fee_mid = fee_for_price(Platform::Kalshi, 0.50);
-        let fee_high = fee_for_price(Platform::Kalshi, 0.90);
-
-        // Fees should all be positive and reasonable
-        assert!(fee_low > 0.0 && fee_low < 0.10);
-        assert!(fee_mid > 0.0 && fee_mid < 0.10);
-        assert!(fee_high > 0.0 && fee_high < 0.10);
-    }
-
-    #[test]
-    fn test_fee_for_price_polymarket() {
-        // Polymarket charges 2% of price
-        let fee = fee_for_price(Platform::Polymarket, 0.50);
-        assert!((fee - 0.01).abs() < 0.001); // 2% of 0.50 = 0.01
-    }
-
-    #[test]
-    fn test_fee_for_price_clamped() {
-        // Prices should be clamped to 0-1
-        let fee_negative = fee_for_price(Platform::Kalshi, -0.5);
-        let fee_over = fee_for_price(Platform::Kalshi, 1.5);
-
-        assert!(fee_negative >= 0.0);
-        assert!(fee_over >= 0.0);
-    }
-}
+//
+// Tests moved to submodules:
+// - signals/edge.rs: compute_team_net_edge, fee_for_price tests
+// - monitoring/espn.rs: parse_sport, is_overtime, format_time_remaining, check_cross_platform_arb tests
+// - price/matching.rs: find_team_prices, select_best_platform_for_team tests
+//
+// Run all tests with:
+// cargo test --package game_shard_rust

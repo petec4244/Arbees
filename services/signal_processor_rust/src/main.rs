@@ -8,14 +8,16 @@
 
 use anyhow::{Context, Result};
 use arbees_rust_core::models::{
-    channels, ExecutionRequest, ExecutionSide, NotificationEvent, NotificationPriority,
-    NotificationType, Platform, RuleDecision, RuleDecisionType, SignalDirection, SignalType, Sport,
-    TradingSignal, TransportMode,
+    channels, ExecutionRequest, ExecutionResult, ExecutionSide, ExecutionStatus, MarketType,
+    NotificationEvent, NotificationPriority, NotificationType, Platform, RuleDecision,
+    RuleDecisionType, SignalDirection, SignalType, Sport, TradingSignal,
 };
 use arbees_rust_core::redis::RedisBus;
 use arbees_rust_core::utils::matching::match_team_in_text;
 use chrono::{DateTime, Duration, Utc};
 use dotenv::dotenv;
+use execution_service_rust::balance::start_balance_refresh_loop;
+use execution_service_rust::{DailyPnlTracker, ExecutionEngine};
 use futures_util::StreamExt;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -75,8 +77,22 @@ struct Config {
     price_staleness_secs: f64,
     /// Minimum liquidity threshold to trade ($10 default)
     liquidity_min_threshold: f64,
+    /// Optional per-platform liquidity thresholds
+    liquidity_min_threshold_kalshi: Option<f64>,
+    liquidity_min_threshold_polymarket: Option<f64>,
+    liquidity_min_threshold_paper: Option<f64>,
+    /// Optional per-market-type liquidity thresholds
+    liquidity_min_threshold_sport: Option<f64>,
+    liquidity_min_threshold_crypto: Option<f64>,
+    liquidity_min_threshold_economics: Option<f64>,
+    liquidity_min_threshold_politics: Option<f64>,
+    liquidity_min_threshold_entertainment: Option<f64>,
     /// Maximum percentage of available liquidity to use (80% default)
     liquidity_max_position_pct: f64,
+}
+
+fn get_env_float(name: &str) -> Option<f64> {
+    env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 impl Default for Config {
@@ -149,10 +165,17 @@ impl Default for Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30.0),
             // Minimum liquidity threshold - don't trade if less than this available ($10 default)
-            liquidity_min_threshold: env::var("LIQUIDITY_MIN_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10.0),
+            liquidity_min_threshold: get_env_float("LIQUIDITY_MIN_THRESHOLD").unwrap_or(10.0),
+            liquidity_min_threshold_kalshi: get_env_float("LIQUIDITY_MIN_THRESHOLD_KALSHI"),
+            liquidity_min_threshold_polymarket: get_env_float("LIQUIDITY_MIN_THRESHOLD_POLYMARKET"),
+            liquidity_min_threshold_paper: get_env_float("LIQUIDITY_MIN_THRESHOLD_PAPER"),
+            liquidity_min_threshold_sport: get_env_float("LIQUIDITY_MIN_THRESHOLD_SPORT"),
+            liquidity_min_threshold_crypto: get_env_float("LIQUIDITY_MIN_THRESHOLD_CRYPTO"),
+            liquidity_min_threshold_economics: get_env_float("LIQUIDITY_MIN_THRESHOLD_ECONOMICS"),
+            liquidity_min_threshold_politics: get_env_float("LIQUIDITY_MIN_THRESHOLD_POLITICS"),
+            liquidity_min_threshold_entertainment: get_env_float(
+                "LIQUIDITY_MIN_THRESHOLD_ENTERTAINMENT",
+            ),
             // Maximum percentage of available liquidity to use (80% default)
             // This prevents taking the entire book and ensures we can exit
             liquidity_max_position_pct: env::var("LIQUIDITY_MAX_POSITION_PCT")
@@ -251,8 +274,12 @@ struct SignalProcessorState {
     pool: PgPool,
     redis: RedisBus,
 
-    // Transport configuration
-    transport_mode: TransportMode,
+    // Inline execution mode (consolidated path)
+    execution_inline: bool,
+    execution_engine: Option<Arc<ExecutionEngine>>,
+    pnl_tracker: Option<Arc<DailyPnlTracker>>,
+
+    // ZMQ publishing (ZMQ-only transport)
     zmq_pub: Option<Arc<Mutex<PubSocket>>>,
     zmq_seq: Arc<AtomicU64>,
 
@@ -278,8 +305,10 @@ impl SignalProcessorState {
         config: Config,
         pool: PgPool,
         redis: RedisBus,
-        transport_mode: TransportMode,
         zmq_pub: Option<Arc<Mutex<PubSocket>>>,
+        execution_inline: bool,
+        execution_engine: Option<Arc<ExecutionEngine>>,
+        pnl_tracker: Option<Arc<DailyPnlTracker>>,
     ) -> Self {
         let mut rejected_counts = HashMap::new();
         for key in &[
@@ -290,6 +319,7 @@ impl SignalProcessorState {
             "cooldown",
             "risk",
             "rule_blocked",
+            "insufficient_liquidity",
         ] {
             rejected_counts.insert(key.to_string(), 0);
         }
@@ -298,7 +328,9 @@ impl SignalProcessorState {
             config,
             pool,
             redis,
-            transport_mode,
+            execution_inline,
+            execution_engine,
+            pnl_tracker,
             zmq_pub,
             zmq_seq: Arc::new(AtomicU64::new(0)),
             signal_count: 0,
@@ -879,22 +911,45 @@ impl SignalProcessorState {
             SignalDirection::Sell => market_price.yes_bid_size.unwrap_or(0.0),
             SignalDirection::Hold => return Ok(proposed_size),
         };
+        let mut used_signal_liquidity = false;
 
         // Fallback: If market price has no liquidity data, use signal's liquidity_available
         // This handles cases where DB market_prices table is missing liquidity columns
         if available == 0.0 && signal.liquidity_available > 0.0 {
             available = signal.liquidity_available;
+            used_signal_liquidity = true;
             debug!(
                 "Using signal's liquidity_available (${:.2}) as fallback for market price with no liquidity data",
                 available
             );
         }
 
+        let min_threshold = self.min_liquidity_threshold(signal, market_price);
+
         // Check minimum liquidity threshold
-        if available < self.config.liquidity_min_threshold {
+        if available < min_threshold {
+            let rejection = serde_json::json!({
+                "event": "liquidity_rejected",
+                "signal_id": signal.signal_id,
+                "game_id": signal.game_id,
+                "market_id": market_price.market_id,
+                "platform": market_price.platform,
+                "market_type": signal.get_market_type().type_name(),
+                "direction": format!("{:?}", signal.direction),
+                "price": match signal.direction {
+                    SignalDirection::Buy => market_price.yes_ask,
+                    SignalDirection::Sell => market_price.yes_bid,
+                    SignalDirection::Hold => 0.0,
+                },
+                "liquidity_available": available,
+                "liquidity_source_signal": used_signal_liquidity,
+                "threshold": min_threshold,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+            warn!("LIQUIDITY_REJECTED {}", rejection);
             return Err(format!(
                 "insufficient_liquidity: ${:.2} available < ${:.2} minimum",
-                available, self.config.liquidity_min_threshold
+                available, min_threshold
             ));
         }
 
@@ -910,6 +965,31 @@ impl SignalProcessorState {
         }
 
         Ok(validated_size)
+    }
+
+    fn min_liquidity_threshold(&self, signal: &TradingSignal, market_price: &MarketPriceRow) -> f64 {
+        let market_type = signal.get_market_type();
+        let mut threshold = self.config.liquidity_min_threshold;
+
+        threshold = match market_type {
+            MarketType::Sport { .. } => self.config.liquidity_min_threshold_sport.unwrap_or(threshold),
+            MarketType::Crypto { .. } => self.config.liquidity_min_threshold_crypto.unwrap_or(threshold),
+            MarketType::Economics { .. } => self.config.liquidity_min_threshold_economics.unwrap_or(threshold),
+            MarketType::Politics { .. } => self.config.liquidity_min_threshold_politics.unwrap_or(threshold),
+            MarketType::Entertainment { .. } => self.config.liquidity_min_threshold_entertainment.unwrap_or(threshold),
+        };
+
+        let platform = match market_price.platform.as_str() {
+            "kalshi" => Platform::Kalshi,
+            "polymarket" => Platform::Polymarket,
+            _ => Platform::Paper,
+        };
+
+        match platform {
+            Platform::Kalshi => self.config.liquidity_min_threshold_kalshi.unwrap_or(threshold),
+            Platform::Polymarket => self.config.liquidity_min_threshold_polymarket.unwrap_or(threshold),
+            Platform::Paper => self.config.liquidity_min_threshold_paper.unwrap_or(threshold),
+        }
     }
 
     fn create_execution_request(
@@ -1052,6 +1132,15 @@ impl SignalProcessorState {
 
     async fn handle_signal(&mut self, signal: TradingSignal) -> Result<()> {
         self.signal_count += 1;
+        if self.signal_count % 100 == 0 {
+            let rejection_snapshot = serde_json::json!(self.rejected_counts);
+            info!(
+                "Signal stats: total={} approved={} rejected={}",
+                self.signal_count,
+                self.approved_count,
+                rejection_snapshot
+            );
+        }
 
         // Format direction as "to win" / "to lose" for clarity
         let direction_str = match signal.direction {
@@ -1091,10 +1180,11 @@ impl SignalProcessorState {
                         contract_team: Some(signal.team.clone()),
                         yes_bid: (signal.market_prob.unwrap_or(0.5) - 0.02).max(0.01),
                         yes_ask: (signal.market_prob.unwrap_or(0.5) + 0.02).min(0.99),
-                        yes_bid_size: Some(liquidity),
-                        yes_ask_size: Some(liquidity),
+                        // Use liquidity from signal (set by game_shard based on orderbook)
+                        yes_bid_size: Some(signal.liquidity_available),
+                        yes_ask_size: Some(signal.liquidity_available),
                         volume: Some(0.0),
-                        liquidity: Some(liquidity),
+                        liquidity: Some(signal.liquidity_available),
                         time: Utc::now(),
                     }
                 } else {
@@ -1181,29 +1271,69 @@ impl SignalProcessorState {
         self.in_flight
             .insert(exec_request.idempotency_key.clone(), Utc::now());
 
-        // Publish to execution channel based on transport mode
-        if self.transport_mode.use_redis() {
-            self.redis
-                .publish(channels::EXECUTION_REQUESTS, &exec_request)
-                .await?;
-        }
+        // Capture values for logging before potential move
+        let request_id = exec_request.request_id.clone();
+        let limit_price = exec_request.limit_price;
 
-        if self.transport_mode.use_zmq() {
+        if self.execution_inline {
+            if let Some(engine) = &self.execution_engine {
+                let result = self.execute_inline_request(engine, exec_request).await;
+                self.publish_execution_result(&result).await;
+            } else {
+                error!("Execution inline enabled but engine not initialized");
+            }
+        } else {
+            // Publish to execution channel via ZMQ (ZMQ-only transport)
             self.publish_zmq(&exec_request).await;
         }
 
         self.approved_count += 1;
 
         info!(
-            "Emitted ExecutionRequest: {} ({:?} {} @ {:.3}) via {:?}",
-            exec_request.request_id,
+            "Emitted ExecutionRequest: {} ({:?} {} @ {:.3}) via ZMQ",
+            request_id,
             signal.direction,
             signal.team,
-            exec_request.limit_price,
-            self.transport_mode
+            limit_price
         );
 
         Ok(())
+    }
+
+    async fn execute_inline_request(
+        &self,
+        engine: &ExecutionEngine,
+        request: ExecutionRequest,
+    ) -> ExecutionResult {
+        inline_execute_request(engine, request).await
+    }
+
+    async fn publish_execution_result(&self, result: &ExecutionResult) {
+        if let Some(pnl_tracker) = &self.pnl_tracker {
+            if result.status == ExecutionStatus::Filled {
+                pnl_tracker.record_pnl(-result.fees).await;
+            }
+        }
+
+        if result.status == ExecutionStatus::Failed {
+            let event = NotificationEvent {
+                event_type: NotificationType::Error,
+                priority: NotificationPriority::Error,
+                data: serde_json::json!({
+                    "service": "signal_processor_rust",
+                    "request_id": result.request_id,
+                    "message": result.rejection_reason.clone().unwrap_or_else(|| "execution_failed".to_string()),
+                }),
+                ts: Some(Utc::now()),
+            };
+            if let Err(e) = self.redis.publish(channels::NOTIFICATION_EVENTS, &event).await {
+                warn!("Failed to publish notification event: {}", e);
+            }
+        }
+
+        if let Err(e) = self.redis.publish(channels::EXECUTION_RESULTS, result).await {
+            error!("Failed to publish execution result: {}", e);
+        }
     }
 
     async fn cleanup_stale_inflight(&mut self) {
@@ -1239,6 +1369,78 @@ impl SignalProcessorState {
                 warn!("Failed to publish execution request via ZMQ: {}", e);
             }
         }
+    }
+}
+
+async fn inline_execute_request(
+    engine: &ExecutionEngine,
+    request: ExecutionRequest,
+) -> ExecutionResult {
+    match engine.execute(request.clone()).await {
+        Ok(res) => res,
+        Err(e) => {
+            error!("Inline execution failed for {}: {}", request.request_id, e);
+            let executed_at = Utc::now();
+            let latency_ms = (executed_at - request.created_at).num_milliseconds() as f64;
+            ExecutionResult {
+                request_id: request.request_id,
+                idempotency_key: request.idempotency_key,
+                rejection_reason: Some(e.to_string()),
+                status: ExecutionStatus::Failed,
+                order_id: None,
+                filled_qty: 0.0,
+                avg_price: 0.0,
+                fees: 0.0,
+                platform: request.platform,
+                market_id: request.market_id,
+                contract_team: request.contract_team,
+                game_id: request.game_id,
+                sport: request.sport,
+                signal_id: request.signal_id,
+                signal_type: request.signal_type,
+                edge_pct: request.edge_pct,
+                side: request.side,
+                requested_at: request.created_at,
+                executed_at,
+                latency_ms,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn test_inline_execute_request_paper() {
+        let engine = ExecutionEngine::with_safeguards(true, None, None, None).await;
+        let request = ExecutionRequest {
+            request_id: Uuid::new_v4().to_string(),
+            idempotency_key: "test_game_team_buy".to_string(),
+            game_id: "test_game".to_string(),
+            sport: Sport::NBA,
+            platform: Platform::Paper,
+            market_id: "test_market".to_string(),
+            contract_team: Some("HOME".to_string()),
+            token_id: None,
+            side: ExecutionSide::Yes,
+            limit_price: 0.55,
+            size: 10.0,
+            signal_id: Uuid::new_v4().to_string(),
+            signal_type: "test".to_string(),
+            edge_pct: 2.0,
+            model_prob: 0.60,
+            market_prob: Some(0.55),
+            reason: "test".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+        };
+
+        let result = inline_execute_request(&engine, request).await;
+        assert_eq!(result.status, ExecutionStatus::Filled);
+        assert_eq!(result.platform, Platform::Paper);
     }
 }
 
@@ -1301,6 +1503,11 @@ async fn heartbeat_loop(
         let mut metrics = HashMap::new();
         metrics.insert("signals_received".to_string(), state.signal_count as f64);
         metrics.insert("signals_approved".to_string(), state.approved_count as f64);
+        let rejected_total: u64 = state.rejected_counts.values().sum();
+        metrics.insert("signals_rejected".to_string(), rejected_total as f64);
+        if let Some(count) = state.rejected_counts.get("insufficient_liquidity") {
+            metrics.insert("signals_rejected_insufficient_liquidity".to_string(), *count as f64);
+        }
 
         // Connection pool metrics for monitoring
         let pool_size = state.pool.size() as f64;
@@ -1450,29 +1657,20 @@ async fn main() -> Result<()> {
     let redis = RedisBus::new().await?;
     info!("Connected to Redis");
 
-    // Transport mode configuration
-    let transport_mode = TransportMode::from_env();
-    info!("Transport mode: {:?}", transport_mode);
+    // ZMQ-only transport mode - always initialize ZMQ publisher
+    let zmq_port = env::var("ZMQ_PUB_PORT").unwrap_or_else(|_| "5559".to_string());
+    let zmq_addr = format!("tcp://0.0.0.0:{}", zmq_port);
 
-    // Setup ZMQ publisher if needed
-    let zmq_pub = if transport_mode.use_zmq() {
-        let zmq_port = env::var("ZMQ_PUB_PORT").unwrap_or_else(|_| "5559".to_string());
-        let zmq_addr = format!("tcp://0.0.0.0:{}", zmq_port);
-
-        let mut socket = PubSocket::new();
-        match socket.bind(&zmq_addr).await {
-            Ok(_) => {
-                info!("ZMQ publisher bound to {}", zmq_addr);
-                Some(Arc::new(Mutex::new(socket)))
-            }
-            Err(e) => {
-                error!("Failed to bind ZMQ publisher to {}: {}", zmq_addr, e);
-                None
-            }
+    let mut socket = PubSocket::new();
+    let zmq_pub = match socket.bind(&zmq_addr).await {
+        Ok(_) => {
+            info!("ZMQ publisher bound to {}", zmq_addr);
+            Some(Arc::new(Mutex::new(socket)))
         }
-    } else {
-        info!("ZMQ publishing disabled (transport_mode={:?})", transport_mode);
-        None
+        Err(e) => {
+            error!("Failed to bind ZMQ publisher to {}: {}", zmq_addr, e);
+            None
+        }
     };
 
     // Configuration
@@ -1482,9 +1680,47 @@ async fn main() -> Result<()> {
         config.min_edge_pct, config.max_buy_prob, config.min_sell_prob
     );
 
+    // Inline execution (consolidated path)
+    let execution_inline = env::var("EXECUTION_INLINE")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let paper_trading = env::var("PAPER_TRADING")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true);
+
+    let (execution_engine, pnl_tracker) = if execution_inline {
+        info!("Execution inline enabled - creating execution engine");
+        let engine = ExecutionEngine::with_safeguards(paper_trading, Some(Arc::new(redis.clone())), None, None).await;
+        let idempotency = engine.idempotency_tracker();
+        let _cleanup_task = execution_service_rust::idempotency::start_cleanup_task(idempotency);
+
+        if !paper_trading {
+            let _balance_refresh_task = start_balance_refresh_loop(
+                engine.balance_cache(),
+                engine.kalshi_client(),
+                engine.config().balance_refresh_secs,
+            );
+        }
+
+        (Some(Arc::new(engine)), Some(Arc::new(DailyPnlTracker::new())))
+    } else {
+        (None, None)
+    };
+
     // Initialize state
     let state = Arc::new(RwLock::new(
-        SignalProcessorState::new(config, pool, redis.clone(), transport_mode, zmq_pub).await,
+        SignalProcessorState::new(
+            config,
+            pool,
+            redis.clone(),
+            zmq_pub,
+            execution_inline,
+            execution_engine,
+            pnl_tracker,
+        )
+        .await,
     ));
 
     // Load rules from DB
@@ -1495,33 +1731,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Spawn ZMQ listener if enabled
-    if transport_mode.use_zmq() {
-        let zmq_endpoint = env::var("ZMQ_SUB_ENDPOINT")
-            .unwrap_or_else(|_| "tcp://game_shard:5558".to_string());
-        let state_zmq = state.clone();
+    // Spawn ZMQ listener (ZMQ-only transport - always enabled)
+    let zmq_endpoint = env::var("ZMQ_SUB_ENDPOINT")
+        .unwrap_or_else(|_| "tcp://game_shard:5558".to_string());
+    let state_zmq = state.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = zmq_listener_loop(state_zmq, zmq_endpoint).await {
-                error!("ZMQ listener error: {}", e);
-            }
-        });
-        info!("ZMQ signal listener started");
-    }
-
-    // Subscribe to Redis signals if enabled
-    if !transport_mode.use_redis() {
-        info!("Redis signal subscription disabled (transport_mode={:?})", transport_mode);
-        // Keep service running with ZMQ only
-        tokio::signal::ctrl_c().await?;
-        return Ok(());
-    }
-
-    // Subscribe with auto-reconnect to main signal channel
-    let mut stream = redis
-        .subscribe_with_reconnect(vec![channels::SIGNALS_NEW.to_string()])
-        .into_message_stream();
-    info!("Subscribed to {} (auto-reconnect enabled)", channels::SIGNALS_NEW);
+    tokio::spawn(async move {
+        if let Err(e) = zmq_listener_loop(state_zmq, zmq_endpoint).await {
+            error!("ZMQ listener error: {}", e);
+        }
+    });
+    info!("ZMQ signal listener started (ZMQ-only transport)");
 
     // Subscribe to rule updates with auto-reconnect
     let redis_rules = redis.clone();
@@ -1568,31 +1788,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("Signal Processor started");
+    info!("Signal Processor started (ZMQ-only transport)");
 
-    // Main message loop (stream already created above with auto-reconnect)
-    while let Some(msg) = stream.next().await {
-        let payload: String = match msg.get_payload() {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Failed to get payload: {}", e);
-                continue;
-            }
-        };
-
-        let signal: TradingSignal = match serde_json::from_str(&payload) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to parse signal: {}", e);
-                continue;
-            }
-        };
-
-        let mut s = state.write().await;
-        if let Err(e) = s.handle_signal(signal).await {
-            error!("Error handling signal: {}", e);
-        }
-    }
+    // Wait for shutdown signal (ZMQ signals handled in spawned listener task)
+    tokio::signal::ctrl_c().await?;
+    info!("Signal Processor shutting down...");
 
     Ok(())
 }

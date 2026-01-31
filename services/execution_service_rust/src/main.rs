@@ -9,8 +9,8 @@ mod rate_limiter;
 
 use anyhow::Result;
 use arbees_rust_core::models::{
-    channels, ExecutionRequest, ExecutionResult, ExecutionStatus, NotificationEvent,
-    NotificationPriority, NotificationType, TransportMode,
+    channels, CryptoDirection, CryptoExecutionRequest, ExecutionRequest, ExecutionResult,
+    ExecutionStatus, NotificationEvent, NotificationPriority, NotificationType, Sport,
 };
 use arbees_rust_core::redis::bus::RedisBus;
 use balance::{start_balance_refresh_loop, DailyPnlTracker};
@@ -18,7 +18,6 @@ use chrono::Utc;
 use config::SafeguardConfig;
 use dotenv::dotenv;
 use engine::ExecutionEngine;
-use futures_util::StreamExt;
 use idempotency::start_cleanup_task;
 use kill_switch::{KillSwitch, KillSwitchReason};
 use log::{debug, error, info, warn};
@@ -27,7 +26,8 @@ use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use zeromq::{Socket, SocketRecv, SubSocket};
+use tokio::sync::RwLock;
+use zeromq::{PubSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 /// ZMQ message envelope format (matches game_shard)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,11 +38,72 @@ struct ZmqEnvelope {
     payload: serde_json::Value,
 }
 
+/// Unified execution request type that accepts both sports and crypto requests
+#[derive(Debug, Clone)]
+enum UnifiedExecutionRequest {
+    Sports(ExecutionRequest),
+    Crypto(CryptoExecutionRequest),
+}
+
+impl UnifiedExecutionRequest {
+    /// Try to deserialize from a JSON value, attempting both formats
+    fn from_json(value: serde_json::Value) -> anyhow::Result<Self> {
+        // Try to deserialize as CryptoExecutionRequest first (has unique fields like "asset")
+        if let Ok(crypto_req) = serde_json::from_value::<CryptoExecutionRequest>(value.clone()) {
+            return Ok(UnifiedExecutionRequest::Crypto(crypto_req));
+        }
+
+        // Fall back to ExecutionRequest (has unique fields like "game_id", "sport")
+        match serde_json::from_value::<ExecutionRequest>(value) {
+            Ok(sports_req) => Ok(UnifiedExecutionRequest::Sports(sports_req)),
+            Err(_) => Err(anyhow::anyhow!(
+                "Request did not match ExecutionRequest or CryptoExecutionRequest format"
+            )),
+        }
+    }
+
+    /// Convert to ExecutionRequest for unified processing
+    /// Crypto requests get placeholder values for sports-specific fields
+    fn to_execution_request(&self) -> ExecutionRequest {
+        match self {
+            UnifiedExecutionRequest::Sports(req) => req.clone(),
+            UnifiedExecutionRequest::Crypto(crypto_req) => {
+                // Convert crypto request to sports request with crypto placeholders
+                ExecutionRequest {
+                    request_id: crypto_req.request_id.clone(),
+                    idempotency_key: format!("crypto_{}", crypto_req.request_id),
+                    game_id: format!("crypto_{}_{}", crypto_req.asset, crypto_req.event_id),
+                    sport: Sport::NBA, // Placeholder - crypto requests don't use sport field
+                    platform: crypto_req.platform,
+                    market_id: crypto_req.market_id.clone(),
+                    contract_team: Some(crypto_req.asset.clone()), // Asset name in contract_team
+                    token_id: None,
+                    side: match crypto_req.direction {
+                        CryptoDirection::Long => arbees_rust_core::models::ExecutionSide::Yes,
+                        CryptoDirection::Short => arbees_rust_core::models::ExecutionSide::No,
+                    },
+                    limit_price: crypto_req.max_price,
+                    size: crypto_req.suggested_size,
+                    signal_id: format!("crypto_{}", crypto_req.request_id),
+                    signal_type: format!("{:?}", crypto_req.signal_type),
+                    edge_pct: crypto_req.edge_pct,
+                    model_prob: crypto_req.probability,
+                    market_prob: Some(1.0 - crypto_req.current_price), // Estimate from current price
+                    reason: format!("Crypto {} arbitrage", crypto_req.asset),
+                    created_at: crypto_req.timestamp,
+                    expires_at: None,
+                }
+            }
+        }
+    }
+}
+
 /// Statistics for monitoring ZMQ message processing
 struct ZmqStats {
     messages_received: AtomicU64,
     messages_processed: AtomicU64,
     parse_errors: AtomicU64,
+    trades_published: AtomicU64,
 }
 
 impl ZmqStats {
@@ -51,7 +112,87 @@ impl ZmqStats {
             messages_received: AtomicU64::new(0),
             messages_processed: AtomicU64::new(0),
             parse_errors: AtomicU64::new(0),
+            trades_published: AtomicU64::new(0),
         }
+    }
+}
+
+/// ZMQ Publisher for trade results (port 5560)
+/// Enables zmq_listener to observe complete pipeline
+struct TradePublisher {
+    socket: RwLock<Option<PubSocket>>,
+    seq: AtomicU64,
+    enabled: bool,
+}
+
+impl TradePublisher {
+    async fn new(port: u16, enabled: bool) -> Result<Self> {
+        let socket = if enabled {
+            let mut pub_socket = PubSocket::new();
+            let addr = format!("tcp://0.0.0.0:{}", port);
+            pub_socket.bind(&addr).await?;
+            info!("ZMQ PUB socket bound to {} for trade results", addr);
+            Some(pub_socket)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            socket: RwLock::new(socket),
+            seq: AtomicU64::new(0),
+            enabled,
+        })
+    }
+
+    async fn publish_trade(&self, result: &ExecutionResult, stats: &ZmqStats) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let socket_guard = self.socket.read().await;
+        let socket = match socket_guard.as_ref() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Determine topic based on status
+        let status_str = match result.status {
+            ExecutionStatus::Filled => "executed",
+            ExecutionStatus::Partial => "partial",
+            ExecutionStatus::Failed => "failed",
+            ExecutionStatus::Rejected => "rejected",
+            ExecutionStatus::Pending => "pending",
+            ExecutionStatus::Accepted => "accepted",
+            ExecutionStatus::Cancelled => "cancelled",
+        };
+        let topic = format!("trades.{}.{}", status_str, result.request_id);
+
+        // Build envelope
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let envelope = ZmqEnvelope {
+            seq,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            source: Some("execution_service".to_string()),
+            payload: serde_json::to_value(result)?,
+        };
+
+        // Send multipart message
+        let topic_bytes = topic.as_bytes().to_vec();
+        let payload_bytes = serde_json::to_vec(&envelope)?;
+
+        let mut msg = ZmqMessage::from(topic_bytes);
+        msg.push_back(payload_bytes.into());
+
+        // Clone the socket for sending (workaround for immutable borrow)
+        drop(socket_guard);
+        let mut socket_guard = self.socket.write().await;
+        if let Some(ref mut socket) = *socket_guard {
+            socket.send(msg).await?;
+            stats.trades_published.fetch_add(1, Ordering::Relaxed);
+            debug!("Published trade result: {} status={}", result.request_id, status_str);
+        }
+
+        Ok(())
     }
 }
 
@@ -107,18 +248,28 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    // Transport mode configuration
-    let transport_mode = TransportMode::from_env();
-
+    // ZMQ configuration (ZMQ-only transport)
     let zmq_endpoint = env::var("ZMQ_SUB_ENDPOINT")
         .unwrap_or_else(|_| "tcp://signal_processor:5559".to_string());
 
+    let zmq_pub_port: u16 = env::var("ZMQ_PUB_PORT")
+        .unwrap_or_else(|_| "5560".to_string())
+        .parse()
+        .unwrap_or(5560);
+
+    // Initialize ZMQ trade publisher (for zmq_listener to observe)
+    let trade_publisher = Arc::new(
+        TradePublisher::new(zmq_pub_port, true)  // Always enabled in ZMQ-only mode
+            .await
+            .expect("Failed to initialize trade publisher"),
+    );
+
     info!(
-        "Execution Service ready (Paper Trading: {}, Kalshi Live: {}, Polymarket Live: {}, Transport: {:?})",
+        "Execution Service ready (Paper Trading: {}, Kalshi Live: {}, Polymarket Live: {}, ZMQ PUB: :{})",
         paper_trading,
         engine.kalshi_live_enabled(),
         engine.polymarket_live_enabled(),
-        transport_mode
+        zmq_pub_port
     );
 
     // Start background tasks
@@ -152,20 +303,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    match transport_mode {
-        TransportMode::ZmqOnly => {
-            // ZMQ only mode
-            run_zmq_only(engine, redis, zmq_endpoint, pnl_tracker).await
-        }
-        TransportMode::Both => {
-            // Run with both ZMQ and Redis listeners
-            run_with_zmq(engine, redis, zmq_endpoint, pnl_tracker).await
-        }
-        TransportMode::RedisOnly => {
-            // Run with Redis only (backward compatible)
-            run_redis_only(engine, redis, pnl_tracker).await
-        }
-    }
+    // Run with ZMQ-only transport (lowest latency)
+    run_zmq_only(engine, redis, zmq_endpoint, pnl_tracker, trade_publisher).await
 }
 
 /// Start P&L monitoring task
@@ -237,47 +376,13 @@ fn start_pnl_monitor(
     })
 }
 
-/// Run with Redis pub/sub only (backward compatible mode)
-async fn run_redis_only(
-    engine: ExecutionEngine,
-    redis: Arc<RedisBus>,
-    pnl_tracker: Arc<DailyPnlTracker>,
-) -> Result<()> {
-    info!("Running in Redis-only mode");
-
-    let mut pubsub = redis.subscribe("execution:requests").await?;
-    info!("Subscribed to execution:requests");
-
-    let mut stream = pubsub.on_message();
-    while let Some(msg) = stream.next().await {
-        let payload: Vec<u8> = match msg.get_payload::<Vec<u8>>() {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Execution request: failed to read payload: {}", e);
-                continue;
-            }
-        };
-
-        let request: ExecutionRequest = match serde_json::from_slice(&payload) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Execution request: invalid JSON: {}", e);
-                continue;
-            }
-        };
-
-        process_request(&engine, &redis, &pnl_tracker, request).await;
-    }
-
-    Ok(())
-}
-
 /// Run with ZMQ only (lowest latency mode)
 async fn run_zmq_only(
     engine: ExecutionEngine,
     redis: Arc<RedisBus>,
     zmq_endpoint: String,
     pnl_tracker: Arc<DailyPnlTracker>,
+    trade_publisher: Arc<TradePublisher>,
 ) -> Result<()> {
     info!("Running in ZMQ-only mode");
 
@@ -285,58 +390,7 @@ async fn run_zmq_only(
     let zmq_stats = Arc::new(ZmqStats::new());
 
     // Run ZMQ listener
-    zmq_listener_loop(engine, redis, zmq_endpoint, zmq_stats, pnl_tracker).await
-}
-
-/// Run with both ZMQ (primary, low-latency) and Redis (fallback) listeners
-async fn run_with_zmq(
-    engine: ExecutionEngine,
-    redis: Arc<RedisBus>,
-    zmq_endpoint: String,
-    pnl_tracker: Arc<DailyPnlTracker>,
-) -> Result<()> {
-    info!("Running in ZMQ + Redis hybrid mode");
-
-    let engine = Arc::new(engine);
-    let zmq_stats = Arc::new(ZmqStats::new());
-
-    // Spawn ZMQ listener task
-    let zmq_engine = engine.clone();
-    let zmq_redis = redis.clone();
-    let zmq_stats_clone = zmq_stats.clone();
-    let zmq_pnl = pnl_tracker.clone();
-    let zmq_handle = tokio::spawn(async move {
-        zmq_listener_loop(zmq_engine, zmq_redis, zmq_endpoint, zmq_stats_clone, zmq_pnl).await
-    });
-
-    // Spawn Redis listener task (fallback)
-    let redis_engine = engine.clone();
-    let redis_bus = redis.clone();
-    let redis_pnl = pnl_tracker.clone();
-    let redis_handle = tokio::spawn(async move {
-        redis_listener_loop(redis_engine, redis_bus, redis_pnl).await
-    });
-
-    // Spawn stats logging task
-    let stats_clone = zmq_stats.clone();
-    let stats_handle = tokio::spawn(async move { stats_logging_loop(stats_clone).await });
-
-    // Wait for any task to complete (they shouldn't under normal operation)
-    tokio::select! {
-        result = zmq_handle => {
-            if let Err(e) = result {
-                error!("ZMQ listener task failed: {}", e);
-            }
-        }
-        result = redis_handle => {
-            if let Err(e) = result {
-                error!("Redis listener task failed: {}", e);
-            }
-        }
-        _ = stats_handle => {}
-    }
-
-    Ok(())
+    zmq_listener_loop(engine, redis, zmq_endpoint, zmq_stats, pnl_tracker, trade_publisher).await
 }
 
 /// ZMQ listener for low-latency signal reception
@@ -346,6 +400,7 @@ async fn zmq_listener_loop(
     endpoint: String,
     stats: Arc<ZmqStats>,
     pnl_tracker: Arc<DailyPnlTracker>,
+    trade_publisher: Arc<TradePublisher>,
 ) -> Result<()> {
     info!("Starting ZMQ listener for signals from {}", endpoint);
 
@@ -409,16 +464,18 @@ async fn zmq_listener_loop(
                         topic, latency_ms
                     );
 
-                    // Parse execution request from signal payload
-                    let request: ExecutionRequest =
-                        match serde_json::from_value(envelope.payload) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                                debug!("Failed to parse execution request from ZMQ: {}", e);
-                                continue;
-                            }
-                        };
+                    // Parse execution request from signal payload (handles both sports and crypto)
+                    let unified_request = match UnifiedExecutionRequest::from_json(envelope.payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                            debug!("Failed to parse execution request from ZMQ: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Convert to standard ExecutionRequest for processing
+                    let request = unified_request.to_execution_request();
 
                     // Log ZMQ-specific latency info
                     let signal_age_ms = (Utc::now() - request.created_at).num_milliseconds();
@@ -427,7 +484,7 @@ async fn zmq_listener_loop(
                         request.request_id, signal_age_ms, latency_ms
                     );
 
-                    process_request(&engine, &redis, &pnl_tracker, request).await;
+                    process_request(&engine, &redis, &pnl_tracker, &trade_publisher, &stats, request).await;
                     stats.messages_processed.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => {
@@ -446,50 +503,13 @@ async fn zmq_listener_loop(
     }
 }
 
-/// Redis listener for backward compatibility
-async fn redis_listener_loop(
-    engine: Arc<ExecutionEngine>,
-    redis: Arc<RedisBus>,
-    pnl_tracker: Arc<DailyPnlTracker>,
-) -> Result<()> {
-    info!("Starting Redis listener for execution:requests");
-
-    let mut pubsub = redis.subscribe("execution:requests").await?;
-    info!("Redis subscribed to execution:requests");
-
-    let mut stream = pubsub.on_message();
-    while let Some(msg) = stream.next().await {
-        let payload: Vec<u8> = match msg.get_payload::<Vec<u8>>() {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Redis execution request: failed to read payload: {}", e);
-                continue;
-            }
-        };
-
-        let request: ExecutionRequest = match serde_json::from_slice(&payload) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Redis execution request: invalid JSON: {}", e);
-                continue;
-            }
-        };
-
-        // Log that this came via Redis path
-        let signal_age_ms = (Utc::now() - request.created_at).num_milliseconds();
-        debug!("Redis signal: {} age={}ms", request.request_id, signal_age_ms);
-
-        process_request(&engine, &redis, &pnl_tracker, request).await;
-    }
-
-    Ok(())
-}
-
 /// Process an execution request
 async fn process_request(
     engine: &ExecutionEngine,
     redis: &RedisBus,
     pnl_tracker: &DailyPnlTracker,
+    trade_publisher: &TradePublisher,
+    stats: &ZmqStats,
     request: ExecutionRequest,
 ) {
     let result = match engine.execute(request.clone()).await {
@@ -530,6 +550,11 @@ async fn process_request(
         pnl_tracker.record_pnl(-result.fees).await;
     }
 
+    // Publish trade result to ZMQ (for zmq_listener to observe)
+    if let Err(e) = trade_publisher.publish_trade(&result, stats).await {
+        warn!("Failed to publish trade to ZMQ: {}", e);
+    }
+
     // Publish notification on execution failure
     if result.status == ExecutionStatus::Failed {
         let event = NotificationEvent {
@@ -547,6 +572,7 @@ async fn process_request(
         }
     }
 
+    // Publish execution result to Redis (for backward compatibility)
     if let Err(e) = redis.publish(channels::EXECUTION_RESULTS, &result).await {
         error!("Failed to publish execution result: {}", e);
     }
@@ -562,10 +588,11 @@ async fn stats_logging_loop(stats: Arc<ZmqStats>) -> Result<()> {
         let received = stats.messages_received.load(Ordering::Relaxed);
         let processed = stats.messages_processed.load(Ordering::Relaxed);
         let parse_errors = stats.parse_errors.load(Ordering::Relaxed);
+        let trades_published = stats.trades_published.load(Ordering::Relaxed);
 
         info!(
-            "Execution Service ZMQ stats: received={}, processed={}, parse_errors={}",
-            received, processed, parse_errors
+            "Execution Service ZMQ stats: received={}, processed={}, trades_published={}, parse_errors={}",
+            received, processed, trades_published, parse_errors
         );
     }
 }

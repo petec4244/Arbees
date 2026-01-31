@@ -116,36 +116,6 @@ impl Sport {
 }
 
 // ============================================================================
-// Transport Mode Configuration
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransportMode {
-    ZmqOnly,
-    RedisOnly,
-    Both,
-}
-
-impl TransportMode {
-    pub fn from_env() -> Self {
-        match std::env::var("ZMQ_TRANSPORT_MODE").ok().as_deref() {
-            Some("zmq_only") => TransportMode::ZmqOnly,
-            Some("both") => TransportMode::Both,
-            _ => TransportMode::RedisOnly, // default
-        }
-    }
-
-    pub fn use_zmq(&self) -> bool {
-        matches!(self, TransportMode::ZmqOnly | TransportMode::Both)
-    }
-
-    pub fn use_redis(&self) -> bool {
-        matches!(self, TransportMode::RedisOnly | TransportMode::Both)
-    }
-}
-
-// ============================================================================
 // Game State (for win probability calculation)
 // ============================================================================
 
@@ -846,6 +816,50 @@ pub struct ExecutionResult {
     pub requested_at: DateTime<Utc>,
     pub executed_at: DateTime<Utc>,
     pub latency_ms: f64,
+}
+
+// ============================================================================
+// Crypto Execution Types
+// ============================================================================
+
+/// Crypto-native execution request (from crypto_shard_rust)
+/// Bypasses signal_processor for low-latency crypto arbitrage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoExecutionRequest {
+    pub request_id: String,
+    pub event_id: String,
+    pub asset: String,                    // "BTC", "ETH", "SOL"
+    pub signal_type: CryptoSignalType,
+    pub platform: Platform,               // Kalshi or Polymarket
+    pub market_id: String,
+    pub direction: CryptoDirection,       // Long (buy YES) or Short (buy NO)
+    pub edge_pct: f64,
+    pub probability: f64,
+    pub suggested_size: f64,
+    pub max_price: f64,
+    pub current_price: f64,
+    pub timestamp: DateTime<Utc>,
+    pub volatility_factor: f64,
+    pub exposure_check: bool,
+    pub balance_check: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CryptoSignalType {
+    #[serde(rename = "Arbitrage")]
+    Arbitrage,
+    #[serde(rename = "ModelEdge")]
+    ModelEdge,
+    #[serde(rename = "VolatilityMispricing")]
+    VolatilityMispricing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CryptoDirection {
+    #[serde(rename = "Long")]
+    Long,
+    #[serde(rename = "Short")]
+    Short,
 }
 
 // ============================================================================

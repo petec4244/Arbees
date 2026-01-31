@@ -5,6 +5,7 @@
 //! (Coinbase → Binance → CoinGecko fallback chain).
 
 use super::{CryptoStateData, EventInfo, EventProvider, EventState, EventStatus, StateData};
+use crate::clients::chainlink::ChainlinkClient;
 use crate::clients::chained_price::ChainedPriceProvider;
 use crate::clients::crypto_price::CryptoPriceProvider;
 use crate::models::{CryptoPredictionType, MarketType};
@@ -14,10 +15,12 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tracing::{debug, info, warn};
 
 /// Crypto event provider
 ///
@@ -28,15 +31,26 @@ pub struct CryptoEventProvider {
     client: Client,
     /// Price provider with fallback chain
     price_provider: Arc<dyn CryptoPriceProvider>,
+    /// Chainlink oracle client for directional market prices
+    chainlink_client: ChainlinkClient,
     /// Cache for discovered markets
     market_cache: Arc<RwLock<HashMap<String, CryptoMarket>>>,
     /// Last cache update time
     last_update: Arc<RwLock<Option<DateTime<Utc>>>>,
     /// Cache TTL in seconds
     cache_ttl_secs: i64,
+    /// Mutex to prevent concurrent cache refreshes (prevents stack overflow)
+    refresh_lock: Arc<Mutex<()>>,
+    /// Semaphore to limit concurrent get_event_state calls (prevents stack overflow)
+    state_semaphore: Arc<Semaphore>,
 }
 
 /// Represents a crypto prediction market
+///
+/// Optimized for arbitrage detection with focus on fields needed for:
+/// - Price mismatch detection across platforms
+/// - Liquidity/slippage assessment
+/// - Profitability calculations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CryptoMarket {
     pub market_id: String,
@@ -44,13 +58,49 @@ pub struct CryptoMarket {
     pub asset: String,    // "BTC", "ETH", etc.
     pub target_price: f64,
     pub target_date: DateTime<Utc>,
+    pub start_date: Option<DateTime<Utc>>, // When the market opened
     pub prediction_type: CryptoPredictionType,
     pub title: String,
     pub description: Option<String>,
+
+    // === PRICE DATA (for arbitrage detection) ===
+    /// Current Up/Yes market price (what you'd pay to buy UP)
     pub yes_price: Option<f64>,
+    /// Current Down/No market price (what you'd pay to buy DOWN)
     pub no_price: Option<f64>,
+    /// Opening Up/Yes market price
+    pub yes_start_price: Option<f64>,
+    /// Opening Down/No market price
+    pub no_start_price: Option<f64>,
+    /// Current crypto asset price from spot market or oracle (e.g., SOL at $117.44)
+    pub current_crypto_price: Option<f64>,
+    /// Reference price to beat (starting price when market opened, e.g., SOL at $117.77)
+    pub reference_price: Option<f64>,
+
+    // === LIQUIDITY & EXECUTION (for slippage calculation) ===
+    /// Best bid price (highest price someone will pay to sell UP)
+    pub best_bid_yes: Option<f64>,
+    /// Best ask price (lowest price someone will take to buy UP)
+    pub best_ask_yes: Option<f64>,
+    /// Best bid price for DOWN
+    pub best_bid_no: Option<f64>,
+    /// Best ask price for DOWN
+    pub best_ask_no: Option<f64>,
+    /// Total volume traded
     pub volume: Option<f64>,
+    /// Total liquidity in market (AMM or order book)
     pub liquidity: Option<f64>,
+    /// Bid-ask spread percentage (for execution cost estimation)
+    pub spread_bps: Option<f64>,
+    /// Whether market is accepting new orders
+    pub accepting_orders: Option<bool>,
+
+    // === FEES (for profitability calculation) ===
+    /// Maker fee in basis points (Polymarket)
+    pub maker_fee_bps: Option<u32>,
+    /// Taker fee in basis points (Polymarket)
+    pub taker_fee_bps: Option<u32>,
+
     pub status: EventStatus,
     pub discovered_at: DateTime<Utc>,
 }
@@ -78,9 +128,14 @@ impl CryptoEventProvider {
         Self {
             client,
             price_provider,
+            chainlink_client: ChainlinkClient::new(),
             market_cache: Arc::new(RwLock::new(HashMap::new())),
             last_update: Arc::new(RwLock::new(None)),
             cache_ttl_secs: 300, // 5 minute cache
+            refresh_lock: Arc::new(Mutex::new(())),
+            // Limit concurrent get_event_state calls to prevent stack overflow
+            // when many events are monitored simultaneously
+            state_semaphore: Arc::new(Semaphore::new(3)),
         }
     }
 
@@ -90,6 +145,41 @@ impl CryptoEventProvider {
         match *last {
             None => true,
             Some(t) => Utc::now().signed_duration_since(t).num_seconds() > self.cache_ttl_secs,
+        }
+    }
+
+    /// Enrich a market with current prices from Chainlink (for directional markets)
+    ///
+    /// For directional markets, tries to fetch current spot price from oracle.
+    /// If resolution_source contains a Chainlink stream URL, fetches the price.
+    async fn enrich_with_prices(&self, market: &mut CryptoMarket) {
+        // Only enrich directional markets (those are the ones with oracle sources)
+        // Price-target markets don't need current spot prices for resolution
+        if market.platform != "polymarket" {
+            return;
+        }
+
+        // For Polymarket directional markets, we would have resolution_source
+        // In the future, integrate with actual market data to get reference_price
+        // For now, we can only fetch current prices
+
+        // Map asset to Chainlink stream ID
+        // Example: "SOL" -> "sol-usd"
+        let stream_id = format!("{}-usd", market.asset.to_lowercase());
+
+        match self.chainlink_client.get_price(&stream_id).await {
+            Ok(price_data) => {
+                market.current_crypto_price = Some(price_data.price);
+                debug!(
+                    "Enriched market {} with current price: ${} ({})",
+                    market.market_id, price_data.price, price_data.symbol
+                );
+            }
+            Err(e) => {
+                debug!("Failed to fetch price for {}: {}", market.asset, e);
+                // Don't fail market discovery if price fetching fails
+                // Arbitrage detection will handle missing prices
+            }
         }
     }
 
@@ -121,6 +211,12 @@ impl CryptoEventProvider {
             }
         }
 
+        // Enrich markets with current prices from oracle feeds
+        // This is non-blocking - if price fetching fails, we continue with what we have
+        for market in &mut all_markets {
+            self.enrich_with_prices(market).await;
+        }
+
         // Update cache
         {
             let mut cache = self.market_cache.write().await;
@@ -140,40 +236,88 @@ impl CryptoEventProvider {
     }
 
     /// Fetch crypto markets from Polymarket Gamma API
+    ///
+    /// Uses two approaches:
+    /// 1. Text search for price-target markets (e.g., "will BTC reach $100k")
+    /// 2. Direct slug lookup for directional markets (e.g., "btc-updown-15m")
     async fn fetch_polymarket_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
-        let url = "https://gamma-api.polymarket.com/markets?closed=false&limit=100";
+        // Search terms for crypto markets - use full names for better API-side filtering
+        const CRYPTO_SEARCH_TERMS: &[&str] = &[
+            "bitcoin",
+            "ethereum",
+            "solana",
+            "dogecoin",
+            "cardano",
+            "ripple",
+            "XRP",
+            "crypto",
+        ];
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .context("Failed to fetch Polymarket markets")?;
+        // Known recurring directional market series (15-minute, hourly, 4-hour)
+        // These are high-velocity binary markets perfect for crypto arbitrage
+        // Discovered by examining: https://github.com/peterpeterparker/Polymarket-Kalshi-Arbitrage-bot
+        const DIRECTIONAL_SERIES: &[&str] = &[
+            // 15-minute markets (highest velocity)
+            "btc-updown-15m",
+            "eth-updown-15m",
+            "sol-updown-15m",
+            "xrp-updown-15m",
+            // Hourly markets
+            "btc-up-or-down-hourly",
+            "eth-up-or-down-hourly",
+            "solana-up-or-down-hourly",
+            "xrp-up-or-down-hourly",
+            // 4-hour markets (optional - slower)
+            "btc-updown-4h",
+            "eth-updown-4h",
+            "sol-updown-4h",
+            "xrp-updown-4h",
+        ];
 
-        if !response.status().is_success() {
-            return Err(anyhow!("Polymarket API error: {}", response.status()));
+        let mut all_markets: HashMap<String, CryptoMarket> = HashMap::new();
+
+        // First, search for price-target markets using text search
+        for search_term in CRYPTO_SEARCH_TERMS {
+            match self.fetch_polymarket_events_for_query(search_term).await {
+                Ok(markets) => {
+                    for market in markets {
+                        // Dedupe by market_id
+                        all_markets.entry(market.market_id.clone()).or_insert(market);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to search Polymarket for '{}': {}", search_term, e);
+                }
+            }
         }
 
-        // Get raw text first for debugging
-        let text = response.text().await?;
-
-        let markets: Vec<PolymarketMarket> = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                // Log a snippet of the response for debugging
-                let snippet: String = text.chars().take(500).collect();
-                warn!("Polymarket JSON parse error: {}. Response snippet: {}", e, snippet);
-                return Err(anyhow!("JSON parse error: {}", e));
+        // Then, fetch directional markets using slug-based lookup
+        // (these don't appear in text search results - must use /markets?slug= endpoint)
+        let mut directional_found = 0;
+        for series in DIRECTIONAL_SERIES {
+            match self.fetch_polymarket_directional_market(series).await {
+                Ok(market) => {
+                    directional_found += 1;
+                    // Dedupe by market_id
+                    all_markets.entry(market.market_id.clone()).or_insert(market);
+                }
+                Err(_e) => {
+                    // Directional markets not found - they may not exist on Polymarket
+                    // or may have different naming conventions
+                }
             }
-        };
+        }
 
-        info!("Polymarket returned {} total markets", markets.len());
+        if directional_found == 0 {
+            debug!(
+                "No Polymarket directional markets found via slug lookup (tried {} series)",
+                DIRECTIONAL_SERIES.len()
+            );
+        } else {
+            info!("Found {} directional (Up/Down) markets on Polymarket", directional_found);
+        }
 
-        // Filter for crypto markets
-        let crypto_markets: Vec<CryptoMarket> = markets
-            .into_iter()
-            .filter_map(|m| self.parse_polymarket_crypto(&m))
-            .collect();
+        let crypto_markets: Vec<CryptoMarket> = all_markets.into_values().collect();
 
         if !crypto_markets.is_empty() {
             info!(
@@ -186,15 +330,162 @@ impl CryptoEventProvider {
         Ok(crypto_markets)
     }
 
-    /// Parse a Polymarket market into a CryptoMarket if it's crypto-related
-    fn parse_polymarket_crypto(&self, market: &PolymarketMarket) -> Option<CryptoMarket> {
+    /// Fetch a specific directional market from Polymarket using slug-based lookup with timestamp
+    ///
+    /// Directional markets (e.g., "btc-updown-15m-1769805000") include a Unix timestamp
+    /// for the market's end date. We try multiple timestamp windows to find an active market.
+    ///
+    /// Returns the first matching active (non-closed) market.
+    async fn fetch_polymarket_directional_market(&self, series: &str) -> Result<CryptoMarket> {
+        const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
+
+        // Calculate timestamp windows to try
+        // 15-minute markets expire every 15 minutes (900 seconds)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Try current 15-min slot and next few slots
+        let current_slot = (now / 900) * 900;
+        let timestamps_to_try = vec![
+            current_slot,
+            current_slot + 900,  // Next 15-min slot
+            current_slot + 1800, // Slot after that
+        ];
+
+        // Try different timestamp windows
+        for timestamp in timestamps_to_try {
+            let slug = format!("{}-{}", series, timestamp);
+            let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
+
+            match self.client.get(&url).send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        continue;
+                    }
+
+                    if let Ok(text) = response.text().await {
+                        if let Ok(markets) = serde_json::from_str::<Vec<PolymarketMarketSimple>>(&text) {
+                            // Find the first active/non-closed market
+                            for market in markets {
+                                if market.closed.unwrap_or(false) {
+                                    continue;
+                                }
+
+                                // Parse as crypto market
+                                if let Some(crypto_market) = self.parse_polymarket_market_simple(&market) {
+                                    debug!("Found directional market for series '{}' ({}): {}",
+                                           series, timestamp, crypto_market.title);
+                                    return Ok(crypto_market);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Network error, try next timestamp
+                    continue;
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "No active directional markets found for series '{}' in recent timestamp windows",
+            series
+        ))
+    }
+
+    /// Fetch events from Polymarket using /events endpoint with text search and pagination
+    async fn fetch_polymarket_events_for_query(&self, query: &str) -> Result<Vec<CryptoMarket>> {
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 5; // Limit to 500 events per query
+
+        let mut all_markets = Vec::new();
+        let mut offset = 0u32;
+
+        for _page in 0..MAX_PAGES {
+            let url = format!(
+                "https://gamma-api.polymarket.com/events?active=true&closed=false&limit={}&offset={}&_q={}",
+                PAGE_SIZE, offset, query
+            );
+
+            let response = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .context("Failed to fetch Polymarket events")?;
+
+            if !response.status().is_success() {
+                return Err(anyhow!("Polymarket API error: {}", response.status()));
+            }
+
+            let text = response.text().await?;
+            let events: Vec<PolymarketEvent> = match serde_json::from_str(&text) {
+                Ok(e) => e,
+                Err(e) => {
+                    let snippet: String = text.chars().take(500).collect();
+                    warn!("Polymarket events JSON parse error: {}. Snippet: {}", e, snippet);
+                    return Err(anyhow!("JSON parse error: {}", e));
+                }
+            };
+
+            let event_count = events.len();
+            debug!("Polymarket query '{}' offset {} returned {} events", query, offset, event_count);
+
+            // Extract markets from events
+            for event in events {
+                for market in event.markets.into_iter().flatten() {
+                    // Skip closed markets
+                    if market.closed.unwrap_or(false) {
+                        continue;
+                    }
+
+                    // Try to parse as crypto market
+                    if let Some(crypto_market) = self.parse_polymarket_market(&market, &event.title) {
+                        all_markets.push(crypto_market);
+                    }
+                }
+            }
+
+            // Stop if we got fewer than a full page (no more results)
+            if event_count < PAGE_SIZE as usize {
+                break;
+            }
+
+            offset += PAGE_SIZE;
+        }
+
+        Ok(all_markets)
+    }
+
+    /// Parse a Polymarket market from the /events response into a CryptoMarket
+    fn parse_polymarket_market(&self, market: &PolymarketMarketNested, event_title: &str) -> Option<CryptoMarket> {
+        // Use the market question, falling back to event title
+        let question = if market.question.is_empty() {
+            event_title.to_string()
+        } else {
+            market.question.clone()
+        };
+
         // Check if it's a crypto market using word-boundary matching
         let asset = TRACKED_ASSETS
             .iter()
-            .find(|&asset| contains_crypto_asset(&market.question, asset))?;
+            .find(|&asset| contains_crypto_asset(&question, asset))?;
 
-        // Try to parse price target from question
-        let (target_price, prediction_type) = self.parse_price_target(&market.question)?;
+        // Check if this is a directional market (Up or Down) without explicit price target
+        let is_directional = is_polymarket_directional(&question);
+
+        // Try to parse price target from question (for price-target markets)
+        // For directional markets, use a default target price (50% midpoint)
+        let (target_price, prediction_type) = if is_directional {
+            // Directional markets don't have explicit price targets
+            // Use a placeholder (0.0) and mark as directional
+            (10000.0, CryptoPredictionType::PriceTarget) // Placeholder - actual comparison is binary Up/Down
+        } else {
+            self.parse_price_target(&question)?
+        };
 
         // Parse end date
         let target_date = market
@@ -210,13 +501,26 @@ impl CryptoEventProvider {
             asset: asset.to_string(),
             target_price,
             target_date,
+            start_date: None, // Price-target markets don't have a specific start time in /events response
             prediction_type,
-            title: market.question.clone(),
+            title: question,
             description: market.description.clone(),
-            yes_price: market.outcome_prices.as_ref().and_then(|p| p.get(0).copied()),
+            yes_price: market.outcome_prices.as_ref().and_then(|p| p.first().copied()),
             no_price: market.outcome_prices.as_ref().and_then(|p| p.get(1).copied()),
-            volume: market.volume.map(|v| v as f64),
-            liquidity: market.liquidity.map(|l| l as f64),
+            yes_start_price: None, // Don't have opening prices for price-target markets
+            no_start_price: None,
+            current_crypto_price: None, // Not available in price-target markets
+            reference_price: None,      // Not applicable for price-target markets
+            best_bid_yes: None,
+            best_ask_yes: None,
+            best_bid_no: None,
+            best_ask_no: None,
+            volume: market.volume,
+            liquidity: market.liquidity,
+            spread_bps: None,
+            accepting_orders: None,
+            maker_fee_bps: None,
+            taker_fee_bps: None,
             status: if market.closed.unwrap_or(false) {
                 EventStatus::Completed
             } else {
@@ -226,15 +530,222 @@ impl CryptoEventProvider {
         })
     }
 
-    /// Fetch crypto markets from Kalshi
+    /// Parse a Polymarket market from the /markets?slug= endpoint (directional markets)
+    ///
+    /// Similar to parse_polymarket_market() but uses PolymarketMarketSimple struct.
+    /// Used for directional markets (Up/Down binary markets).
+    ///
+    /// Extracts both current and opening prices for price movement analysis.
+    fn parse_polymarket_market_simple(&self, market: &PolymarketMarketSimple) -> Option<CryptoMarket> {
+        let question = market.question.clone();
+
+        // Check if it's a crypto market using word-boundary matching
+        let asset = TRACKED_ASSETS
+            .iter()
+            .find(|&asset| contains_crypto_asset(&question, asset))?;
+
+        // Check if this is a directional market (Up or Down) without explicit price target
+        let is_directional = is_polymarket_directional(&question);
+
+        // Try to parse price target from question (for price-target markets)
+        // For directional markets, use a default target price (50% midpoint)
+        let (target_price, prediction_type) = if is_directional {
+            // Directional markets don't have explicit price targets
+            // Use a placeholder (0.0) and mark as directional
+            (10000.0, CryptoPredictionType::PriceTarget) // Placeholder - actual comparison is binary Up/Down
+        } else {
+            self.parse_price_target(&question)?
+        };
+
+        // Parse end date
+        let target_date = market
+            .end_date
+            .as_ref()
+            .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::days(365));
+
+        // Parse start date (when market opened)
+        let start_date = market
+            .start_date
+            .as_ref()
+            .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.with_timezone(&Utc));
+
+        // For directional markets with outcome_prices, those are current market betting prices
+        // Opening prices would typically be 0.5 for a new market (50/50 split)
+        // We use 0.5 as the starting price unless we have historical data
+        let current_yes = market.outcome_prices.as_ref().and_then(|p| p.first().copied());
+        let current_no = market.outcome_prices.as_ref().and_then(|p| p.get(1).copied());
+
+        // Calculate bid-ask spread in basis points
+        let spread_bps = if let (Some(bid), Some(ask)) = (market.best_bid, market.best_ask) {
+            Some((((ask - bid) / bid) * 10000.0).round())
+        } else {
+            market.spread.map(|s| (s * 10000.0).round())
+        };
+
+        Some(CryptoMarket {
+            market_id: format!("polymarket:{}", market.condition_id),
+            platform: "polymarket".to_string(),
+            asset: asset.to_string(),
+            target_price,
+            target_date,
+            start_date,
+            prediction_type,
+            title: question,
+            description: market.description.clone(),
+
+            // Price data
+            yes_price: current_yes,
+            no_price: current_no,
+            yes_start_price: Some(0.5), // Default opening price for new market
+            no_start_price: Some(0.5),  // Markets typically start at 50/50
+            current_crypto_price: None, // TODO: Fetch from resolution_source (Chainlink API)
+            reference_price: None,      // TODO: Extract from market history or Oracle opening
+
+            // Liquidity & execution data
+            best_bid_yes: market.best_bid,
+            best_ask_yes: market.best_ask,
+            best_bid_no: None,          // TODO: Extract from outcomes array if available
+            best_ask_no: None,          // TODO: Extract from outcomes array if available
+            volume: market.volume,
+            liquidity: market.liquidity,
+            spread_bps,
+            accepting_orders: market.accepting_orders,
+
+            // Fee data
+            maker_fee_bps: market.maker_base_fee,
+            taker_fee_bps: market.taker_base_fee,
+
+            status: if market.closed.unwrap_or(false) {
+                EventStatus::Completed
+            } else {
+                EventStatus::Live
+            },
+            discovered_at: Utc::now(),
+        })
+    }
+
+    /// Fetch crypto markets from Kalshi API
+    ///
+    /// Uses api.elections.kalshi.com (Kalshi consolidated to a single API).
+    /// Searches multiple crypto series tickers for short-term price prediction markets.
     async fn fetch_kalshi_crypto_markets(&self) -> Result<Vec<CryptoMarket>> {
-        // Kalshi uses different endpoints for different market types
-        // We'll search for crypto-related markets
-        let url = "https://api.elections.kalshi.com/trade-api/v2/markets?status=open&limit=200";
+        // Kalshi API base URL (consolidated - includes crypto, elections, etc.)
+        const KALSHI_API: &str = "https://api.elections.kalshi.com/trade-api/v2";
+
+        // Crypto series tickers to search - from kalshi.com/category/crypto/btc
+        // These include short-term (daily) and longer-term price prediction markets
+        const CRYPTO_SERIES: &[&str] = &[
+            // Bitcoin short-term/daily markets (high frequency)
+            "KXBTC",       // Bitcoin price range today at 12pm EST
+            "KXBTCD",      // Bitcoin price today at 11am EST
+            "KXBTCW",      // Bitcoin weekly
+
+            // Bitcoin milestone/target markets
+            "KXBTCMAXY",   // How high will Bitcoin get this year (yearly max)
+            "KXBTCMINY",   // How low will Bitcoin fall this year (yearly min)
+            "KXBTCMAX150", // When will Bitcoin hit $150k
+            "KXBTC2025100",// Will Bitcoin cross $100k again this year
+            // Ethereum markets (likely similar naming)
+            "KXETH",       // Ethereum price range
+            "KXETHD",      // Ethereum daily
+            "KXETHMAXY",   // Ethereum yearly max
+            // Other crypto
+            "KXSOL",       // Solana
+            "KXDOGE",      // Dogecoin
+
+            "INXBTC",      // Intraday Bitcoin (15-min markets)
+            "INXETH",      // Intraday Ethereum
+            "BTCPRICE",    // Alternative Bitcoin ticker
+            "ETHPRICE",    // Alternative Ethereum ticker
+        ];
+
+        let mut all_markets: HashMap<String, CryptoMarket> = HashMap::new();
+
+        // Search each crypto series
+        for series in CRYPTO_SERIES {
+            match self.fetch_kalshi_series(KALSHI_API, series).await {
+                Ok(markets) => {
+                    for market in markets {
+                        all_markets.entry(market.market_id.clone()).or_insert(market);
+                    }
+                }
+                Err(e) => {
+                    debug!("Kalshi series {} not found or error: {}", series, e);
+                }
+            }
+        }
+
+        // Also try a general search for any open crypto-related markets
+        match self.fetch_kalshi_general_crypto(KALSHI_API).await {
+            Ok(markets) => {
+                for market in markets {
+                    all_markets.entry(market.market_id.clone()).or_insert(market);
+                }
+            }
+            Err(e) => {
+                debug!("Kalshi general crypto search failed: {}", e);
+            }
+        }
+
+        let crypto_markets: Vec<CryptoMarket> = all_markets.into_values().collect();
+
+        if !crypto_markets.is_empty() {
+            info!(
+                "Found {} crypto markets on Kalshi: {:?}",
+                crypto_markets.len(),
+                crypto_markets.iter().map(|m| &m.title).collect::<Vec<_>>()
+            );
+        } else {
+            info!("Found 0 crypto markets on Kalshi");
+        }
+
+        Ok(crypto_markets)
+    }
+
+    /// Fetch markets from a specific Kalshi series
+    async fn fetch_kalshi_series(&self, base_url: &str, series_ticker: &str) -> Result<Vec<CryptoMarket>> {
+        let url = format!(
+            "{}/markets?series_ticker={}&status=open&limit=100",
+            base_url, series_ticker
+        );
 
         let response = self
             .client
-            .get(url)
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch Kalshi series")?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Kalshi API error for series {}: {}", series_ticker, response.status()));
+        }
+
+        let resp: KalshiMarketsResponse = response.json().await?;
+
+        if !resp.markets.is_empty() {
+            debug!("Kalshi series {} returned {} markets", series_ticker, resp.markets.len());
+        }
+
+        let crypto_markets: Vec<CryptoMarket> = resp
+            .markets
+            .into_iter()
+            .filter_map(|m| self.parse_kalshi_crypto(&m))
+            .collect();
+
+        Ok(crypto_markets)
+    }
+
+    /// Fetch general crypto markets from Kalshi by scanning all open markets
+    async fn fetch_kalshi_general_crypto(&self, base_url: &str) -> Result<Vec<CryptoMarket>> {
+        // Fetch open markets and filter locally for crypto
+        let url = format!("{}/markets?status=open&limit=500", base_url);
+
+        let response = self
+            .client
+            .get(&url)
             .send()
             .await
             .context("Failed to fetch Kalshi markets")?;
@@ -244,39 +755,59 @@ impl CryptoEventProvider {
         }
 
         let resp: KalshiMarketsResponse = response.json().await?;
-        info!("Kalshi returned {} total markets", resp.markets.len());
+        debug!("Kalshi general search returned {} total markets", resp.markets.len());
 
-        // Log some sample titles to help debug crypto detection
-        let sample_titles: Vec<&str> = resp.markets.iter().take(5).map(|m| m.title.as_str()).collect();
-        info!("Kalshi sample titles: {:?}", sample_titles);
-
-        // Filter for crypto markets
+        // Filter for crypto markets by scanning titles
         let crypto_markets: Vec<CryptoMarket> = resp
             .markets
             .into_iter()
             .filter_map(|m| self.parse_kalshi_crypto(&m))
             .collect();
 
-        if !crypto_markets.is_empty() {
-            info!(
-                "Found {} crypto markets on Kalshi: {:?}",
-                crypto_markets.len(),
-                crypto_markets.iter().map(|m| &m.title).collect::<Vec<_>>()
-            );
-        }
-
         Ok(crypto_markets)
     }
 
     /// Parse a Kalshi market into a CryptoMarket if it's crypto-related
     fn parse_kalshi_crypto(&self, market: &KalshiMarket) -> Option<CryptoMarket> {
+        // FILTER: Only accept 15-minute intraday markets (INXBTC, INXETH)
+        // We focus on the fastest markets for highest velocity arbitrage
+        if !is_intraday_market(&market.ticker) {
+            debug!("Filtered non-intraday market: {} ({})", market.ticker, market.title);
+            return None;
+        }
+
         // Check if it's a crypto market using word-boundary matching
         let asset = TRACKED_ASSETS
             .iter()
             .find(|&asset| contains_crypto_asset(&market.title, asset))?;
 
-        // Try to parse price target
-        let (target_price, prediction_type) = self.parse_price_target(&market.title)?;
+        // Extract target price from floor_strike/cap_strike fields (more reliable than parsing title)
+        // - "greater" type: target is floor_strike (price must be above this)
+        // - "less" type: target is cap_strike (price must be below this)
+        // - "between" type: use floor_strike as the lower bound
+        let target_price = match market.strike_type.as_deref() {
+            Some("greater") => market.floor_strike,
+            Some("less") => market.cap_strike,
+            Some("between") => market.floor_strike, // Use lower bound for between ranges
+            _ => None
+        }
+        .or_else(|| {
+            // Fallback 1: Try to extract from Kalshi ticker format (e.g., "KXDOGE-26JAN3017-B0.227")
+            extract_price_from_kalshi_ticker(&market.ticker)
+        })
+        .or_else(|| {
+            // Fallback 2: Parse from title if all else fails
+            self.parse_price_target(&market.title).map(|(p, _)| p)
+        })?;
+
+        // Determine prediction type from strike_type
+        let prediction_type = match market.strike_type.as_deref() {
+            Some("greater") | Some("less") | Some("between") => CryptoPredictionType::PriceTarget,
+            _ => self
+                .parse_price_target(&market.title)
+                .map(|(_, t)| t)
+                .unwrap_or(CryptoPredictionType::PriceTarget),
+        };
 
         // Parse end date
         let target_date = market
@@ -292,16 +823,41 @@ impl CryptoEventProvider {
             asset: asset.to_string(),
             target_price,
             target_date,
+            start_date: None, // Kalshi API doesn't provide start date
             prediction_type,
             title: market.title.clone(),
             description: market.subtitle.clone(),
-            yes_price: market.yes_bid.map(|p| p as f64 / 100.0),
-            no_price: market.no_bid.map(|p| p as f64 / 100.0),
+            // Use yes_ask for yes_price (what you'd pay to buy YES)
+            yes_price: market.yes_ask.map(|p| p as f64 / 100.0),
+            // Use no_ask for no_price (what you'd pay to buy NO)
+            no_price: market.no_ask.map(|p| p as f64 / 100.0),
+            yes_start_price: None, // Kalshi doesn't provide opening prices
+            no_start_price: None,
+            current_crypto_price: None, // Would need to fetch from external price source
+            reference_price: Some(target_price), // For Kalshi, the target price is the reference
+            // Kalshi bid/ask data
+            best_bid_yes: market.yes_bid.map(|p| p as f64 / 100.0),
+            best_ask_yes: market.yes_ask.map(|p| p as f64 / 100.0),
+            best_bid_no: market.no_bid.map(|p| p as f64 / 100.0),
+            best_ask_no: market.no_ask.map(|p| p as f64 / 100.0),
             volume: market.volume.map(|v| v as f64),
             liquidity: market.open_interest.map(|o| o as f64),
+            // Calculate spread from bid/ask
+            spread_bps: if let (Some(bid), Some(ask)) = (market.yes_bid, market.yes_ask) {
+                let bid_f = bid as f64 / 100.0;
+                let ask_f = ask as f64 / 100.0;
+                Some((((ask_f - bid_f) / bid_f) * 10000.0).round())
+            } else {
+                None
+            },
+            accepting_orders: Some(market.status == "active" || market.status == "open"),
+            // Kalshi fees are implicit in bid/ask, not explicitly provided
+            maker_fee_bps: None,
+            taker_fee_bps: None,
+            // Kalshi uses "active" for open/tradeable markets
             status: match market.status.as_str() {
-                "open" => EventStatus::Live,
-                "closed" => EventStatus::Completed,
+                "active" | "open" => EventStatus::Live,
+                "closed" | "settled" => EventStatus::Completed,
                 _ => EventStatus::Scheduled,
             },
             discovered_at: Utc::now(),
@@ -344,44 +900,67 @@ impl CryptoEventProvider {
     }
 
     /// Enrich a market with live price data
-    async fn enrich_with_price(&self, market: &CryptoMarket) -> Result<EventState> {
-        // Get current price from chained provider (Coinbase → Binance → CoinGecko)
-        let price = self.price_provider.get_price(&market.asset).await?;
+    ///
+    /// Returns a boxed future to prevent stack overflow in deeply nested async call chains.
+    /// Uses tokio::spawn to run price and volatility fetches in parallel, which also
+    /// breaks the call chain depth by executing on separate tasks.
+    fn enrich_with_price<'a>(
+        &'a self,
+        market: &'a CryptoMarket,
+    ) -> Pin<Box<dyn Future<Output = Result<EventState>> + Send + 'a>> {
+        Box::pin(async move {
+            // Spawn price and volatility fetches in parallel on separate tasks.
+            // This breaks the call chain depth and runs both operations concurrently.
+            let price_provider = self.price_provider.clone();
+            let asset = market.asset.clone();
 
-        // Calculate volatility
-        let volatility = self
-            .price_provider
-            .calculate_volatility(&market.asset, 30)
-            .await
-            .map(|v| v.daily_volatility)
-            .unwrap_or(0.03); // Default 3% daily vol
+            let price_handle = tokio::spawn(async move { price_provider.get_price(&asset).await });
 
-        Ok(EventState {
-            event_id: market.market_id.clone(),
-            market_type: MarketType::Crypto {
-                asset: market.asset.clone(),
-                prediction_type: market.prediction_type,
-            },
-            entity_a: market.asset.clone(),
-            entity_b: None,
-            status: market.status,
-            state: StateData::Crypto(CryptoStateData {
-                current_price: price.current_price,
-                target_price: market.target_price,
-                target_date: market.target_date,
-                volatility_24h: volatility,
-                volume_24h: Some(price.volume_24h),
-                metadata: serde_json::json!({
-                    "market_cap": price.market_cap,
-                    "high_24h": price.high_24h,
-                    "low_24h": price.low_24h,
-                    "price_source": price.source,
-                    "yes_price": market.yes_price,
-                    "no_price": market.no_price,
-                    "platform": market.platform,
+            let price_provider2 = self.price_provider.clone();
+            let asset2 = market.asset.clone();
+
+            let volatility_handle = tokio::spawn(async move {
+                price_provider2.calculate_volatility(&asset2, 30).await
+            });
+
+            // Await both in parallel
+            let price = price_handle
+                .await
+                .context("Price fetch task panicked")??;
+
+            let volatility = volatility_handle
+                .await
+                .context("Volatility fetch task panicked")?
+                .map(|v| v.daily_volatility)
+                .unwrap_or(0.03); // Default 3% daily vol
+
+            Ok(EventState {
+                event_id: market.market_id.clone(),
+                market_type: MarketType::Crypto {
+                    asset: market.asset.clone(),
+                    prediction_type: market.prediction_type,
+                },
+                entity_a: market.asset.clone(),
+                entity_b: None,
+                status: market.status,
+                state: StateData::Crypto(CryptoStateData {
+                    current_price: price.current_price,
+                    target_price: market.target_price,
+                    target_date: market.target_date,
+                    volatility_24h: volatility,
+                    volume_24h: Some(price.volume_24h),
+                    metadata: serde_json::json!({
+                        "market_cap": price.market_cap,
+                        "high_24h": price.high_24h,
+                        "low_24h": price.low_24h,
+                        "price_source": price.source,
+                        "yes_price": market.yes_price,
+                        "no_price": market.no_price,
+                        "platform": market.platform,
+                    }),
                 }),
-            }),
-            fetched_at: Utc::now(),
+                fetched_at: Utc::now(),
+            })
         })
     }
 }
@@ -405,21 +984,29 @@ impl EventProvider for CryptoEventProvider {
         let events: Vec<EventInfo> = cache
             .values()
             .filter(|m| m.status == EventStatus::Live)
-            .map(|m| EventInfo {
-                event_id: m.market_id.clone(),
-                market_type: MarketType::Crypto {
-                    asset: m.asset.clone(),
-                    prediction_type: m.prediction_type,
-                },
-                entity_a: m.asset.clone(),
-                entity_b: None,
-                scheduled_time: m.target_date,
-                status: m.status,
-                venue: Some(m.platform.clone()),
-                metadata: serde_json::json!({
-                    "title": m.title,
-                    "target_price": m.target_price,
-                }),
+            .map(|m| {
+                // Extract raw condition_id/ticker from market_id (format: "platform:id")
+                let raw_id = m.market_id.split(':').nth(1).unwrap_or(&m.market_id);
+
+                EventInfo {
+                    event_id: m.market_id.clone(),
+                    market_type: MarketType::Crypto {
+                        asset: m.asset.clone(),
+                        prediction_type: m.prediction_type,
+                    },
+                    entity_a: m.asset.clone(),
+                    entity_b: None,
+                    scheduled_time: m.target_date,
+                    status: m.status,
+                    venue: Some(m.platform.clone()),
+                    metadata: serde_json::json!({
+                        "title": m.title,
+                        "target_price": m.target_price,
+                        // Include platform-specific IDs for monitor assignment
+                        "polymarket_condition_id": if m.platform == "polymarket" { Some(raw_id) } else { None },
+                        "kalshi_ticker": if m.platform == "kalshi" { Some(raw_id) } else { None },
+                    }),
+                }
             })
             .collect();
 
@@ -438,21 +1025,29 @@ impl EventProvider for CryptoEventProvider {
         let events: Vec<EventInfo> = cache
             .values()
             .filter(|m| m.target_date <= cutoff)
-            .map(|m| EventInfo {
-                event_id: m.market_id.clone(),
-                market_type: MarketType::Crypto {
-                    asset: m.asset.clone(),
-                    prediction_type: m.prediction_type,
-                },
-                entity_a: m.asset.clone(),
-                entity_b: None,
-                scheduled_time: m.target_date,
-                status: m.status,
-                venue: Some(m.platform.clone()),
-                metadata: serde_json::json!({
-                    "title": m.title,
-                    "target_price": m.target_price,
-                }),
+            .map(|m| {
+                // Extract raw condition_id/ticker from market_id (format: "platform:id")
+                let raw_id = m.market_id.split(':').nth(1).unwrap_or(&m.market_id);
+
+                EventInfo {
+                    event_id: m.market_id.clone(),
+                    market_type: MarketType::Crypto {
+                        asset: m.asset.clone(),
+                        prediction_type: m.prediction_type,
+                    },
+                    entity_a: m.asset.clone(),
+                    entity_b: None,
+                    scheduled_time: m.target_date,
+                    status: m.status,
+                    venue: Some(m.platform.clone()),
+                    metadata: serde_json::json!({
+                        "title": m.title,
+                        "target_price": m.target_price,
+                        // Include platform-specific IDs for monitor assignment
+                        "polymarket_condition_id": if m.platform == "polymarket" { Some(raw_id) } else { None },
+                        "kalshi_ticker": if m.platform == "kalshi" { Some(raw_id) } else { None },
+                    }),
+                }
             })
             .collect();
 
@@ -460,14 +1055,38 @@ impl EventProvider for CryptoEventProvider {
     }
 
     async fn get_event_state(&self, event_id: &str) -> Result<EventState> {
+        // Acquire semaphore to limit concurrent calls (prevents stack overflow)
+        let _permit = self.state_semaphore.acquire().await
+            .map_err(|e| anyhow!("Failed to acquire state semaphore: {}", e))?;
+
         // Check if cache is empty and needs refresh
+        // Use refresh_lock to prevent concurrent refreshes (which cause stack overflow)
         {
             let cache = self.market_cache.read().await;
-            if cache.is_empty() {
-                drop(cache);
-                info!("Market cache empty, refreshing...");
-                if let Err(e) = self.refresh_markets().await {
-                    warn!("Failed to refresh market cache: {}", e);
+            let needs_refresh = cache.is_empty();
+            drop(cache);
+
+            if needs_refresh {
+                // Try to acquire the refresh lock - only one task does the refresh
+                match self.refresh_lock.try_lock() {
+                    Ok(_guard) => {
+                        // Double-check cache is still empty (another task may have filled it)
+                        let cache = self.market_cache.read().await;
+                        if cache.is_empty() {
+                            drop(cache);
+                            debug!("Market cache empty, refreshing (holding lock)...");
+                            if let Err(e) = self.refresh_markets().await {
+                                warn!("Failed to refresh market cache: {}", e);
+                            }
+                        }
+                        // _guard drops here, releasing the lock
+                    }
+                    Err(_) => {
+                        // Another task is refreshing, wait for it
+                        debug!("Waiting for another task to refresh cache...");
+                        let _guard = self.refresh_lock.lock().await;
+                        // Cache should be populated now
+                    }
                 }
             }
         }
@@ -542,12 +1161,103 @@ fn extract_price_from_text(text: &str) -> Option<f64> {
     None
 }
 
+/// Extract price from Kalshi ticker format like "KXDOGE-26JAN3017-B0.227"
+/// Format: {ticker}-{date}-{strike_type}{price}
+/// Returns the price value (e.g., 0.227 from "B0.227")
+fn extract_price_from_kalshi_ticker(ticker: &str) -> Option<f64> {
+    // Format: "KXDOGE-26JAN3017-B0.227"
+    // Split by hyphen: ["KXDOGE", "26JAN3017", "B0.227"]
+    let parts: Vec<&str> = ticker.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let strike_part = parts[2]; // "B0.227"
+
+    // The strike part starts with a letter (B, T, L, etc.) and is followed by the price
+    // Extract everything after the first character (which is the strike type)
+    if strike_part.len() > 1 {
+        let price_str = &strike_part[1..]; // "0.227"
+        if let Ok(price) = price_str.parse::<f64>() {
+            return Some(price);
+        }
+    }
+
+    None
+}
+
+/// Check if a Kalshi market is a 15-minute intraday market.
+/// We ONLY trade these fast markets for crypto arbitrage.
+/// Intraday markets expire every 15 minutes, providing high-velocity arbitrage opportunities.
+///
+/// Configuration:
+/// - CRYPTO_ALLOW_ALL_TIMEFRAMES=false (default): Only INXBTC/INXETH
+/// - CRYPTO_ALLOW_ALL_TIMEFRAMES=true: Include all Kalshi crypto series
+fn is_intraday_market(ticker: &str) -> bool {
+    // Check if we're allowing all timeframes
+    let allow_all = std::env::var("CRYPTO_ALLOW_ALL_TIMEFRAMES")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if allow_all {
+        // If enabled, accept all crypto markets (no filtering)
+        return true;
+    }
+
+    // Default: Only 15-minute intraday markets
+    ticker.starts_with("INXBTC") || ticker.starts_with("INXETH")
+}
+
+/// Check if a Polymarket market is a directional (Up/Down) market.
+/// Directional markets are simple binary outcome markets predicting price movement direction.
+/// Examples:
+/// - "Bitcoin Up or Down 15m" (15-minute price direction)
+/// - "Ethereum Up or Down Hourly" (1-hour price direction)
+/// - "SOL Up or Down 4h" (4-hour price direction)
+///
+/// These markets have high velocity and real liquidity, perfect for crypto arbitrage.
+fn is_polymarket_directional(title: &str) -> bool {
+    let t = title.to_lowercase();
+
+    // Check for directional market patterns
+    let has_direction = t.contains("up or down") ||
+                       t.contains("up/down") ||
+                       t.contains("updown");
+
+    if !has_direction {
+        return false;
+    }
+
+    // Check for timeframe indicators (15m, hourly, 4h, etc.)
+    // Also match time range patterns like "4:00pm-4:15pm" or "4:00PM-4:15PM ET"
+    let has_timeframe = t.contains("15m") ||
+                       t.contains("15-min") ||
+                       t.contains("15 min") ||
+                       t.contains("hourly") ||
+                       t.contains("hour") ||
+                       t.contains("4h") ||
+                       t.contains("4-hour") ||
+                       t.contains("4 hour") ||
+                       // Match time patterns like "4:00pm-4:15pm" (with or without AM/PM/ET)
+                       regex::Regex::new(r"\d{1,2}:\d{2}(?:am|pm)?\s*-\s*\d{1,2}:\d{2}(?:am|pm)?")
+                           .map(|re| re.is_match(&t))
+                           .unwrap_or(false);
+
+    has_timeframe
+}
+
 /// Check if text contains asset as a whole word (not part of another word)
 /// This prevents "Kenneth" from matching "ETH"
 fn contains_crypto_asset(text: &str, asset: &str) -> bool {
     let text_upper = text.to_uppercase();
     let asset_upper = asset.to_uppercase();
     let full_name = asset_full_name(asset).to_uppercase();
+
+    // Special handling for DOGE - filter out Department of Government Efficiency markets
+    // These are political markets about Elon Musk's cost-cutting initiative, not Dogecoin
+    if asset_upper == "DOGE" && is_government_doge_market(&text_upper) {
+        return false;
+    }
 
     // Check for the asset symbol with word boundaries
     // Allow matches like "BTC", "$BTC", "BTC:", "BTC,", "(BTC)", etc.
@@ -560,6 +1270,41 @@ fn contains_crypto_asset(text: &str, asset: &str) -> bool {
 
     // Check for full name (e.g., "BITCOIN", "ETHEREUM")
     text_upper.contains(&full_name)
+}
+
+/// Check if text is about Department of Government Efficiency (DOGE), not Dogecoin
+/// Returns true if the text contains political/government keywords indicating it's not crypto
+fn is_government_doge_market(text_upper: &str) -> bool {
+    // Keywords that indicate Department of Government Efficiency, not Dogecoin
+    const GOVT_DOGE_KEYWORDS: &[&str] = &[
+        "FEDERAL SPENDING",
+        "GOVERNMENT SPENDING",
+        "FEDERAL BUDGET",
+        "GOVERNMENT EFFICIENCY",
+        "DEPT OF GOVERNMENT",
+        "DEPARTMENT OF GOVERNMENT",
+        "ELON AND DOGE",
+        "MUSK AND DOGE",
+        "DOGE CUT",
+        "DOGE SAVE",
+        "DOGE REDUCE",
+        "DOGE SLASH",
+        "BILLION IN SPENDING",
+        "TRILLION IN SPENDING",
+        "EXECUTIVE ORDER",
+        "WHITE HOUSE",
+        "TRUMP ADMIN",
+        "VIVEK",
+        "RAMASWAMY",
+    ];
+
+    for keyword in GOVT_DOGE_KEYWORDS {
+        if text_upper.contains(keyword) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Get full name for asset symbol
@@ -645,6 +1390,36 @@ mod string_or_number {
     }
 }
 
+/// Polymarket event from /events endpoint
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolymarketEvent {
+    #[allow(dead_code)]
+    id: String,
+    title: String,
+    #[serde(default)]
+    markets: Option<Vec<PolymarketMarketNested>>,
+}
+
+/// Polymarket market nested inside an event
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolymarketMarketNested {
+    condition_id: String,
+    #[serde(default)]
+    question: String,
+    description: Option<String>,
+    end_date: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize_outcome_prices")]
+    outcome_prices: Option<Vec<f64>>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    volume: Option<f64>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    liquidity: Option<f64>,
+    closed: Option<bool>,
+}
+
+/// Legacy: Polymarket market from /markets endpoint (kept for compatibility)
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PolymarketMarket {
@@ -661,6 +1436,45 @@ struct PolymarketMarket {
     closed: Option<bool>,
 }
 
+/// Polymarket market returned from /markets?slug= endpoint (directional markets)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolymarketMarketSimple {
+    condition_id: String,
+    question: String,
+    description: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize_outcome_prices")]
+    outcome_prices: Option<Vec<f64>>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    volume: Option<f64>,
+    #[serde(default, deserialize_with = "string_or_number::deserialize")]
+    liquidity: Option<f64>,
+    closed: Option<bool>,
+    /// Chainlink or other oracle providing resolution price
+    #[serde(default)]
+    resolution_source: Option<String>,
+    /// Best bid price for outcome 0 (Up)
+    #[serde(default)]
+    best_bid: Option<f64>,
+    /// Best ask price for outcome 0 (Up)
+    #[serde(default)]
+    best_ask: Option<f64>,
+    /// Whether market is accepting new orders
+    #[serde(default)]
+    accepting_orders: Option<bool>,
+    /// Bid-ask spread
+    #[serde(default)]
+    spread: Option<f64>,
+    /// Maker fee in basis points
+    #[serde(default)]
+    maker_base_fee: Option<u32>,
+    /// Taker fee in basis points
+    #[serde(default)]
+    taker_base_fee: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 struct KalshiMarketsResponse {
     markets: Vec<KalshiMarket>,
@@ -675,8 +1489,16 @@ struct KalshiMarket {
     status: String,
     yes_bid: Option<i32>,
     no_bid: Option<i32>,
+    yes_ask: Option<i32>,
+    no_ask: Option<i32>,
     volume: Option<i64>,
     open_interest: Option<i64>,
+    /// Price floor for "greater than" or "between" markets
+    floor_strike: Option<f64>,
+    /// Price cap for "less than" or "between" markets
+    cap_strike: Option<f64>,
+    /// Type of strike: "greater", "less", "between"
+    strike_type: Option<String>,
 }
 
 #[cfg(test)]
@@ -714,5 +1536,55 @@ mod tests {
         let provider = CryptoEventProvider::new();
         assert_eq!(provider.provider_name(), "CryptoEventProvider");
         assert!(!provider.supported_market_types().is_empty());
+    }
+
+    #[test]
+    fn test_intraday_filtering_kalshi() {
+        // Should accept intraday markets (INXBTC, INXETH)
+        assert!(is_intraday_market("INXBTC-30JAN25-1530"), "Should keep INXBTC");
+        assert!(is_intraday_market("INXBTC"), "Should keep INXBTC prefix");
+        assert!(is_intraday_market("INXETH-30JAN25-1545"), "Should keep INXETH");
+        assert!(is_intraday_market("INXETH"), "Should keep INXETH prefix");
+
+        // Should reject daily/weekly markets
+        assert!(!is_intraday_market("KXBTC-30JAN25"), "Should filter KXBTC daily");
+        assert!(!is_intraday_market("KXBTCD"), "Should filter KXBTCD daily");
+        assert!(!is_intraday_market("KXBTCW-FEB25"), "Should filter weekly");
+        assert!(!is_intraday_market("KXETH-30JAN25"), "Should filter daily ETH");
+        assert!(!is_intraday_market("KXSOL"), "Should filter SOL daily");
+        assert!(!is_intraday_market("KXDOGE"), "Should filter DOGE daily");
+        assert!(!is_intraday_market("KXBTCMAXY"), "Should filter yearly max");
+        assert!(!is_intraday_market("BTCPRICE"), "Should filter alternative ticker");
+    }
+
+    #[test]
+    fn test_doge_government_filtering() {
+        // Should NOT match - these are Department of Government Efficiency markets
+        assert!(
+            !contains_crypto_asset("Will Elon and DOGE cut less than $50b in federal spending in 2025?", "DOGE"),
+            "Should filter out government DOGE markets"
+        );
+        assert!(
+            !contains_crypto_asset("Will DOGE save $1 trillion in government spending?", "DOGE"),
+            "Should filter out government spending DOGE markets"
+        );
+        assert!(
+            !contains_crypto_asset("DOGE slash federal budget by 20%", "DOGE"),
+            "Should filter out federal budget DOGE markets"
+        );
+
+        // SHOULD match - these are actual Dogecoin markets
+        assert!(
+            contains_crypto_asset("Will DOGE reach $1?", "DOGE"),
+            "Should match Dogecoin price target"
+        );
+        assert!(
+            contains_crypto_asset("Dogecoin above $0.50 by December", "DOGE"),
+            "Should match Dogecoin by full name"
+        );
+        assert!(
+            contains_crypto_asset("Will $DOGE hit $2?", "DOGE"),
+            "Should match $DOGE ticker format"
+        );
     }
 }

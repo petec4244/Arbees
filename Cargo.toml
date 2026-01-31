@@ -9,6 +9,7 @@ members = [
     "services/position_tracker_rust",
     "services/notification_service_rust",
     "services/zmq_listener_rust",
+    "services/crypto_shard_rust",
 ]
 resolver = "2"
 

@@ -5,13 +5,17 @@
 //!
 //! Rate limits: 10 requests/second (IP-based)
 
-use super::crypto_price::{CryptoPrice, CryptoPriceProvider, ProviderStatus, VolatilityResult};
+use super::crypto_price::{
+    default_calculate_volatility, CryptoPrice, CryptoPriceProvider, ProviderStatus, VolatilityResult,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,98 +150,103 @@ impl CryptoPriceProvider for CoinbaseClient {
         Self::to_product_id(symbol)
     }
 
-    async fn get_price(&self, coin_id: &str) -> Result<CryptoPrice> {
-        let symbol = coin_id.to_uppercase();
+    fn get_price<'a>(
+        &'a self,
+        coin_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CryptoPrice>> + Send + 'a>> {
+        Box::pin(async move {
+            let symbol = coin_id.to_uppercase();
 
-        // Check cache
-        if let Some(cached) = self.get_cached(&symbol).await {
-            return Ok(cached);
-        }
-
-        // Check rate limit
-        if !self.check_rate_limit().await {
-            return Err(anyhow!("Coinbase rate limit exceeded"));
-        }
-
-        let product_id = Self::to_product_id(&symbol);
-
-        // Fetch ticker for current price
-        let ticker_url = format!("{}/products/{}/ticker", BASE_URL, product_id);
-
-        debug!("Fetching {} from Coinbase", product_id);
-
-        let response = self
-            .client
-            .get(&ticker_url)
-            .send()
-            .await
-            .context("Failed to fetch from Coinbase")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-
-            if status.as_u16() == 429 {
-                *self.status.write().unwrap() = ProviderStatus::RateLimited;
-            } else {
-                *self.status.write().unwrap() = ProviderStatus::Error;
+            // Check cache
+            if let Some(cached) = self.get_cached(&symbol).await {
+                return Ok(cached);
             }
 
-            return Err(anyhow!("Coinbase API error: {} - {}", status, body));
-        }
+            // Check rate limit
+            if !self.check_rate_limit().await {
+                return Err(anyhow!("Coinbase rate limit exceeded"));
+            }
 
-        let ticker: CoinbaseTicker = response
-            .json()
-            .await
-            .context("Failed to parse Coinbase ticker")?;
+            let product_id = Self::to_product_id(&symbol);
 
-        // Fetch stats for 24h data (separate request)
-        let stats = self.get_stats(&product_id).await.ok();
+            // Fetch ticker for current price
+            let ticker_url = format!("{}/products/{}/ticker", BASE_URL, product_id);
 
-        // Update status to healthy on success
-        *self.status.write().unwrap() = ProviderStatus::Healthy;
+            debug!("Fetching {} from Coinbase", product_id);
 
-        let current_price: f64 = ticker.price.parse().unwrap_or(0.0);
+            let response = self
+                .client
+                .get(&ticker_url)
+                .send()
+                .await
+                .context("Failed to fetch from Coinbase")?;
 
-        let (high_24h, low_24h, volume_24h) = if let Some(ref s) = stats {
-            (
-                s.high.parse().unwrap_or(current_price),
-                s.low.parse().unwrap_or(current_price),
-                s.volume.parse().unwrap_or(0.0) * current_price, // Convert to USD
-            )
-        } else {
-            (current_price, current_price, 0.0)
-        };
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
 
-        // Calculate price change from 24h open
-        let open_24h: f64 = stats
-            .as_ref()
-            .map(|s| s.open.parse().unwrap_or(current_price))
-            .unwrap_or(current_price);
-        let price_change_24h = current_price - open_24h;
-        let price_change_percentage_24h = if open_24h > 0.0 {
-            (price_change_24h / open_24h) * 100.0
-        } else {
-            0.0
-        };
+                if status.as_u16() == 429 {
+                    *self.status.write().unwrap() = ProviderStatus::RateLimited;
+                } else {
+                    *self.status.write().unwrap() = ProviderStatus::Error;
+                }
 
-        let price = CryptoPrice {
-            id: product_id.clone(),
-            symbol: symbol.clone(),
-            name: symbol.clone(), // Coinbase ticker doesn't provide full names
-            current_price,
-            high_24h,
-            low_24h,
-            price_change_24h,
-            price_change_percentage_24h,
-            volume_24h,
-            market_cap: None, // Coinbase doesn't provide market cap
-            last_updated: Utc::now(),
-            source: "Coinbase".to_string(),
-        };
+                return Err(anyhow!("Coinbase API error: {} - {}", status, body));
+            }
 
-        self.update_cache(&symbol, price.clone()).await;
-        Ok(price)
+            let ticker: CoinbaseTicker = response
+                .json()
+                .await
+                .context("Failed to parse Coinbase ticker")?;
+
+            // Fetch stats for 24h data (separate request)
+            let stats = self.get_stats(&product_id).await.ok();
+
+            // Update status to healthy on success
+            *self.status.write().unwrap() = ProviderStatus::Healthy;
+
+            let current_price: f64 = ticker.price.parse().unwrap_or(0.0);
+
+            let (high_24h, low_24h, volume_24h) = if let Some(ref s) = stats {
+                (
+                    s.high.parse().unwrap_or(current_price),
+                    s.low.parse().unwrap_or(current_price),
+                    s.volume.parse().unwrap_or(0.0) * current_price, // Convert to USD
+                )
+            } else {
+                (current_price, current_price, 0.0)
+            };
+
+            // Calculate price change from 24h open
+            let open_24h: f64 = stats
+                .as_ref()
+                .map(|s| s.open.parse().unwrap_or(current_price))
+                .unwrap_or(current_price);
+            let price_change_24h = current_price - open_24h;
+            let price_change_percentage_24h = if open_24h > 0.0 {
+                (price_change_24h / open_24h) * 100.0
+            } else {
+                0.0
+            };
+
+            let price = CryptoPrice {
+                id: product_id.clone(),
+                symbol: symbol.clone(),
+                name: symbol.clone(), // Coinbase ticker doesn't provide full names
+                current_price,
+                high_24h,
+                low_24h,
+                price_change_24h,
+                price_change_percentage_24h,
+                volume_24h,
+                market_cap: None, // Coinbase doesn't provide market cap
+                last_updated: Utc::now(),
+                source: "Coinbase".to_string(),
+            };
+
+            self.update_cache(&symbol, price.clone()).await;
+            Ok(price)
+        })
     }
 
     async fn get_prices(&self, coin_ids: &[&str]) -> Result<Vec<CryptoPrice>> {
@@ -329,9 +338,12 @@ impl CryptoPriceProvider for CoinbaseClient {
         Ok(prices)
     }
 
-    async fn calculate_volatility(&self, coin_id: &str, days: u32) -> Result<VolatilityResult> {
-        // Use default implementation from trait
-        <Self as CryptoPriceProvider>::calculate_volatility(self, coin_id, days).await
+    fn calculate_volatility<'a>(
+        &'a self,
+        coin_id: &'a str,
+        days: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<VolatilityResult>> + Send + 'a>> {
+        default_calculate_volatility(self, coin_id, days)
     }
 }
 

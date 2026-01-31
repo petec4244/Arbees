@@ -38,11 +38,18 @@ services:
       retries: 5
 
   # ==========================================================================
-  # ZMQ Listener (Rust) - Bridges ZMQ messages to Redis for backward compatibility
+  # ZMQ Listener (Rust) - Observes all ZMQ traffic for logging and persistence
   # ==========================================================================
-  # This service subscribes to ZMQ publishers (kalshi_monitor, polymarket_monitor,
-  # game_shard) and mirrors messages to Redis streams/pub-sub for services that
-  # don't use ZMQ directly.
+  # This service subscribes to ALL ZMQ publishers and provides:
+  # - Structured console logging for debugging
+  # - Redis streams for historical queries and slow-path consumers
+  # - Optional file logging for replay/backtesting
+  # - Latency tracking and sequence gap detection
+  #
+  # Modes:
+  # - observer: Log and persist to streams only (default for zmq_only)
+  # - bridge: Also forward to Redis pub/sub (for "both" transport mode)
+  # - disabled: Exit immediately (for redis_only mode)
   # ==========================================================================
   zmq_listener:
     build:
@@ -55,13 +62,24 @@ services:
     env_file:
       - .env
     environment:
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
+      # Listener mode (default: observer for ZMQ-only transport)
+      ZMQ_LISTENER_MODE: "${ZMQ_LISTENER_MODE:-observer}"
+      # ZMQ endpoints to subscribe to
       ZMQ_KALSHI_ENDPOINT: "tcp://kalshi_monitor:5555"
       ZMQ_POLYMARKET_ENDPOINT: "tcp://vpn:5556"
       ZMQ_GAME_SHARD_ENDPOINT: "tcp://game_shard:5558"
+      ZMQ_SIGNAL_PROCESSOR_ENDPOINT: "tcp://signal_processor:5559"
+      ZMQ_EXECUTION_ENDPOINT: "tcp://execution_service:5560"
+      # Output configuration
+      ZMQ_LISTENER_CONSOLE_LOG: "${ZMQ_LISTENER_CONSOLE_LOG:-true}"
+      ZMQ_LISTENER_REDIS_STREAMS: "${ZMQ_LISTENER_REDIS_STREAMS:-true}"
+      ZMQ_LISTENER_LOG_FORMAT: "${ZMQ_LISTENER_LOG_FORMAT:-pretty}"
+      # Optional file logging (mount a volume if using)
+      # ZMQ_LISTENER_LOG_FILE: "/var/log/arbees/zmq_traffic.jsonl"
     restart: unless-stopped
     profiles:
       - full
+      - zmq
 
   # ==========================================================================
   # Notifications (Rust) - Signal via signal-cli-rest-api sidecar
@@ -142,6 +160,11 @@ services:
         condition: service_started
     env_file:
       - .env
+    environment:
+      # Crypto market filtering: Only 15-minute intraday markets
+      # Set to "true" to include all crypto timeframes (KXBTC daily, KXBTCW weekly, etc.)
+      # Default "false": Only INXBTC/INXETH 15-minute markets (fastest arbitrage opportunities)
+      CRYPTO_ALLOW_ALL_TIMEFRAMES: "${CRYPTO_ALLOW_ALL_TIMEFRAMES:-true}"
     # NOTE: No volume mount for Rust orchestrator - binary is compiled in image
     # Mount Docker socket only if supervisor functionality is needed
     # volumes:
@@ -167,11 +190,16 @@ services:
     env_file:
       - .env
     environment:
+      # Shard identity - MUST match what orchestrator expects (default: shard-1)
+      SHARD_ID: "shard-1"
+      SHARD_TYPE: "sports"
+      # Heartbeat interval (5 seconds for fast shard discovery)
+      HEARTBEAT_INTERVAL_SECS: "5"
       # ZMQ configuration for low-latency messaging
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
       ZMQ_PUB_PORT: "5558"
-      SHARD_TYPE: "sports"
+      # Increase stack size to prevent overflow with deep async call stacks
+      RUST_MIN_STACK: "8388608"
     expose:
       - "5558"
     ports:
@@ -182,15 +210,41 @@ services:
       - full
 
   # ==========================================================================
-  # Crypto Shard - Handles non-sports markets (crypto, economics, politics)
+  # Crypto ZMQ Bridge - Polymarket prices from VPN to arbees-network
   # ==========================================================================
-  # Uses the same game_shard binary but configured for crypto/multi-market types.
-  # Orchestrator routes markets based on shard_type in heartbeat.
+  # Polymarket monitor runs behind VPN (network_mode: "service:vpn")
+  # Publishes to tcp://polymarket_monitor:5556 (unreachable from arbees-network)
+  # This bridge subscribes from VPN and republishes on arbees-network
+  # crypto_shard subscribes to this bridge at tcp://crypto-zmq-bridge:5564
+  # ==========================================================================
+  crypto-zmq-bridge:
+    build:
+      context: ./services/crypto_zmq_bridge
+      dockerfile: Dockerfile
+    container_name: arbees-crypto-zmq-bridge
+    environment:
+      LOG_LEVEL: "INFO"
+      POLYMARKET_ZMQ_ENDPOINT: "tcp://vpn:5556"
+      BRIDGE_PUB_ENDPOINT: "tcp://0.0.0.0:5564"
+    depends_on:
+      - polymarket_monitor
+    expose:
+      - "5564"
+    restart: unless-stopped
+    profiles:
+      - full
+      - crypto
+
+  # ==========================================================================
+  # Crypto Shard - Self-contained crypto arbitrage service
+  # ==========================================================================
+  # Monitors crypto events and emits execution requests via ZMQ
+  # Bypasses signal_processor for <50ms latency
   # ==========================================================================
   crypto_shard:
     build:
       context: .
-      dockerfile: services/game_shard_rust/Dockerfile
+      dockerfile: services/crypto_shard_rust/Dockerfile
     container_name: arbees-crypto-shard
     deploy:
       resources:
@@ -200,16 +254,46 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      crypto-spot-monitor:
+        condition: service_started
+      crypto-zmq-bridge:
+        condition: service_started
     env_file:
       - .env
     environment:
-      SHARD_ID: "crypto_shard_1"
+      RUST_LOG: info
       SHARD_TYPE: "crypto"
-      MAX_GAMES: "50"
-      # ZMQ configuration for low-latency messaging
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
-      ZMQ_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556"
-      ZMQ_PUB_PORT: "5559"
+      CRYPTO_SHARD_ID: "crypto_1"
+      # ZMQ price subscriptions: Direct ZMQ feeds (hot path, not Redis)
+      # Endpoints:
+      #   - kalshi_monitor:5555 (Kalshi prediction markets)
+      #   - vpn:5556 (Polymarket 15-min directional markets - via VPN service)
+      #   - crypto-spot-monitor:5560 (Coinbase/Binance spot prices)
+      CRYPTO_PRICE_SUB_ENDPOINTS: "tcp://kalshi_monitor:5555,tcp://vpn:5556,tcp://crypto-spot-monitor:5560"
+      CRYPTO_EXECUTION_PUB_ENDPOINT: "tcp://0.0.0.0:5559"
+      # Risk management
+      CRYPTO_MIN_EDGE_PCT: "3.0"
+      CRYPTO_MAX_POSITION_SIZE: "500.0"
+      CRYPTO_MAX_ASSET_EXPOSURE: "2000.0"
+      CRYPTO_MAX_TOTAL_EXPOSURE: "5000.0"
+      CRYPTO_VOLATILITY_SCALING: "true"
+      CRYPTO_MIN_LIQUIDITY: "50.0"
+      # Probability model
+      CRYPTO_MODEL_VOLATILITY_WINDOW_DAYS: "30"
+      CRYPTO_MODEL_TIME_DECAY: "true"
+      CRYPTO_MODEL_MIN_CONFIDENCE: "0.60"
+      # Monitoring
+      # Event-driven evaluation: Signals triggered immediately on price updates (default: true)
+      # Set to "false" to use traditional polling at fixed interval below
+      CRYPTO_EVENT_DRIVEN_EVALUATION: "true"
+      # Polling interval fallback (used when event-driven is disabled)
+      # With event-driven enabled, this is the backup periodic cycle interval
+      CRYPTO_POLL_INTERVAL_SECS: "5"
+      # Price staleness threshold (prices older than this are rejected)
+      # Reduced from 60s to 10s for crypto volatility
+      CRYPTO_PRICE_STALENESS_SECS: "10"
+      # Heartbeat interval (5 seconds for fast shard discovery)
+      CRYPTO_HEARTBEAT_INTERVAL_SECS: "5"
     expose:
       - "5559"
     ports:
@@ -265,7 +349,6 @@ services:
       - .env
     environment:
       # ZMQ configuration for signal processing pipeline
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_SUB_ENDPOINT: "tcp://game_shard:5558"
       ZMQ_PUB_PORT: "5559"
     expose:
@@ -290,8 +373,11 @@ services:
       - .env
     environment:
       # ZMQ configuration for execution request processing
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_SUB_ENDPOINT: "tcp://signal_processor:5559"
+      # ZMQ PUB for trade results (observed by zmq_listener)
+      ZMQ_PUB_PORT: "5560"
+    expose:
+      - "5560"
     volumes:
       - ./:/app
     profiles:
@@ -494,6 +580,31 @@ services:
       - full
       - vpn
 
+  # Crypto Spot Price Monitor - Real-time BTC/ETH/SOL spot prices via WebSocket
+  crypto-spot-monitor:
+    build:
+      context: .
+      dockerfile: services/crypto_spot_monitor/Dockerfile
+    container_name: arbees-crypto-spot-monitor
+    environment:
+      ZMQ_PUB_ENDPOINT: "tcp://*:5560"
+      MONITORED_ASSETS: "BTC,ETH,SOL"
+      LOG_LEVEL: "INFO"
+    expose:
+      - "5560"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    restart: unless-stopped
+    profiles:
+      - full
+      - crypto
+
   # Polymarket Price Shard - publishes prices to Redis for all consumers
   polymarket_monitor:
     build:
@@ -509,7 +620,6 @@ services:
     environment:
       # ZMQ configuration for low-latency price publishing
       # Note: Since using network_mode: service:vpn, port 5556 is exposed via vpn container
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_PUB_PORT: "5556"
     volumes:
       # DEBUG MODE: write NDJSON instrumentation to the host workspace file
@@ -533,7 +643,6 @@ services:
       - .env
     environment:
       # ZMQ configuration for low-latency price publishing
-      ZMQ_TRANSPORT_MODE: "${ZMQ_TRANSPORT_MODE:-redis_only}"
       ZMQ_PUB_PORT: "5555"
     expose:
       - "5555"

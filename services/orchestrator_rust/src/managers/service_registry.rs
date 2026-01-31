@@ -45,6 +45,11 @@ impl ServiceRegistry {
 
     /// Handle incoming heartbeat from a service
     pub async fn handle_heartbeat(&self, payload: Value) -> Result<()> {
+        // Log all incoming heartbeats for debugging
+        if let Some(shard_id) = payload.get("shard_id").and_then(|v| v.as_str()) {
+            debug!("Received heartbeat from shard_id={}", shard_id);
+        }
+
         // Parse heartbeat payload
         let service_name = payload
             .get("service")
@@ -67,6 +72,21 @@ impl ServiceRegistry {
         let state = services
             .entry(instance_key.clone())
             .or_insert_with(|| ServiceState::new(service_type.clone(), instance_id.to_string()));
+
+        // Always update service_type from heartbeat (fixes routing for crypto vs sports shards)
+        if state.service_type != service_type {
+            info!(
+                "Updating service_type for {} from {:?} to {:?}",
+                instance_key, state.service_type, service_type
+            );
+            state.service_type = service_type.clone();
+        }
+
+        // Log when a new service is registered
+        debug!(
+            "Heartbeat processed: instance_key={}, service_type={:?}, status={:?}",
+            instance_key, state.service_type, state.status
+        );
 
         // Extract heartbeat fields
         let process_id = payload.get("process_id").and_then(|v| v.as_str()).map(String::from);
@@ -155,7 +175,12 @@ impl ServiceRegistry {
                     state.metrics.insert("max_games".to_string(), max_games.clone());
                 }
 
-                if let Some(games) = payload.get("games").and_then(|v| v.as_array()) {
+                // Check both "games" (for game shards) and "events" (for crypto shards)
+                if let Some(games) = payload
+                    .get("games")
+                    .or_else(|| payload.get("events"))
+                    .and_then(|v| v.as_array())
+                {
                     let reported_games: HashSet<String> = games
                         .iter()
                         .filter_map(|v| v.as_str().map(String::from))
@@ -178,6 +203,12 @@ impl ServiceRegistry {
                         state.assigned_games.remove(&game_id);
                     }
 
+                    // DISABLED: Zombie game detection
+                    // This was too aggressive and removed games immediately after assignment
+                    // due to race conditions between assignment and heartbeat reporting.
+                    // TODO: Implement grace period (require multiple heartbeats missing game)
+                    // before sending remove commands.
+                    /*
                     // Check for zombie games (shard is monitoring but shouldn't be)
                     let zombie_games: Vec<String> = reported_games
                         .difference(&state.assigned_games)
@@ -198,7 +229,7 @@ impl ServiceRegistry {
                             info!("Removing zombie game {} from shard {}", game_id, instance_id);
                             let remove_channel = format!("shard:{}:command", instance_id);
                             let remove_cmd = json!({
-                                "command": "remove_game",
+                                "type": "remove_game",
                                 "game_id": game_id
                             });
 
@@ -210,6 +241,7 @@ impl ServiceRegistry {
                         // Re-acquire lock for rest of processing
                         services = self.services.write().await;
                     }
+                    */
                 }
             }
         }
@@ -670,7 +702,7 @@ impl ServiceRegistry {
                 // Send remove command to old shard (best effort)
                 let remove_channel = format!("shard:{}:command", old_shard_id);
                 let remove_cmd = json!({
-                    "command": "remove_game",
+                    "type": "remove_game",
                     "game_id": game_id
                 });
                 let _ = self.redis.publish(&remove_channel, &remove_cmd).await;
@@ -686,7 +718,7 @@ impl ServiceRegistry {
                     // Send assignment to new shard
                     let add_channel = format!("shard:{}:command", shard.instance_id);
                     let add_cmd = json!({
-                        "command": "add_game",
+                        "type": "add_game",
                         "game_id": assignment.game_id,
                         "sport": assignment.sport,
                         "kalshi_market_id": assignment.kalshi_market_id,

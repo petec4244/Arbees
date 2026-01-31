@@ -115,11 +115,38 @@ def parse_kalshi_ticker(ticker: str) -> Optional[dict]:
 
 def extract_team_from_ticker(ticker: str) -> Optional[str]:
     """
-    Extract team abbreviation from Kalshi ticker format.
+    Extract team abbreviation or asset from Kalshi ticker format.
+
+    Handles both sports and crypto tickers:
+    - Sports: KXNHLGAME-26JAN27NSHBOS-BOS -> "BOS"
+    - Crypto: KXBTCMINY-27JAN01-80000.00 -> "BTC"
+
     Convenience wrapper around parse_kalshi_ticker.
     """
+    # First try sports parsing
     parsed = parse_kalshi_ticker(ticker)
-    return parsed["contract_team"] if parsed else None
+    if parsed:
+        return parsed["contract_team"]
+
+    # For crypto tickers, extract asset from prefix
+    # Format: KX{ASSET}... (e.g., KXBTC, KXETH, KXSOL, KXDOGE, KXXRP)
+    if ticker.startswith("KX"):
+        # Extract characters after "KX" up to the next digit or hyphen
+        prefix = ticker[2:]  # Remove "KX"
+        asset = ""
+        for char in prefix:
+            if char.isalpha():
+                asset += char
+            else:
+                break
+
+        # Validate it's a known crypto asset (3-4 uppercase letters)
+        if 3 <= len(asset) <= 4 and asset.isupper():
+            logger.debug(f"[INSTRUMENTATION] Extracted crypto asset '{asset}' from ticker '{ticker}'")
+            return asset
+
+    logger.warning(f"[INSTRUMENTATION] Could not extract team/asset from ticker: {ticker}")
+    return None
 
 
 def get_complementary_ticker(ticker: str) -> Optional[str]:
@@ -181,13 +208,16 @@ class KalshiMonitor:
         # Heartbeat publisher for health monitoring
         self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
-        # ZMQ publisher for low-latency messaging (hot path)
-        transport_mode = os.environ.get("ZMQ_TRANSPORT_MODE", "redis_only").lower()
-        self._zmq_enabled = transport_mode in ("zmq_only", "both")
+        # ZMQ publisher for low-latency messaging (HOT PATH - always enabled)
+        # ZMQ is the primary transport for price data; Redis is only for slow-path consumers
         self._zmq_context: Optional["zmq.asyncio.Context"] = None
         self._zmq_pub: Optional["zmq.asyncio.Socket"] = None
         self._zmq_seq = 0
         self._zmq_pub_port = int(os.environ.get("ZMQ_PUB_PORT", "5555"))
+
+        # Redis publishing is now optional (only for backward compatibility)
+        transport_mode = os.environ.get("ZMQ_TRANSPORT_MODE", "zmq_only").lower()
+        self._redis_publish_prices = transport_mode in ("redis_only", "both")
 
     async def start(self):
         """Initialize connections and start monitoring."""
@@ -222,19 +252,26 @@ class KalshiMonitor:
         self._running = True
         self._health_ok = True
 
-        # Initialize ZMQ publisher if enabled
-        if self._zmq_enabled and ZMQ_AVAILABLE:
-            try:
-                self._zmq_context = zmq.asyncio.Context()
-                self._zmq_pub = self._zmq_context.socket(zmq.PUB)
-                self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
-                logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port}")
-            except Exception as e:
-                logger.error(f"Failed to initialize ZMQ: {e}")
-                self._zmq_enabled = False
-        elif self._zmq_enabled and not ZMQ_AVAILABLE:
-            logger.warning(f"ZMQ_TRANSPORT_MODE={transport_mode} but pyzmq not installed")
-            self._zmq_enabled = False
+        # Initialize ZMQ publisher (REQUIRED - ZMQ is the primary hot path)
+        if not ZMQ_AVAILABLE:
+            raise RuntimeError(
+                "pyzmq is required for KalshiMonitor. "
+                "Install with: pip install pyzmq"
+            )
+
+        try:
+            self._zmq_context = zmq.asyncio.Context()
+            self._zmq_pub = self._zmq_context.socket(zmq.PUB)
+            # Configure socket for high-throughput price publishing
+            # Increase send buffer (HWM) to 100k messages to handle Kalshi price flood
+            self._zmq_pub.setsockopt(zmq.SNDHWM, 100000)
+            # Enable linger on disconnect to ensure last messages are sent
+            self._zmq_pub.setsockopt(zmq.LINGER, 1000)
+            self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
+            logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port} (HWM=100k, primary hot path)")
+        except Exception as e:
+            logger.error(f"Failed to initialize ZMQ: {e}")
+            raise RuntimeError(f"ZMQ initialization failed: {e}")
 
         # Setup signal handlers
         loop = asyncio.get_event_loop()
@@ -257,6 +294,16 @@ class KalshiMonitor:
         })
 
         logger.info("KalshiMonitor started successfully")
+
+        # Start Redis listener loop BEFORE requesting startup state
+        # (so subscription callbacks are processed when responses arrive)
+        await self.redis.start_listening()
+
+        # REQUEST CURRENT ASSIGNMENTS FROM ORCHESTRATOR ON STARTUP
+        # This ensures that if the monitor was restarted, it recovers assignments
+        # without waiting for new discoveries (which could take minutes)
+        logger.info("Requesting current Kalshi market assignments from orchestrator...")
+        await self._request_startup_state()
 
         # Run concurrent tasks
         await asyncio.gather(
@@ -286,9 +333,96 @@ class KalshiMonitor:
 
         logger.info(f"KalshiMonitor stopped. Published {self._prices_published} prices.")
 
+    async def _request_startup_state(self):
+        """Request current market assignments from orchestrator on startup.
+
+        This ensures monitors recover quickly after restart without waiting for
+        new market discoveries (which can take several minutes).
+        """
+        try:
+            # Request current state from orchestrator
+            request_channel = "orchestrator:startup_state_request"
+            response_channel = "orchestrator:startup_state_response:kalshi"
+
+            # Subscribe to response channel BEFORE making the request
+            # (otherwise we might miss the response)
+            responses_received = []
+
+            async def collect_response(data: dict):
+                logger.info(f"Received response from orchestrator: {data}")
+                responses_received.append(data)
+
+            await self.redis.subscribe(response_channel, collect_response)
+
+            # Retry logic: Try up to 3 times with 2-second delays to ensure orchestrator is subscribed
+            max_retries = 3
+            for attempt in range(max_retries):
+                # Send startup state request as JSON string (not msgpack)
+                request_payload = {
+                    "monitor_type": "kalshi",
+                    "timestamp": asyncio.get_event_loop().time(),
+                }
+                request_json = json.dumps(request_payload)
+                logger.info(f"Publishing startup state request (attempt {attempt + 1}/{max_retries}) to {request_channel}: {request_json}")
+                # Publish as raw string to Redis (not through RedisBus which uses msgpack)
+                await self.redis._client.publish(request_channel, request_json)
+
+                # Wait for response with 5-second timeout per attempt
+                start_time = asyncio.get_event_loop().time()
+                while not responses_received and asyncio.get_event_loop().time() - start_time < 5:
+                    await asyncio.sleep(0.1)
+
+                if responses_received:
+                    response = responses_received[0]
+                    markets = response.get("markets", [])
+                    logger.info(f"Received {len(markets)} Kalshi market assignments from orchestrator")
+
+                    # Group markets by event_id and convert to assignment message format
+                    assignments_by_event = {}
+                    for market in markets:
+                        event_id = market.get("event_id")
+                        kalshi_market_id = market.get("kalshi_market_id")
+                        market_type = market.get("market_type", {})
+                        entity_a = market.get("entity_a")
+
+                        if not event_id or not kalshi_market_id:
+                            continue
+
+                        if event_id not in assignments_by_event:
+                            assignments_by_event[event_id] = {
+                                "type": "kalshi_assign",
+                                "event_id": event_id,
+                                "market_type": market_type.get("type", "crypto"),
+                                "markets": [],
+                            }
+
+                        # Add market to this event's assignment
+                        assignments_by_event[event_id]["markets"].append({
+                            "ticker": kalshi_market_id,
+                            "market_id": kalshi_market_id,
+                            "market_type": market_type.get("type", "crypto"),
+                            "team_name": entity_a,  # For crypto, this is the asset (BTC, ETH, etc.)
+                        })
+
+                    # Process each grouped assignment immediately
+                    for event_id, assignment in assignments_by_event.items():
+                        await self._handle_assignment(assignment)
+
+                    logger.info(f"Processed {len(assignments_by_event)} grouped market assignments")
+                    return  # Success, exit
+
+                # If not the last attempt, wait before retrying
+                if attempt < max_retries - 1:
+                    logger.debug(f"No response received, waiting 2 seconds before retry...")
+                    await asyncio.sleep(2)
+
+            logger.warning("No startup state response from orchestrator after 3 attempts (will wait for assignment listener)")
+        except Exception as e:
+            logger.warning(f"Failed to request startup state: {e} (will wait for assignment listener)")
+
     async def _assignment_listener(self):
         """Subscribe to market assignment messages from Orchestrator."""
-        logger.info("Starting assignment listener...")
+        logger.info(f"Starting assignment listener on channel: {Channel.MARKET_ASSIGNMENTS.value}")
 
         # Subscribe to market assignments channel
         await self.redis.subscribe(
@@ -296,9 +430,9 @@ class KalshiMonitor:
             self._handle_assignment,
         )
 
-        # Start the listener (runs in background)
-        await self.redis.start_listening()
-        
+        logger.info("Assignment listener subscribed, waiting for market assignments from orchestrator...")
+
+        # (Listener already started in start() method before _request_startup_state())
         # Keep this task alive while running
         while self._running:
             await asyncio.sleep(1)
@@ -310,14 +444,17 @@ class KalshiMonitor:
         if msg_type != "kalshi_assign":
             return
 
-        game_id = data.get("game_id")
+        # Support both "game_id" (sports) and "event_id" (crypto/multi-market)
+        game_id = data.get("game_id") or data.get("event_id")
         sport = data.get("sport")
+        market_type_label = data.get("market_type", "moneyline")  # crypto, economics, politics, or moneyline
         markets = data.get("markets", [])
 
         if not game_id or not markets:
+            logger.warning(f"Invalid Kalshi assignment - missing game_id/event_id or markets: {data}")
             return
 
-        logger.info(f"Received Kalshi assignment: game={game_id}, sport={sport}, markets={len(markets)}")
+        logger.info(f"Received Kalshi assignment: game={game_id}, sport={sport}, market_type={market_type_label}, markets={len(markets)}")
 
         for market_info in markets:
             ticker = market_info.get("ticker") or market_info.get("market_id")
@@ -398,13 +535,22 @@ class KalshiMonitor:
     async def _price_streaming_loop(self):
         """Stream prices from Kalshi WebSocket and publish to Redis."""
         logger.info("Starting price streaming loop...")
+        idle_log_counter = 0
+        prices_received_count = 0
+        prices_published_count = 0
 
         while self._running:
             try:
                 # Wait for subscriptions
                 if not self.subscribed_tickers:
+                    idle_log_counter += 1
+                    # Log every 30 iterations (60 seconds) when idle
+                    if idle_log_counter % 30 == 1:
+                        logger.info(f"Price streaming loop idle - no subscribed tickers (waiting for market assignments)")
                     await asyncio.sleep(2)
                     continue
+
+                idle_log_counter = 0  # Reset when we have tickers
 
                 # Check connection before streaming
                 if not self.kalshi_ws.is_connected:
@@ -412,9 +558,11 @@ class KalshiMonitor:
                     await asyncio.sleep(5)
                     continue
 
-                logger.debug(f"Streaming prices for {len(self.subscribed_tickers)} Kalshi markets")
+                logger.info(f"Starting to stream prices for {len(self.subscribed_tickers)} Kalshi markets")
 
                 async for price in self.kalshi_ws.stream_prices():
+                    prices_received_count += 1
+
                     if not self._running:
                         break
 
@@ -423,7 +571,18 @@ class KalshiMonitor:
                         logger.warning("WebSocket disconnected during streaming")
                         break
 
+                    # Log every 100 prices received
+                    if prices_received_count % 100 == 0:
+                        logger.info(f"[INSTRUMENTATION] Received {prices_received_count} prices from Kalshi WS, published {prices_published_count}")
+
+                    prev_published = self._prices_published
                     await self._handle_price_update(price)
+
+                    # Check if price was actually published
+                    if self._prices_published > prev_published:
+                        prices_published_count += 1
+                        if prices_published_count % 100 == 0:
+                            logger.info(f"[INSTRUMENTATION] Successfully published {prices_published_count} prices to ZMQ")
 
             except RuntimeError as e:
                 if "Not connected" in str(e):
@@ -464,6 +623,7 @@ class KalshiMonitor:
         # Drop stale markets: only publish if ticker is in the active set for this (game_id, market_type)
         active_set = self._active_by_game_type.get((str(game_id), str(market_type)))
         if active_set and ticker not in active_set:
+            logger.debug(f"[INSTRUMENTATION] Filtering out price for {ticker} - not in active set for ({game_id}, {market_type})")
             return
 
         # Get metadata
@@ -489,29 +649,35 @@ class KalshiMonitor:
             last_trade_price=price.last_trade_price,
         )
 
-        # Publish to per-game price channel
-        await self.redis.publish_market_price(game_id, normalized_price)
+        # PRIMARY: Publish to ZMQ (hot path - always)
+        await self._publish_zmq_price(ticker, game_id, normalized_price)
+
+        # SECONDARY: Optionally publish to Redis for backward compatibility
+        if self._redis_publish_prices:
+            await self.redis.publish_market_price(game_id, normalized_price)
 
         self._prices_published += 1
         self._last_price_time = datetime.utcnow()
 
-        # Publish to ZMQ for low-latency consumers (hot path)
-        if self._zmq_enabled and self._zmq_pub:
-            await self._publish_zmq_price(ticker, game_id, normalized_price)
-
-        logger.debug(
-            f"Published Kalshi price: {ticker[:12]}... team='{team_name}' "
-            f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
-            f"game={game_id}"
-        )
+        # Log first 20 prices to confirm asset extraction
+        if self._prices_published < 20:
+            logger.info(
+                f"[INSTRUMENTATION] Published Kalshi price: {ticker[:20]}... asset='{team_name}' "
+                f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
+                f"game={game_id}"
+            )
+        else:
+            logger.debug(
+                f"Published Kalshi price: {ticker[:12]}... team='{team_name}' "
+                f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
+                f"game={game_id} (zmq=yes, redis={self._redis_publish_prices})"
+            )
 
     async def _publish_zmq_price(self, ticker: str, game_id: str, price: MarketPrice):
-        """Publish price to ZMQ PUB socket for low-latency consumers."""
-        if not self._zmq_pub:
-            return
-
+        """Publish price to ZMQ PUB socket (primary hot path)."""
         try:
-            topic = f"prices.kalshi.{ticker}".encode()
+            topic_str = f"prices.kalshi.{ticker}"
+            topic = topic_str.encode()
             envelope = {
                 "seq": self._zmq_seq,
                 "timestamp_ms": int(time.time() * 1000),
@@ -519,22 +685,22 @@ class KalshiMonitor:
                 "payload": {
                     "market_id": price.market_id,
                     "platform": "kalshi",
-                    "game_id": game_id,
-                    "contract_team": price.contract_team,
+                    "asset": price.contract_team,  # Renamed: contract_team -> asset (matches crypto_shard IncomingCryptoPrice)
                     "yes_bid": price.yes_bid,
                     "yes_ask": price.yes_ask,
                     "mid_price": price.mid_price,
                     "yes_bid_size": price.yes_bid_size,
                     "yes_ask_size": price.yes_ask_size,
-                    "volume": price.volume,
                     "liquidity": price.liquidity,
-                    "timestamp": price.timestamp.isoformat() if price.timestamp else None,
+                    "timestamp": (price.timestamp.isoformat() + "Z") if price.timestamp else None,
                 },
             }
             self._zmq_seq += 1
             await self._zmq_pub.send_multipart([topic, json.dumps(envelope).encode()])
+            if self._zmq_seq % 1000 == 0:
+                logger.info(f"[INSTRUMENTATION] Published ZMQ price to topic '{topic_str}': {ticker} bid={price.yes_bid:.4f} ask={price.yes_ask:.4f}")
         except Exception as e:
-            logger.warning(f"Failed to publish to ZMQ: {e}")
+            logger.error(f"[INSTRUMENTATION] Failed to publish to ZMQ: {e}")
 
     async def _health_check_loop(self):
         """Periodic health checks."""

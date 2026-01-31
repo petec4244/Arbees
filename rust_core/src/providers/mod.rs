@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 // Concrete provider implementations
 pub mod crypto;
+pub mod crypto_arbitrage;
 pub mod economics;
 pub mod espn;
 pub mod politics;

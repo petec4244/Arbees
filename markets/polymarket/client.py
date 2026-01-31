@@ -416,13 +416,81 @@ class PolymarketClient(BaseMarketClient):
             return []
 
     async def get_market(self, market_id: str) -> Optional[dict]:
-        """Get detailed information about a specific market."""
+        """Get detailed information about a specific market.
+
+        Handles both:
+        - slug/numeric ID: Uses /markets/{id} endpoint
+        - condition_id (0x...): Searches /markets and filters by conditionId
+        """
+        # If it's a condition_id (hex), we need to search for it
+        if self._is_condition_id(market_id):
+            return await self._get_market_by_condition_id(market_id)
+
+        # Standard slug/numeric ID lookup
         try:
             return await self._gamma_request("GET", f"/markets/{market_id}")
         except aiohttp.ClientResponseError as e:
-            if e.status == 404:
+            if e.status in (404, 422):
                 return None
             raise
+
+    async def _get_market_by_condition_id(self, condition_id: str) -> Optional[dict]:
+        """Find a market by its condition_id using the CLOB API.
+
+        The CLOB API at /markets/{condition_id} directly supports condition ID lookups,
+        while the Gamma API /markets/{id} endpoint only accepts slugs or numeric IDs.
+        """
+        # Normalize condition_id (ensure 0x prefix)
+        normalized = condition_id if condition_id.startswith("0x") else f"0x{condition_id}"
+
+        try:
+            # CLOB API supports direct condition_id lookup
+            data = await self._clob_request("GET", f"/markets/{normalized}")
+
+            if data:
+                # CLOB returns different format than Gamma, normalize for compatibility
+                # CLOB format: tokens=[{token_id, outcome, price}, ...]
+                # Gamma format: outcomes="[\"Yes\", \"No\"]", clobTokenIds="[\"token1\", \"token2\"]"
+                tokens = data.get("tokens", [])
+                outcomes = [t.get("outcome", "Yes") for t in tokens] if tokens else ["Yes", "No"]
+                token_ids = [t.get("token_id", "") for t in tokens] if tokens else []
+
+                return {
+                    "conditionId": data.get("condition_id", normalized),
+                    "question": data.get("question", ""),
+                    "description": data.get("description", ""),
+                    "outcomes": outcomes,  # Already a list
+                    "clobTokenIds": token_ids,  # Already a list
+                    "active": data.get("active", True),
+                    "closed": data.get("closed", False),
+                    "volume": 0,  # CLOB doesn't return volume in this endpoint
+                    "outcomePrices": [t.get("price", 0.5) for t in tokens] if tokens else [0.5, 0.5],
+                    "_source": "clob",
+                }
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                logger.debug(f"Market not found in CLOB for condition_id: {condition_id}")
+            else:
+                logger.debug(f"CLOB API error for {condition_id}: {e}")
+        except Exception as e:
+            logger.debug(f"Error fetching market from CLOB by condition_id {condition_id}: {e}")
+
+        # Fallback: search Gamma API (slower, but covers more cases)
+        try:
+            markets = await self._gamma_request("GET", "/markets", params={
+                "limit": 200,
+                "active": "true",
+            })
+
+            if isinstance(markets, list):
+                for market in markets:
+                    if market.get("conditionId") == normalized:
+                        return market
+        except Exception as e:
+            logger.debug(f"Gamma fallback search failed: {e}")
+
+        logger.debug(f"Market not found for condition_id: {condition_id}")
+        return None
 
     async def get_orderbook(self, market_id: str) -> Optional[OrderBook]:
         """Get order book for a market (by condition_id or token_id)."""

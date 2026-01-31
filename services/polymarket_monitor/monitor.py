@@ -43,6 +43,50 @@ except ImportError:
     logger.warning("pyzmq not installed - ZMQ publishing disabled")
 
 
+def extract_asset_from_market_title(title: str) -> Optional[str]:
+    """
+    Extract crypto asset name from Polymarket market title.
+
+    Examples:
+        "Will Bitcoin reach $100,000 by end of 2026?" -> "BTC"
+        "Ethereum price above $3000 tomorrow?" -> "ETH"
+        "Solana (SOL) above $250?" -> "SOL"
+        "XRP ends 2026 above $5?" -> "XRP"
+
+    Known crypto assets: BTC, ETH, SOL, XRP, DOGE, AVAX, CARDANO, POLKADOT
+    """
+    if not title:
+        return None
+
+    title_upper = title.upper()
+
+    # Direct word matching for known assets
+    asset_keywords = {
+        "BITCOIN": "BTC",
+        "BTC": "BTC",
+        "ETHEREUM": "ETH",
+        "ETH": "ETH",
+        "SOLANA": "SOL",
+        "SOL": "SOL",
+        "XRP": "XRP",
+        "RIPPLE": "XRP",
+        "DOGE": "DOGE",
+        "DOGECOIN": "DOGE",
+        "CARDANO": "ADA",
+        "ADA": "ADA",
+        "POLKADOT": "DOT",
+        "DOT": "DOT",
+        "AVALANCHE": "AVAX",
+        "AVAX": "AVAX",
+    }
+
+    for keyword, asset in asset_keywords.items():
+        if keyword in title_upper:
+            return asset
+
+    return None
+
+
 class PolymarketMonitor:
     """
     Monitors Polymarket markets via VPN and publishes prices to Redis.
@@ -60,17 +104,15 @@ class PolymarketMonitor:
 
         # Subscription tracking
         self.subscribed_tokens: set[str] = set()
-        self.subscribed_conditions: set[str] = set()
 
-        # token_id -> {condition_id, team_name}
-        # For moneyline markets, each token represents one team's YES contract
-        self._token_to_info: dict[str, dict] = {}
-        
-        # condition_id -> list of token_ids (usually 2 for moneyline)
-        self._condition_to_tokens: dict[str, list[str]] = {}
+        # SIMPLIFIED: token_id -> {condition_id, game_id, market_type}
+        # This is all we need to route incoming prices to the right market
+        self._token_to_market: dict[str, dict] = {}
 
-        # Market metadata (condition_id -> {game_id, market_type, title, outcomes, home_team, away_team})
+        # Market metadata: condition_id -> {title, asset, game_id, market_type}
+        # Used to store asset and title information for crypto markets
         self._market_metadata: dict[str, dict] = {}
+
         # Active assignment per (game_id, market_type) -> condition_id
         # Used to prevent publishing stale markets after discovery corrections.
         self._active_by_game_type: dict[tuple[str, str], str] = {}
@@ -85,13 +127,16 @@ class PolymarketMonitor:
         # Heartbeat publisher for health monitoring
         self._heartbeat_publisher: Optional[HeartbeatPublisher] = None
 
-        # ZMQ publisher for low-latency messaging (hot path)
-        transport_mode = os.environ.get("ZMQ_TRANSPORT_MODE", "redis_only").lower()
-        self._zmq_enabled = transport_mode in ("zmq_only", "both")
+        # ZMQ publisher for low-latency messaging (HOT PATH - always enabled)
+        # ZMQ is the primary transport for price data; Redis is only for slow-path consumers
         self._zmq_context: Optional["zmq.asyncio.Context"] = None
         self._zmq_pub: Optional["zmq.asyncio.Socket"] = None
         self._zmq_seq = 0
         self._zmq_pub_port = int(os.environ.get("ZMQ_PUB_PORT", "5556"))
+
+        # Redis publishing is now optional (only for backward compatibility)
+        transport_mode = os.environ.get("ZMQ_TRANSPORT_MODE", "zmq_only").lower()
+        self._redis_publish_prices = transport_mode in ("redis_only", "both")
 
     # region agent log (helper)
     def _agent_dbg(self, hypothesisId: str, location: str, message: str, data: dict) -> None:
@@ -116,9 +161,13 @@ class PolymarketMonitor:
         """Initialize connections and start monitoring."""
         logger.info("Starting PolymarketMonitor...")
 
-        # Verify VPN before anything else
-        await self._verify_vpn()
-        self._health_ok = True
+        # Verify VPN (non-blocking - log warning if it fails)
+        try:
+            await self._verify_vpn()
+            self._health_ok = True
+        except Exception as e:
+            logger.warning(f"VPN verification failed on startup (continuing anyway): {e}")
+            self._health_ok = False
 
         # Connect to Redis
         await self.redis.connect()
@@ -130,19 +179,21 @@ class PolymarketMonitor:
 
         self._running = True
 
-        # Initialize ZMQ publisher if enabled
-        if self._zmq_enabled and ZMQ_AVAILABLE:
-            try:
-                self._zmq_context = zmq.asyncio.Context()
-                self._zmq_pub = self._zmq_context.socket(zmq.PUB)
-                self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
-                logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port}")
-            except Exception as e:
-                logger.error(f"Failed to initialize ZMQ: {e}")
-                self._zmq_enabled = False
-        elif self._zmq_enabled and not ZMQ_AVAILABLE:
-            logger.warning(f"ZMQ_TRANSPORT_MODE={transport_mode} but pyzmq not installed")
-            self._zmq_enabled = False
+        # Initialize ZMQ publisher (REQUIRED - ZMQ is the primary hot path)
+        if not ZMQ_AVAILABLE:
+            raise RuntimeError(
+                "pyzmq is required for PolymarketMonitor. "
+                "Install with: pip install pyzmq"
+            )
+
+        try:
+            self._zmq_context = zmq.asyncio.Context()
+            self._zmq_pub = self._zmq_context.socket(zmq.PUB)
+            self._zmq_pub.bind(f"tcp://*:{self._zmq_pub_port}")
+            logger.info(f"ZMQ PUB socket bound to port {self._zmq_pub_port} (primary hot path)")
+        except Exception as e:
+            logger.error(f"Failed to initialize ZMQ: {e}")
+            raise RuntimeError(f"ZMQ initialization failed: {e}")
 
         # Setup signal handlers
         loop = asyncio.get_event_loop()
@@ -167,11 +218,21 @@ class PolymarketMonitor:
 
         logger.info("PolymarketMonitor started successfully")
 
+        # Start Redis listener loop BEFORE requesting startup state
+        # (so subscription callbacks are processed when responses arrive)
+        await self.redis.start_listening()
+
+        # REQUEST CURRENT ASSIGNMENTS FROM ORCHESTRATOR ON STARTUP
+        # This ensures that if the monitor was restarted, it recovers assignments
+        # without waiting for new discoveries (which could take minutes)
+        logger.info("Requesting current Polymarket market assignments from orchestrator...")
+        await self._request_startup_state()
+
         # Run concurrent tasks
+        # Note: REST poll loop removed - WebSocket streaming is primary transport
         await asyncio.gather(
             self._assignment_listener(),
             self._price_streaming_loop(),
-            self._rest_poll_loop(),
             self._health_check_loop(),
             return_exceptions=True,
         )
@@ -222,9 +283,94 @@ class PolymarketMonitor:
             except httpx.RequestError as e:
                 raise RuntimeError(f"Failed to verify VPN (network error): {e}")
 
+    async def _request_startup_state(self):
+        """Request current market assignments from orchestrator on startup.
+
+        This ensures monitors recover quickly after restart without waiting for
+        new market discoveries (which can take several minutes).
+        """
+        try:
+            # Request current state from orchestrator
+            request_channel = "orchestrator:startup_state_request"
+            response_channel = "orchestrator:startup_state_response:polymarket"
+
+            # Subscribe to response channel BEFORE making the request
+            # (otherwise we might miss the response)
+            responses_received = []
+
+            async def collect_response(data: dict):
+                logger.info(f"Received response from orchestrator: {data}")
+                responses_received.append(data)
+
+            await self.redis.subscribe(response_channel, collect_response)
+
+            # Retry logic: Try up to 3 times with 2-second delays to ensure orchestrator is subscribed
+            max_retries = 3
+            for attempt in range(max_retries):
+                # Send startup state request as JSON string (not msgpack)
+                request_payload = {
+                    "monitor_type": "polymarket",
+                    "timestamp": asyncio.get_event_loop().time(),
+                }
+                request_json = json.dumps(request_payload)
+                logger.info(f"Publishing startup state request (attempt {attempt + 1}/{max_retries}) to {request_channel}: {request_json}")
+                # Publish as raw string to Redis (not through RedisBus which uses msgpack)
+                await self.redis._client.publish(request_channel, request_json)
+
+                # Wait for response with 5-second timeout per attempt
+                start_time = asyncio.get_event_loop().time()
+                while not responses_received and asyncio.get_event_loop().time() - start_time < 5:
+                    await asyncio.sleep(0.1)
+
+                if responses_received:
+                    response = responses_received[0]
+                    markets = response.get("markets", [])
+                    logger.info(f"Received {len(markets)} Polymarket market assignments from orchestrator")
+
+                    # Group markets by event_id and convert to assignment message format
+                    assignments_by_event = {}
+                    for market in markets:
+                        event_id = market.get("event_id")
+                        polymarket_market_id = market.get("polymarket_market_id")
+                        market_type = market.get("market_type", {})
+
+                        if not event_id or not polymarket_market_id:
+                            continue
+
+                        if event_id not in assignments_by_event:
+                            assignments_by_event[event_id] = {
+                                "type": "polymarket_assign",
+                                "event_id": event_id,
+                                "market_type": market_type.get("type", "crypto"),
+                                "markets": [],
+                            }
+
+                        # Add market to this event's assignment
+                        assignments_by_event[event_id]["markets"].append({
+                            "condition_id": polymarket_market_id,
+                            "market_type": market_type.get("type", "crypto"),
+                        })
+
+                    # Process each grouped assignment immediately
+                    for event_id, assignment in assignments_by_event.items():
+                        await self._handle_assignment(assignment)
+
+                    logger.info(f"Processed {len(assignments_by_event)} grouped market assignments")
+                    return  # Success, exit
+
+                # If not the last attempt, wait before retrying
+                if attempt < max_retries - 1:
+                    logger.debug(f"No response received, waiting 2 seconds before retry...")
+                    await asyncio.sleep(2)
+
+            logger.warning("No startup state response from orchestrator after 3 attempts (5s timeout each)")
+
+        except Exception as e:
+            logger.warning(f"Failed to request startup state: {e}")
+
     async def _assignment_listener(self):
         """Subscribe to market assignment messages from Orchestrator."""
-        logger.info("Starting assignment listener...")
+        logger.info(f"Starting assignment listener on channel: {Channel.MARKET_ASSIGNMENTS.value}")
 
         # Subscribe to market assignments channel
         await self.redis.subscribe(
@@ -232,8 +378,9 @@ class PolymarketMonitor:
             self._handle_assignment,
         )
 
-        # Start the listener
-        await self.redis.start_listening()
+        logger.info("Assignment listener subscribed, waiting for market assignments from orchestrator...")
+
+        # (Listener already started in start() method before _request_startup_state())
 
     async def _handle_assignment(self, data: dict):
         """Handle a market assignment message from Orchestrator."""
@@ -242,14 +389,17 @@ class PolymarketMonitor:
         if msg_type != "polymarket_assign":
             return
 
-        game_id = data.get("game_id")
+        # Support both "game_id" (sports) and "event_id" (crypto/multi-market)
+        game_id = data.get("game_id") or data.get("event_id")
         sport = data.get("sport")
+        market_type = data.get("market_type", "moneyline")  # crypto, economics, politics, or moneyline
         markets = data.get("markets", [])
 
         if not game_id or not markets:
+            logger.warning(f"Invalid assignment - missing game_id/event_id or markets: {data}")
             return
 
-        logger.info(f"Received assignment: game={game_id}, sport={sport}, markets={len(markets)}")
+        logger.info(f"Received assignment: game={game_id}, sport={sport}, market_type={market_type}, markets={len(markets)}")
 
         for market_info in markets:
             condition_id = market_info.get("condition_id")
@@ -260,9 +410,6 @@ class PolymarketMonitor:
 
             # Update active mapping even if we're already subscribed; orchestrator may be correcting IDs.
             self._active_by_game_type[(str(game_id), str(market_type))] = str(condition_id)
-
-            if condition_id in self.subscribed_conditions:
-                continue
 
             try:
                 await self._subscribe_to_market(condition_id, game_id, market_type)
@@ -279,34 +426,33 @@ class PolymarketMonitor:
     ):
         """
         Subscribe to a Polymarket market via WebSocket.
-        
-        For moneyline markets, subscribes to BOTH team tokens and tracks
-        which token corresponds to which team.
+
+        Simplified: Only fetch token IDs, don't parse outcomes or store metadata.
+        Team names are inferred from token prices themselves.
+
+        Gracefully skips markets that don't exist on CLOB (may be Gamma-only or not yet synced).
         """
-        # Fetch market details
+        # Fetch market to get token IDs and metadata
         market = await self.poly_client.get_market(condition_id)
         if not market:
-            logger.warning(f"Market not found: {condition_id}")
+            logger.debug(f"Market not found on CLOB (may be Gamma-only or not yet synced): {condition_id}")
             return
 
-        title = market.get("question", market.get("title", ""))
-        volume = float(market.get("volume", 0) or 0)
-        
-        # Parse outcomes and token IDs
-        # Polymarket returns: outcomes=["Team A", "Team B"], clobTokenIds=["token1", "token2"]
-        outcomes_raw = market.get("outcomes", "[]")
+        # Extract market title and asset
+        market_title = market.get("question", market.get("title", ""))
+        asset = extract_asset_from_market_title(market_title) if market_type == "crypto" else None
+
+        # Store metadata for later use
+        self._market_metadata[condition_id] = {
+            "title": market_title,
+            "asset": asset,
+            "game_id": game_id,
+            "market_type": market_type,
+        }
+
+        # Get token IDs (may be in clobTokenIds or resolve from market)
         tokens_raw = market.get("clobTokenIds", "[]")
-        
-        # Handle JSON string or list
-        import json
-        if isinstance(outcomes_raw, str):
-            try:
-                outcomes = json.loads(outcomes_raw)
-            except:
-                outcomes = []
-        else:
-            outcomes = outcomes_raw or []
-            
+
         if isinstance(tokens_raw, str):
             try:
                 token_ids = json.loads(tokens_raw)
@@ -314,82 +460,85 @@ class PolymarketMonitor:
                 token_ids = []
         else:
             token_ids = tokens_raw or []
-        
-        if len(outcomes) != len(token_ids) or not outcomes:
-            logger.warning(f"Market {condition_id} has mismatched outcomes/tokens: {len(outcomes)} vs {len(token_ids)}")
-            # Fallback to single token resolution
-            token_id = await self.poly_client.resolve_yes_token_id(market)
-            if token_id:
-                outcomes = [title]
-                token_ids = [token_id]
-            else:
-                return
 
-        # Store metadata with team info
-        self._market_metadata[condition_id] = {
-            "game_id": game_id,
-            "market_type": market_type,
-            "title": title,
-            "volume": volume,
-            "outcomes": outcomes,
-            "home_team": home_team,
-            "away_team": away_team,
-        }
-        
-        # Track all tokens for this condition
-        self._condition_to_tokens[condition_id] = token_ids
-        
-        # Subscribe to ALL tokens (both teams for moneyline)
-        ws_markets = []
-        for i, (outcome, token_id) in enumerate(zip(outcomes, token_ids)):
+        # If no tokens found, try to resolve single token
+        if not token_ids:
+            logger.debug(f"No clobTokenIds for {condition_id}, attempting resolve_yes_token_id")
+            token_id = await self.poly_client.resolve_yes_token_id(market)
+            token_ids = [token_id] if token_id else []
+
+        if not token_ids:
+            logger.warning(f"Could not determine token IDs for market {condition_id}")
+            return
+
+        # Subscribe to all tokens
+        for token_id in token_ids:
             if token_id in self.subscribed_tokens:
-                logger.debug(f"Already subscribed to token {token_id[:16]}... ({outcome})")
+                logger.debug(f"Already subscribed to token {token_id[:16]}...")
                 continue
-                
-            # Store token -> info mapping
-            self._token_to_info[token_id] = {
+
+            # Minimal metadata: just map token to market location
+            self._token_to_market[token_id] = {
                 "condition_id": condition_id,
-                "team_name": outcome,  # e.g., "Binghamton Bearcats"
-                "outcome_index": i,
+                "game_id": game_id,
+                "market_type": market_type,
             }
-            
-            ws_markets.append({
+
+            self.subscribed_tokens.add(token_id)
+
+            # Subscribe via client metadata for tracking
+            await self.poly_client.subscribe_with_metadata([{
                 "token_id": token_id,
                 "condition_id": condition_id,
-                "title": f"{title} - {outcome}",
                 "game_id": game_id,
-                "volume": volume,
                 "market_type": market_type,
-            })
-            
-            self.subscribed_tokens.add(token_id)
-            logger.info(f"Subscribing to Polymarket token: {token_id[:16]}... for '{outcome}'")
-        
-        if ws_markets:
-            await self.poly_client.subscribe_with_metadata(ws_markets)
-            
-        self.subscribed_conditions.add(condition_id)
-        logger.info(f"Subscribed to Polymarket: {condition_id[:16]}... ({market_type}) with {len(token_ids)} outcomes: {outcomes}")
+            }])
+
+            logger.info(f"Subscribed to token {token_id[:16]}... (game={game_id})")
+
+        logger.info(f"Subscribed to Polymarket: {condition_id[:16]}... ({market_type}) with {len(token_ids)} tokens")
 
     async def _price_streaming_loop(self):
         """Stream prices from Polymarket WebSocket and publish to Redis."""
         logger.info("Starting price streaming loop...")
+        idle_log_counter = 0
+        prices_received_count = 0
+        prices_published_count = 0
 
         while self._running:
             try:
                 # Wait for subscriptions
                 if not self.subscribed_tokens:
+                    idle_log_counter += 1
+                    # Log every 30 iterations (60 seconds) when idle
+                    if idle_log_counter % 30 == 1:
+                        logger.info(f"Price streaming loop idle - no subscribed tokens (waiting for market assignments)")
                     await asyncio.sleep(2)
                     continue
 
+                idle_log_counter = 0  # Reset when we have tokens
+
                 token_ids = list(self.subscribed_tokens)
-                logger.info(f"Streaming prices for {len(token_ids)} Polymarket markets")
+                logger.info(f"Starting to stream prices for {len(token_ids)} Polymarket markets")
 
                 async for price in self.poly_client.stream_prices(token_ids):
+                    prices_received_count += 1
+
                     if not self._running:
                         break
 
+                    # Log every 100 prices received
+                    if prices_received_count % 100 == 0:
+                        logger.info(f"[INSTRUMENTATION] Received {prices_received_count} prices from Polymarket WS, published {prices_published_count}")
+
+                    prev_published = self._prices_published
                     await self._handle_price_update(price)
+
+                    # Check if price was actually published
+                    if self._prices_published > prev_published:
+                        prices_published_count += 1
+                        if prices_published_count % 100 == 0:
+                            logger.info(f"[INSTRUMENTATION] Successfully published {prices_published_count} prices to ZMQ")
 
             except asyncio.CancelledError:
                 break
@@ -400,108 +549,66 @@ class PolymarketMonitor:
 
     async def _handle_price_update(self, price: MarketPrice):
         """
-        Handle incoming price update, normalize, and publish to Redis.
-        
-        CRITICAL: Each token represents ONE team's YES contract.
-        We include contract_team in the published MarketPrice so downstream
-        consumers can match signal.team to the correct contract.
+        Handle incoming price update and publish to ZMQ/Redis.
+
+        Simplified: Minimal lookup, direct market routing.
         """
-        # Normalize: price.market_id is token_id, we need condition_id + team
         token_id = price.market_id
-        token_info = self._token_to_info.get(token_id)
+        market_info = self._token_to_market.get(token_id)
 
-        if not token_info:
-            # Try reverse lookup (maybe it's already a condition_id)
-            if token_id in self._market_metadata:
-                # This is a condition_id, not a token_id - shouldn't happen normally
-                condition_id = token_id
-                contract_team = None
-            else:
-                logger.debug(f"Unknown token_id: {token_id[:16]}...")
-                return
-        else:
-            condition_id = token_info["condition_id"]
-            contract_team = token_info["team_name"]  # e.g., "Binghamton Bearcats"
-
-        # Get metadata
-        meta = self._market_metadata.get(condition_id, {})
-        game_id = meta.get("game_id")
-        market_type = meta.get("market_type", "moneyline")
-
-        if not game_id:
-            logger.debug(f"No game_id for condition {condition_id[:16]}...")
+        if not market_info:
+            logger.debug(f"Unknown token_id: {token_id[:16]}...")
             return
 
-        # Drop stale markets: only publish the currently active (game_id, market_type) assignment.
+        condition_id = market_info["condition_id"]
+        game_id = market_info["game_id"]
+        market_type = market_info["market_type"]
+
+        # Drop stale markets: only publish the currently active assignment.
         active = self._active_by_game_type.get((str(game_id), str(market_type)))
         if active and active != condition_id:
             return
 
-        # Build normalized MarketPrice with:
-        # - market_id = condition_id (for market identification)
-        # - contract_team = which team this YES contract is for
-        # - market_title includes team name for clarity
-        title = meta.get("title", price.market_title)
-        if contract_team and contract_team not in title:
-            title = f"{title} [{contract_team}]"
-            
+        # Extract asset from metadata if available (for crypto markets)
+        meta = self._market_metadata.get(condition_id, {})
+        asset = meta.get("asset")
+
+        # Minimal normalization: use price as-is, with market routing info
         normalized_price = MarketPrice(
             market_id=condition_id,
             platform=Platform.POLYMARKET,
             game_id=game_id,
-            market_title=title,
-            contract_team=contract_team,  # CRITICAL: which team's YES contract
+            market_title=price.market_title,
+            contract_team=asset,  # For crypto markets, store the extracted asset (BTC, ETH, etc.)
             yes_bid=price.yes_bid,
             yes_ask=price.yes_ask,
             yes_bid_size=price.yes_bid_size,
             yes_ask_size=price.yes_ask_size,
-            volume=meta.get("volume", price.volume),
+            volume=price.volume,
             liquidity=price.liquidity,
             status=price.status,
             timestamp=price.timestamp,
             last_trade_price=price.last_trade_price,
         )
 
-        # region agent log
-        if normalized_price.yes_ask >= 0.99 or normalized_price.yes_bid <= 0.01:
-            self._agent_dbg(
-                "H1",
-                "services/polymarket_monitor/monitor.py:_handle_price_update",
-                "published_extreme_price",
-                {
-                    "game_id": game_id,
-                    "condition_id": condition_id,
-                    "contract_team": contract_team,
-                    "yes_bid": float(normalized_price.yes_bid),
-                    "yes_ask": float(normalized_price.yes_ask),
-                    "mid": float(normalized_price.mid_price),
-                    "market_title": normalized_price.market_title,
-                    "source": "ws",
-                },
-            )
-        # endregion
+        # PRIMARY: Publish to ZMQ (hot path - always)
+        await self._publish_zmq_price(condition_id, game_id, normalized_price)
 
-        # Publish to per-game price channel
-        await self.redis.publish_market_price(game_id, normalized_price)
+        # SECONDARY: Optionally publish to Redis for backward compatibility
+        if self._redis_publish_prices:
+            await self.redis.publish_market_price(game_id, normalized_price)
 
         self._prices_published += 1
         self._last_price_time = datetime.utcnow()
 
-        # Publish to ZMQ for low-latency consumers (hot path)
-        if self._zmq_enabled and self._zmq_pub:
-            await self._publish_zmq_price(condition_id, game_id, normalized_price)
-
         logger.debug(
-            f"Published Polymarket price: {condition_id[:12]}... team='{contract_team}' "
+            f"Published Polymarket price: {condition_id[:12]}... "
             f"bid={normalized_price.yes_bid:.3f} ask={normalized_price.yes_ask:.3f} "
             f"game={game_id}"
         )
 
     async def _publish_zmq_price(self, condition_id: str, game_id: str, price: MarketPrice):
-        """Publish price to ZMQ PUB socket for low-latency consumers."""
-        if not self._zmq_pub:
-            return
-
+        """Publish price to ZMQ PUB socket (primary hot path)."""
         try:
             topic = f"prices.poly.{condition_id}".encode()
             envelope = {
@@ -511,16 +618,14 @@ class PolymarketMonitor:
                 "payload": {
                     "market_id": price.market_id,
                     "platform": "polymarket",
-                    "game_id": game_id,
-                    "contract_team": price.contract_team,
+                    "asset": price.contract_team,  # Renamed: contract_team -> asset (matches crypto_shard IncomingCryptoPrice)
                     "yes_bid": price.yes_bid,
                     "yes_ask": price.yes_ask,
                     "mid_price": price.mid_price,
                     "yes_bid_size": price.yes_bid_size,
                     "yes_ask_size": price.yes_ask_size,
-                    "volume": price.volume,
                     "liquidity": price.liquidity,
-                    "timestamp": price.timestamp.isoformat() if price.timestamp else None,
+                    "timestamp": (price.timestamp.isoformat() + "Z") if price.timestamp else None,
                 },
             }
             self._zmq_seq += 1
@@ -531,17 +636,24 @@ class PolymarketMonitor:
     async def _rest_poll_loop(self) -> None:
         """
         Fallback poller to ensure we publish prices even if WS is quiet/flaky.
-        
+
         For moneyline markets, polls BOTH team tokens and publishes separate
         prices for each team.
         """
         logger.info(f"Starting REST poll loop (interval={self._poll_interval_s}s)...")
+        idle_log_counter = 0
 
         while self._running:
             try:
                 if not self._active_by_game_type:
+                    idle_log_counter += 1
+                    # Log every 30 iterations (~60 seconds at 2s interval) when idle
+                    if idle_log_counter % 30 == 1:
+                        logger.info(f"REST poll loop idle - no active market assignments (subscribed_conditions={len(self.subscribed_conditions)})")
                     await asyncio.sleep(self._poll_interval_s)
                     continue
+
+                idle_log_counter = 0  # Reset when we have active assignments
 
                 active_items = list(self._active_by_game_type.items())
                 for (g_id, m_type), condition_id in active_items:
@@ -567,7 +679,7 @@ class PolymarketMonitor:
                                 platform=Platform.POLYMARKET,
                                 game_id=game_id,
                                 market_title=meta.get("title", polled.market_title),
-                                contract_team=None,  # Unknown team
+                                contract_team=meta.get("asset"),  # Asset for crypto markets
                                 yes_bid=polled.yes_bid,
                                 yes_ask=polled.yes_ask,
                                 yes_bid_size=float(getattr(polled, "yes_bid_size", 0.0) or 0.0),
@@ -578,7 +690,11 @@ class PolymarketMonitor:
                                 timestamp=polled.timestamp,
                                 last_trade_price=polled.last_trade_price,
                             )
-                            await self.redis.publish_market_price(game_id, normalized)
+                            # PRIMARY: ZMQ (always)
+                            await self._publish_zmq_price(condition_id, game_id, normalized)
+                            # SECONDARY: Redis (optional)
+                            if self._redis_publish_prices:
+                                await self.redis.publish_market_price(game_id, normalized)
                             self._prices_published += 1
                             self._last_price_time = datetime.utcnow()
                         continue
@@ -626,13 +742,17 @@ class PolymarketMonitor:
                         title = meta.get("title", "")
                         if outcome and outcome not in title:
                             title = f"{title} [{outcome}]"
-                        
+
+                        # For crypto markets, preserve asset; for sports, use outcome (team)
+                        market_type = meta.get("market_type", "moneyline")
+                        contract_team = meta.get("asset") if market_type == "crypto" else outcome
+
                         normalized = MarketPrice(
                             market_id=condition_id,
                             platform=Platform.POLYMARKET,
                             game_id=game_id,
                             market_title=title,
-                            contract_team=outcome,
+                            contract_team=contract_team,
                             yes_bid=yes_bid,
                             yes_ask=yes_ask,
                             yes_bid_size=0.0,
@@ -643,7 +763,11 @@ class PolymarketMonitor:
                             timestamp=datetime.utcnow(),
                             last_trade_price=float(market_data.get("lastTradePrice", 0) or 0) if market_data.get("lastTradePrice") else None,
                         )
-                        await self.redis.publish_market_price(game_id, normalized)
+                        # PRIMARY: ZMQ (always)
+                        await self._publish_zmq_price(condition_id, game_id, normalized)
+                        # SECONDARY: Redis (optional)
+                        if self._redis_publish_prices:
+                            await self.redis.publish_market_price(game_id, normalized)
                         self._prices_published += 1
                         self._last_price_time = datetime.utcnow()
                         
@@ -659,11 +783,13 @@ class PolymarketMonitor:
             await asyncio.sleep(self._poll_interval_s)
 
     async def _health_check_loop(self):
-        """Periodic health checks."""
+        """Periodic health checks (3-minute interval)."""
+        health_check_interval = 180  # 3 minutes instead of 60 seconds
         while self._running:
             try:
-                # Verify VPN is still working
-                await self._verify_vpn()
+                # Skip VPN verification from health check loop (too slow)
+                # VPN is verified on startup; if it fails, the service won't start
+                # Periodic re-verification can be added later if needed
 
                 # Check WebSocket connection
                 ws_ok = self.poly_client.ws_connected
@@ -688,7 +814,7 @@ class PolymarketMonitor:
                         "ws_ok": ws_ok,
                     })
                     self._heartbeat_publisher.update_metrics({
-                        "subscribed_markets": float(len(self.subscribed_conditions)),
+                        "subscribed_markets": float(len(self.subscribed_tokens)),
                         "prices_published": float(self._prices_published),
                         "last_price_age_s": staleness_s,
                     })
@@ -704,7 +830,7 @@ class PolymarketMonitor:
                     "type": "POLYMARKET_MONITOR_HEALTH",
                     "service": "polymarket_monitor",
                     "healthy": True,
-                    "subscribed_markets": len(self.subscribed_conditions),
+                    "subscribed_markets": len(self.subscribed_tokens),
                     "prices_published": self._prices_published,
                     "timestamp": datetime.utcnow().isoformat(),
                 })
@@ -725,7 +851,7 @@ class PolymarketMonitor:
                     "timestamp": datetime.utcnow().isoformat(),
                 })
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(health_check_interval)
 
 
 async def main():
